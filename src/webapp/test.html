@@ -1,0 +1,62 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>WebSocket客户端</title>
+</head>
+<body>
+
+<form onsubmit="return false;">
+    <textarea id="message" style="width: 400px;height: 300px"></textarea>
+    <input type="button" value="发送数据" onclick="send()">
+    <h3>服务器返回数据</h3>
+    <textarea id="responseText" style="height: 400px;width: 300px"></textarea>
+    <input type="button" onclick="clearText()" value="清空内容">
+</form>
+
+
+
+<script type="application/javascript">
+    var socket;
+
+    //判断浏览器是否支持WebSocket协议
+    if (window.WebSocket){
+        //构造一个WebSocket对象
+        socket = new WebSocket("ws://localhost:8899/ws");
+        //如果客户端收到了服务器端发送过来的数据，则onmessage则会被调用
+        socket.onmessage = function (ev) {
+            var data = document.getElementById("responseText");
+            data.value += "\n" + ev.data;
+        };
+        //客户端与服务器端之间的连接建立后，onopen函数被调用
+        socket.onopen = function (ev) {
+            var data = document.getElementById("responseText");
+            data.value += "连接开始";
+        };
+        //客户端与服务器端之间的连接断开后，onclose函数被调用
+        socket.onclose = function (ev) {
+            var data = document.getElementById("responseText");
+            data.value += "\n" + "连接关闭";
+        }
+    }else{
+        alert("浏览器不支持WebSocket");
+    }
+
+    function clearText(){
+        document.getElementById("responseText").value = '';
+    }
+
+    function send() {
+        if (!window.WebSocket){
+             return;
+        }
+
+        if (socket.readyState === WebSocket.OPEN){
+            socket.send(document.getElementById("message").value);
+        }else{
+            alert("连接尚未开始");
+        }
+    }
+</script>
+</body>
+</html>

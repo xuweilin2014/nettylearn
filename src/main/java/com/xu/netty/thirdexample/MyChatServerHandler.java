@@ -67,7 +67,7 @@ public class MyChatServerHandler extends SimpleChannelInboundHandler<String> {
 
     @Override
     public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) throws Exception {
-        cause.printStackTrace();
+        //cause.printStackTrace();
         ctx.close();
     }
 }
