@@ -1,0 +1,40 @@
+syntax = "proto2";
+
+package com.xu.netty.seventhexample.multimsg.proto;
+
+option optimize_for = SPEED;
+option java_package = "com.xu.netty.seventhexample.multimsg.proto";
+option java_outer_classname = "MyClientInfo";
+option java_multiple_files = true;
+
+message MyMessage{
+
+    enum MessageType {
+        App = 1;
+        Pad = 2;
+        Computer = 3;
+    }
+
+    required MessageType type = 1;
+
+    oneof body {
+        App app = 2;
+        Pad pad = 3;
+        Computer computer = 4;
+    }
+}
+
+message App{
+    optional string ip = 1;
+    optional string phoneType = 2;
+}
+
+message Pad{
+    optional string ip = 1;
+    optional string padType = 2;
+}
+
+message Computer{
+    optional string ip = 1;
+    optional string computerType = 2;
+}
