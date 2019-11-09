@@ -8,7 +8,7 @@ import java.nio.ByteBuffer;
  */
 public class NioTestSeven {
     public static void main(String[] args) {
-        ByteBuffer buffer = ByteBuffer.allocate(10);
+        ByteBuffer buffer = ByteBuffer.allocateDirect(10);
 
         System.out.println(buffer.getClass());
 
