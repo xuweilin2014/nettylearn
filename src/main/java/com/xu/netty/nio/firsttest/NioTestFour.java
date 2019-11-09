@@ -17,18 +17,6 @@ public class NioTestFour {
 
         ByteBuffer buffer = ByteBuffer.allocate(512);
 
-        /*inputChannel.read(buffer);
-        System.out.println(buffer.limit());
-        System.out.println(buffer.position());
-        System.out.println(buffer.capacity());
-
-        buffer.flip();
-
-        System.out.println("----------------");
-        System.out.println(buffer.limit());
-        System.out.println(buffer.position());
-        System.out.println(buffer.capacity());*/
-
         while (true){
             buffer.clear();
 
