@@ -1,4 +1,4 @@
-package com.xu.netty.nio.firsttest;
+package com.xu.netty.nio.firsttest.exmaple;
 
 import java.io.RandomAccessFile;
 import java.nio.MappedByteBuffer;

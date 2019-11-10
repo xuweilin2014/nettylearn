@@ -1,4 +1,4 @@
-package com.xu.netty.nio.firsttest;
+package com.xu.netty.nio.firsttest.exmaple;
 
 import java.nio.IntBuffer;
 import java.security.SecureRandom;
