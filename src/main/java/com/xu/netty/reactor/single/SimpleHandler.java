@@ -48,7 +48,7 @@ public class SimpleHandler implements Runnable {
         byteBuffer.flip();
         socketChannel.write(byteBuffer);
 
-        SelectionKey sk = socketChannel.register(selector, SelectionKey.OP_WRITE);
+        SelectionKey sk = socketChannel.register(selector, SelectionKey.OP_READ);
         sk.attach(this);
         state = State.READING;
     }
