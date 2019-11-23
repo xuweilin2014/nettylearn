@@ -1,6 +1,5 @@
 package com.xu.netty.reactor.multiple;
 
-import com.xu.netty.nio.firsttest.basic.BasicHandler;
 import com.xu.netty.reactor.single.SimpleHandler;
 
 import java.io.IOException;
