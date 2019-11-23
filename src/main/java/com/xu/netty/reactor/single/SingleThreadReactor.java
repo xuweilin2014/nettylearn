@@ -12,6 +12,8 @@ import java.util.Set;
 public class SingleThreadReactor implements Runnable{
 
     private Selector selector;
+
+    //Reactor使用ServerSocket用来监听一个端口号
     private ServerSocketChannel ssc;
 
     public SingleThreadReactor(int port) throws IOException {
@@ -20,8 +22,10 @@ public class SingleThreadReactor implements Runnable{
         ssc.socket().bind(new InetSocketAddress(port));
         ssc.configureBlocking(false);
         SelectionKey sk = ssc.register(selector, SelectionKey.OP_ACCEPT);
+
+        //关联事件处理程序，也就是Acceptor Handler
         sk.attach(new Acceptor());
-        System.out.println("reactor thread listening to port " + port);
+        System.out.println("Reactor thread listening to port " + port);
     }
 
     @Override
@@ -44,20 +48,25 @@ public class SingleThreadReactor implements Runnable{
 
     public void dispatch(SelectionKey sk){
         if (sk != null){
+            //当一个事件发生时，获取这个事件所对应的Handler，来对事件进行处理
             Runnable obj = (Runnable) sk.attachment();
-            obj.run();
+            if (obj != null){
+                obj.run();
+            }
         }
     }
 
     private class Acceptor implements Runnable{
-        public Acceptor(){
-        }
-
         @Override
         public void run() {
             try {
                 SocketChannel sc = ssc.accept();
-                new SimpleHandler(selector, sc);
+                // 由于ssc是非阻塞的，所以当有socket连接到端口号的时候，就会返回SocketChannel
+                // 如果没有socket连接的话，直接返回null
+                if (sc != null){
+                    new SimpleHandler(selector, sc);
+                    System.out.println("Reactor accepts connection - " + sc.getRemoteAddress());
+                }
             } catch (IOException e) {
                 e.printStackTrace();
             }

@@ -14,28 +14,29 @@ public class SimpleHandler implements Runnable {
     private SocketChannel socketChannel;
     private static State state = State.READING;
     private byte[] bytes;
-    private Selector selector;
+    private SelectionKey sk;
 
     SimpleHandler(Selector selector, SocketChannel sc) throws IOException {
         socketChannel = sc;
         socketChannel.configureBlocking(false);
-        this.selector = selector;
-        SelectionKey sk = socketChannel.register(selector, SelectionKey.OP_READ);
+        //此Selector和Reactor模型中的Selector是一个对象，即一个Selector监视所有的事件
+        sk = socketChannel.register(selector, SelectionKey.OP_READ);
         sk.attach(this);
     }
 
     @Override
     public void run() {
-        if (State.READING.equals(state)){
-            try {
+        try{
+            if (State.READING.equals(state)){
                 read();
-            } catch (IOException e) {
-                e.printStackTrace();
             }
-        }
-        else if (State.WRITING.equals(state)){
-            try {
+            else if (State.WRITING.equals(state)){
                 write();
+            }
+        }catch (Exception ex){
+            try {
+                //如果在读写数据的过程中发生了异常，则直接关闭此SocketChannel
+                socketChannel.close();
             } catch (IOException e) {
                 e.printStackTrace();
             }
@@ -48,8 +49,7 @@ public class SimpleHandler implements Runnable {
         byteBuffer.flip();
         socketChannel.write(byteBuffer);
 
-        SelectionKey sk = socketChannel.register(selector, SelectionKey.OP_READ);
-        sk.attach(this);
+        sk.interestOps(SelectionKey.OP_READ);
         state = State.READING;
     }
 
@@ -60,10 +60,9 @@ public class SimpleHandler implements Runnable {
         buffer.flip();
         bytes = buffer.array();
         String msg = new String(bytes, StandardCharsets.UTF_8);
-        System.out.println("client：" + socketChannel.getLocalAddress() + " send " + msg);
+        System.out.println("client：" + socketChannel.getRemoteAddress() + " send " + msg);
 
-        SelectionKey sk = socketChannel.register(selector, SelectionKey.OP_WRITE);
-        sk.attach(this);
+        sk.interestOps(SelectionKey.OP_WRITE);
         state = State.WRITING;
     }
 }
