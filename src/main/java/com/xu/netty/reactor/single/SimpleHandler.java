@@ -16,12 +16,24 @@ public class SimpleHandler implements Runnable {
     private byte[] bytes;
     private SelectionKey sk;
 
-    SimpleHandler(Selector selector, SocketChannel sc) throws IOException {
+    public SimpleHandler(SocketChannel sc){
+        this.socketChannel = sc;
+    }
+
+    public SimpleHandler(Selector selector, SocketChannel sc) throws IOException {
         socketChannel = sc;
         socketChannel.configureBlocking(false);
         //此Selector和Reactor模型中的Selector是一个对象，即一个Selector监视所有的事件
         sk = socketChannel.register(selector, SelectionKey.OP_READ);
         sk.attach(this);
+    }
+
+    public SocketChannel getSocketChannel() {
+        return socketChannel;
+    }
+
+    public void setSk(SelectionKey sk) {
+        this.sk = sk;
     }
 
     @Override

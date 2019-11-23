@@ -30,9 +30,9 @@ public class SingleThreadReactor implements Runnable{
 
     @Override
     public void run() {
-        while (true){
+        while (!Thread.interrupted()){
             try {
-                int select = selector.select();
+                selector.select();
                 Set<SelectionKey> keys = selector.selectedKeys();
                 Iterator<SelectionKey> iter = keys.iterator();
                 while (iter.hasNext()){
