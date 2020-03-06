@@ -62,11 +62,9 @@ class OutboundHandlerB extends ChannelOutboundHandlerAdapter {
     @Override
     public void handlerAdded(ChannelHandlerContext ctx) throws Exception {
         // 待handlerAdded事件触发3s后，模拟触发一个
-        /*ctx.executor().schedule(() -> {
+        ctx.executor().schedule(() -> {
             ctx.channel().write("Hello world ! ");
-        }, 3, TimeUnit.SECONDS);*/
-
-        ctx.channel().write("Hello world ! ");
+        }, 3, TimeUnit.SECONDS);
     }
 }
 
