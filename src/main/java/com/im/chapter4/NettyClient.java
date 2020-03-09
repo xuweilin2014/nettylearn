@@ -48,6 +48,11 @@ public class NettyClient {
             return byteBuf;
         }
 
+        /**
+         * 当服务器端向客户端发送数据时，在processSelectedKey函数中，调用unsafe.read来对数据进行处理。
+         * unsafe.read会调用NioByteUnsafe中的read方法来进行处理，它会回调pipeline中所有ChannelHandler的
+         * channelRead方法
+         */
         @Override
         public void channelRead(ChannelHandlerContext ctx, Object msg) throws Exception {
             ByteBuf byteBuf = (ByteBuf) msg;

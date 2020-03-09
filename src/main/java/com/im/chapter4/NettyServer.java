@@ -26,6 +26,7 @@ public class NettyServer {
         ServerBootstrap serverBootstrap = new ServerBootstrap();
         serverBootstrap.group(bossGroup, workerGroup)
                 .channel(NioServerSocketChannel.class)
+                .handler(new SimpleServerHandler())
                 .childHandler(new ChannelInitializer<NioSocketChannel>() {
                     @Override
                     protected void initChannel(NioSocketChannel ch) throws Exception {
@@ -55,6 +56,23 @@ public class NettyServer {
             byte[] bytes = "上疆场彼此弯弓月".getBytes(StandardCharsets.UTF_8);
             byteBuf.writeBytes(bytes);
             return byteBuf;
+        }
+    }
+
+    private static class SimpleServerHandler extends ChannelInboundHandlerAdapter {
+        @Override
+        public void channelActive(ChannelHandlerContext ctx) throws Exception {
+            System.out.println("channelActive");
+        }
+
+        @Override
+        public void channelRegistered(ChannelHandlerContext ctx) throws Exception {
+            System.out.println("channelRegistered");
+        }
+
+        @Override
+        public void handlerAdded(ChannelHandlerContext ctx) throws Exception {
+            System.out.println("handlerAdded");
         }
     }
 
