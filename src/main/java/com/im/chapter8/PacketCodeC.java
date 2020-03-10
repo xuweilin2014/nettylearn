@@ -9,20 +9,23 @@ import java.util.Map;
 public class PacketCodeC {
 
     private static final int MAGIC_NUMBER = 0x12345678;
+    static final PacketCodeC INSTANCE = new PacketCodeC();
+
     private static final Map<Byte, Class<? extends Packet>> PACKET_TYPE;
     private static final Map<Byte, Serializer> SERIALIZER_TYPE;
 
     static {
         PACKET_TYPE = new HashMap<>();
         PACKET_TYPE.put(Command.LOGIN_REQUEST, LoginRequestPacket.class);
+        PACKET_TYPE.put(Command.LOGIN_RESPONSE, LoginResponsePacket.class);
 
         SERIALIZER_TYPE = new HashMap<>();
         SERIALIZER_TYPE.put(SerializerAlgorithm.JSON, new JSONSerializer());
     }
 
-    public ByteBuf encode(Packet packet){
+    public ByteBuf encode(ByteBufAllocator allocator, Packet packet){
         //1.创建ByteBuf对象，用来作为二进制传递的数据包
-        ByteBuf byteBuf = ByteBufAllocator.DEFAULT.ioBuffer();
+        ByteBuf byteBuf = allocator.ioBuffer();
         //2.序列化过程，将Packet序列化为字节数组
         byte[] bytes = Serializer.DEFAULT.serialize(packet);
 

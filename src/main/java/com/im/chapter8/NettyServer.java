@@ -1,4 +1,4 @@
-package com.im.chapter4;
+package com.im.chapter8;
 
 import com.sun.beans.editors.ByteEditor;
 import io.netty.bootstrap.ServerBootstrap;
@@ -30,7 +30,7 @@ public class NettyServer {
                 .childHandler(new ChannelInitializer<NioSocketChannel>() {
                     @Override
                     protected void initChannel(NioSocketChannel ch) throws Exception {
-                        ch.pipeline().addLast(new FirstServerHandler());
+                        ch.pipeline().addLast(new ServerHandler());
                     }
                 });
 
