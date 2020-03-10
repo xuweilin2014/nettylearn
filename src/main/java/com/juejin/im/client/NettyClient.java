@@ -4,6 +4,7 @@ import com.juejin.im.client.handler.LoginResponseHandler;
 import com.juejin.im.client.handler.MessageResponseHandler;
 import com.juejin.im.codec.PacketDecoder;
 import com.juejin.im.codec.PacketEncoder;
+import com.juejin.im.codec.Spliter;
 import com.juejin.im.util.LoginUtil;
 import com.juejin.im.protocol.request.MessageRequestPacket;
 import com.juejin.im.protocol.PacketCodeC;
@@ -12,6 +13,7 @@ import io.netty.buffer.ByteBuf;
 import io.netty.channel.*;
 import io.netty.channel.nio.NioEventLoopGroup;
 import io.netty.channel.socket.nio.NioSocketChannel;
+import io.netty.handler.codec.LengthFieldBasedFrameDecoder;
 import io.netty.util.concurrent.Future;
 import io.netty.util.concurrent.GenericFutureListener;
 
@@ -31,6 +33,7 @@ public class NettyClient {
                 .handler(new ChannelInitializer<NioSocketChannel>() {
                     @Override
                     protected void initChannel(NioSocketChannel ch) throws Exception {
+                        ch.pipeline().addLast(new Spliter());
                         ch.pipeline().addLast(new PacketDecoder());
                         ch.pipeline().addLast(new LoginResponseHandler());
                         ch.pipeline().addLast(new MessageResponseHandler());
