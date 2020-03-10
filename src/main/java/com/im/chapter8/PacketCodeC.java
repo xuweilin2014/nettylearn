@@ -18,6 +18,8 @@ public class PacketCodeC {
         PACKET_TYPE = new HashMap<>();
         PACKET_TYPE.put(Command.LOGIN_REQUEST, LoginRequestPacket.class);
         PACKET_TYPE.put(Command.LOGIN_RESPONSE, LoginResponsePacket.class);
+        PACKET_TYPE.put(Command.MESSAGE_REQUEST, MessageRequestPacket.class);
+        PACKET_TYPE.put(Command.MESSAGE_RESPONSE, MessageResponsePacket.class);
 
         SERIALIZER_TYPE = new HashMap<>();
         SERIALIZER_TYPE.put(SerializerAlgorithm.JSON, new JSONSerializer());

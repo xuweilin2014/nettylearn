@@ -2,13 +2,15 @@ package com.im.chapter8;
 
 import io.netty.bootstrap.Bootstrap;
 import io.netty.buffer.ByteBuf;
-import io.netty.channel.ChannelHandlerContext;
-import io.netty.channel.ChannelInboundHandlerAdapter;
-import io.netty.channel.ChannelInitializer;
+import io.netty.channel.*;
 import io.netty.channel.nio.NioEventLoopGroup;
 import io.netty.channel.socket.nio.NioSocketChannel;
+import io.netty.util.concurrent.Future;
+import io.netty.util.concurrent.GenericFutureListener;
+
 import java.nio.charset.StandardCharsets;
 import java.util.Date;
+import java.util.Scanner;
 
 /**
  * @author xuwei_000
@@ -26,7 +28,40 @@ public class NettyClient {
                     }
                 });
 
-        bootstrap.connect("127.0.0.1", 8888);
+        connect(bootstrap, "127.0.0.1", 8888);
+    }
+
+    public static void connect(Bootstrap bootstrap, String addr, int port){
+        bootstrap.connect(addr, port).addListener(new GenericFutureListener<Future<? super Void>>() {
+            @Override
+            public void operationComplete(Future<? super Void> future) throws Exception {
+                if (future.isSuccess()){
+                    //连接服务端端成功的话，启动控制器线程
+                    startConsoleThread(((ChannelFuture) future).channel());
+                }else{
+                    //连接服务端失败
+                    System.out.println("客户端连接服务器失败");
+                }
+            }
+        });
+    }
+
+    private static void startConsoleThread(Channel channel) {
+        new Thread(() -> {
+            while (!Thread.interrupted()){
+                if (LoginUtil.hasLogin(channel)){
+                    System.out.println(new Date() + "：输入消息发送至服务端");
+                    Scanner scanner = new Scanner(System.in);
+
+                    String line = scanner.nextLine();
+                    MessageRequestPacket mrp = new MessageRequestPacket();
+                    mrp.setMessage(line);
+
+                    ByteBuf byteBuf = PacketCodeC.INSTANCE.encode(channel.alloc(), mrp);
+                    channel.writeAndFlush(byteBuf);
+                }
+            }
+        }).start();
     }
 
     static class FirstClientHandler extends ChannelInboundHandlerAdapter {
