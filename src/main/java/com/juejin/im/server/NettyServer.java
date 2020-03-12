@@ -3,6 +3,7 @@ package com.juejin.im.server;
 import com.juejin.im.codec.PacketDecoder;
 import com.juejin.im.codec.PacketEncoder;
 import com.juejin.im.codec.Spliter;
+import com.juejin.im.server.handler.AuthHandler;
 import com.juejin.im.server.handler.LoginRequestHandler;
 import com.juejin.im.server.handler.MessageRequestHandler;
 import io.netty.bootstrap.ServerBootstrap;
@@ -13,6 +14,9 @@ import io.netty.channel.ChannelInitializer;
 import io.netty.channel.nio.NioEventLoopGroup;
 import io.netty.channel.socket.nio.NioServerSocketChannel;
 import io.netty.channel.socket.nio.NioSocketChannel;
+import io.netty.util.concurrent.Future;
+import io.netty.util.concurrent.GenericFutureListener;
+
 import java.nio.charset.StandardCharsets;
 import java.util.Date;
 
@@ -20,6 +24,8 @@ import java.util.Date;
  * @author xuwei_000
  */
 public class NettyServer {
+
+    public static final int PORT = 8888;
 
     public static void main(String[] args) {
         NioEventLoopGroup bossGroup = new NioEventLoopGroup();
@@ -34,12 +40,27 @@ public class NettyServer {
                         ch.pipeline().addLast(new Spliter());
                         ch.pipeline().addLast(new PacketDecoder());
                         ch.pipeline().addLast(new LoginRequestHandler());
+
+                        ch.pipeline().addLast(new AuthHandler());
                         ch.pipeline().addLast(new MessageRequestHandler());
                         ch.pipeline().addLast(new PacketEncoder());
                     }
                 });
 
-        serverBootstrap.bind(8888);
+        bind(serverBootstrap, PORT);
+    }
+
+    private static void bind(ServerBootstrap serverBootstrap, int port){
+        serverBootstrap.bind(port).addListener(new GenericFutureListener<Future<? super Void>>() {
+            @Override
+            public void operationComplete(Future<? super Void> future) throws Exception {
+                if (future.isSuccess()){
+                    System.out.println(new Date() + ": 端口[" + port + "]绑定成功!");
+                }else{
+                    System.out.println("端口[" + port + "]绑定失败!");
+                }
+            }
+        });
     }
 
     static class FirstServerHandler extends ChannelInboundHandlerAdapter {

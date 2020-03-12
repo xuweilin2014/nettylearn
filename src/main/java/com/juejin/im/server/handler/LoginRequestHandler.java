@@ -3,6 +3,7 @@ package com.juejin.im.server.handler;
 import com.juejin.im.protocol.Packet;
 import com.juejin.im.protocol.request.LoginRequestPacket;
 import com.juejin.im.protocol.response.LoginResponsePacket;
+import com.juejin.im.util.LoginUtil;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.SimpleChannelInboundHandler;
 
@@ -12,10 +13,10 @@ public class LoginRequestHandler extends SimpleChannelInboundHandler<LoginReques
 
     @Override
     protected void channelRead0(ChannelHandlerContext ctx, LoginRequestPacket packet) throws Exception {
-        ctx.channel().writeAndFlush(login(packet));
+        ctx.channel().writeAndFlush(login(packet, ctx));
     }
 
-    private Packet login(LoginRequestPacket packet){
+    private Packet login(LoginRequestPacket packet, ChannelHandlerContext ctx){
         System.out.println(new Date() + ": 收到客户端登录请求……");
 
         LoginResponsePacket lrp = new LoginResponsePacket();
@@ -24,6 +25,7 @@ public class LoginRequestHandler extends SimpleChannelInboundHandler<LoginReques
             //登录成功
             lrp.setSuccess(true);
             System.out.println(new Date() + "：" + packet.getUsername() + " 登录成功");
+            LoginUtil.markAsLogin(ctx.channel());
         }else{
             //登录失败
             lrp.setSuccess(false);
