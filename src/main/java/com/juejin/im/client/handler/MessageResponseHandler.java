@@ -8,6 +8,9 @@ public class MessageResponseHandler extends SimpleChannelInboundHandler<MessageR
 
     @Override
     protected void channelRead0(ChannelHandlerContext ctx, MessageResponsePacket packet) throws Exception {
-        System.out.println(packet.getMessage());
+        String fromUserId = packet.getFromUserId();
+        String fromUserName = packet.getFromUserName();
+        System.out.println(fromUserId + ":" + fromUserName + " -> " + packet
+                .getMessage());
     }
 }

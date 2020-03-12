@@ -5,15 +5,15 @@ import com.juejin.im.client.handler.MessageResponseHandler;
 import com.juejin.im.codec.PacketDecoder;
 import com.juejin.im.codec.PacketEncoder;
 import com.juejin.im.codec.Spliter;
-import com.juejin.im.util.LoginUtil;
+import com.juejin.im.protocol.request.LoginRequestPacket;
 import com.juejin.im.protocol.request.MessageRequestPacket;
-import com.juejin.im.protocol.PacketCodeC;
+import com.juejin.im.util.SessionUtil;
 import io.netty.bootstrap.Bootstrap;
 import io.netty.buffer.ByteBuf;
 import io.netty.channel.*;
 import io.netty.channel.nio.NioEventLoopGroup;
 import io.netty.channel.socket.nio.NioSocketChannel;
-import io.netty.handler.codec.LengthFieldBasedFrameDecoder;
+
 import io.netty.util.concurrent.Future;
 import io.netty.util.concurrent.GenericFutureListener;
 
@@ -62,19 +62,28 @@ public class NettyClient {
 
     private static void startConsoleThread(Channel channel) {
         /**
-         * 在校验完客户端的状态为【登录成功】之后，在控制台读取一条消息之后按回车，
-         * 把消息发送至服务端，服务端收到消息之后，在控制台显示出来。并且返回一条
-         * 消息给客户端，客户端在控制台进行显示
+         * 如果校验客户端的状态为【登录成功】之后，则发送消息数据包到服务器端，
+         * 数据包中有发送给的用户ID和发送的具体消息
+         * 如果校验客户端的状态为【首次等】之后，则要求用户输入登录的用户名，并且
+         * 发送登录数据包给服务器端
          */
         new Thread(() -> {
             while (!Thread.interrupted()){
-                if (LoginUtil.hasLogin(channel)){
-                    System.out.println(new Date() + "：输入消息发送至服务端");
-                    Scanner scanner = new Scanner(System.in);
-                    String line = scanner.nextLine();
-                    MessageRequestPacket mrp = new MessageRequestPacket();
-                    mrp.setMessage(line);
+                Scanner scanner = new Scanner(System.in);
+                if (!SessionUtil.hasLogin(channel)) {
+                    System.out.println("输入用户名登录：");
+                    String userName = scanner.nextLine();
 
+                    LoginRequestPacket lrp = new LoginRequestPacket();
+                    lrp.setUsername(userName);
+                    lrp.setPassword("pwd");
+
+                    channel.writeAndFlush(lrp);
+                    waitForLoginResponse();
+                }else{
+                    MessageRequestPacket mrp = new MessageRequestPacket();
+                    mrp.setToUserId(scanner.next());
+                    mrp.setMessage(scanner.next());
                     channel.writeAndFlush(mrp);
                 }
             }
@@ -110,6 +119,13 @@ public class NettyClient {
             ByteBuf byteBuf = (ByteBuf) msg;
             System.out.println(new Date() + ": 客户端收到消息 -> :"
                     + byteBuf.toString(StandardCharsets.UTF_8));
+        }
+    }
+
+    private static void waitForLoginResponse() {
+        try {
+            Thread.sleep(1000);
+        } catch (InterruptedException ignored) {
         }
     }
 }
