@@ -2,13 +2,12 @@ package com.juejin.im.client;
 
 import com.juejin.im.client.console.ConsoleCommandManager;
 import com.juejin.im.client.console.LoginConsoleCommand;
-import com.juejin.im.client.handler.CreateGroupResponseHandler;
-import com.juejin.im.client.handler.LoginResponseHandler;
-import com.juejin.im.client.handler.LogoutResponseHandler;
-import com.juejin.im.client.handler.MessageResponseHandler;
+import com.juejin.im.client.handler.*;
 import com.juejin.im.codec.PacketDecoder;
 import com.juejin.im.codec.PacketEncoder;
 import com.juejin.im.codec.Spliter;
+import com.juejin.im.server.handler.JoinGroupRequestHandler;
+import com.juejin.im.server.handler.QuitGroupRequestHandler;
 import com.juejin.im.util.SessionUtil;
 import io.netty.bootstrap.Bootstrap;
 import io.netty.buffer.ByteBuf;
@@ -35,9 +34,19 @@ public class NettyClient {
                     protected void initChannel(NioSocketChannel ch) throws Exception {
                         ch.pipeline().addLast(new Spliter());
                         ch.pipeline().addLast(new PacketDecoder());
+                        // 登录响应处理器
                         ch.pipeline().addLast(new LoginResponseHandler());
+                        // 登出响应处理器
                         ch.pipeline().addLast(new LogoutResponseHandler());
+                        // 收消息处理器群
                         ch.pipeline().addLast(new MessageResponseHandler());
+                        // 创建群响应处理器
+                        ch.pipeline().addLast(new JoinGroupResponseHandler());
+                        // 退出群响应处理器
+                        ch.pipeline().addLast(new QuitGroupResponseHandler());
+                        // 获取群成员响应处理器
+                        ch.pipeline().addLast(new ListGroupMembersResponseHandler());
+                        // 创建群聊响应处理器
                         ch.pipeline().addLast(new CreateGroupResponseHandler());
                         ch.pipeline().addLast(new PacketEncoder());
                     }

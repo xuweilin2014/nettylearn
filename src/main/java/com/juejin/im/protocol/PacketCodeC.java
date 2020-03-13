@@ -1,14 +1,8 @@
 package com.juejin.im.protocol;
 
 import com.juejin.im.protocol.command.Command;
-import com.juejin.im.protocol.request.CreateGroupRequestPacket;
-import com.juejin.im.protocol.request.LoginRequestPacket;
-import com.juejin.im.protocol.request.LogoutRequestPacket;
-import com.juejin.im.protocol.request.MessageRequestPacket;
-import com.juejin.im.protocol.response.CreateGroupResponsePacket;
-import com.juejin.im.protocol.response.LoginResponsePacket;
-import com.juejin.im.protocol.response.LogoutResponsePacket;
-import com.juejin.im.protocol.response.MessageResponsePacket;
+import com.juejin.im.protocol.request.*;
+import com.juejin.im.protocol.response.*;
 import com.juejin.im.serializer.Serializer;
 import com.juejin.im.serializer.SerializerAlgorithm;
 import com.juejin.im.serializer.impl.JSONSerializer;
@@ -35,6 +29,12 @@ public class PacketCodeC {
         PACKET_TYPE.put(Command.CREATE_GROUP_RESPONSE, CreateGroupResponsePacket.class);
         PACKET_TYPE.put(Command.LOGOUT_REQUEST, LogoutRequestPacket.class);
         PACKET_TYPE.put(Command.LOGOUT_RESPONSE, LogoutResponsePacket.class);
+        PACKET_TYPE.put(Command.JOIN_GROUP_REQUEST, JoinGroupRequestPacket.class);
+        PACKET_TYPE.put(Command.JOIN_GROUP_RESPONSE, JoinGroupResponsePacket.class);
+        PACKET_TYPE.put(Command.QUIT_GROUP_REQUEST, QuitGroupRequestPacket.class);
+        PACKET_TYPE.put(Command.QUIT_GROUP_RESPONSE, QuitGroupResponsePacket.class);
+        PACKET_TYPE.put(Command.LIST_GROUP_REQUEST, ListGroupMembersRequestPacket.class);
+        PACKET_TYPE.put(Command.LIST_GROUP_RESPONSE, ListGroupMembersResponsePacket.class);
 
         SERIALIZER_TYPE = new HashMap<>();
         SERIALIZER_TYPE.put(SerializerAlgorithm.JSON, new JSONSerializer());
