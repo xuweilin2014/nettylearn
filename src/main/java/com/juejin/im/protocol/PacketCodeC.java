@@ -1,9 +1,13 @@
 package com.juejin.im.protocol;
 
 import com.juejin.im.protocol.command.Command;
+import com.juejin.im.protocol.request.CreateGroupRequestPacket;
 import com.juejin.im.protocol.request.LoginRequestPacket;
+import com.juejin.im.protocol.request.LogoutRequestPacket;
 import com.juejin.im.protocol.request.MessageRequestPacket;
+import com.juejin.im.protocol.response.CreateGroupResponsePacket;
 import com.juejin.im.protocol.response.LoginResponsePacket;
+import com.juejin.im.protocol.response.LogoutResponsePacket;
 import com.juejin.im.protocol.response.MessageResponsePacket;
 import com.juejin.im.serializer.Serializer;
 import com.juejin.im.serializer.SerializerAlgorithm;
@@ -27,6 +31,10 @@ public class PacketCodeC {
         PACKET_TYPE.put(Command.LOGIN_RESPONSE, LoginResponsePacket.class);
         PACKET_TYPE.put(Command.MESSAGE_REQUEST, MessageRequestPacket.class);
         PACKET_TYPE.put(Command.MESSAGE_RESPONSE, MessageResponsePacket.class);
+        PACKET_TYPE.put(Command.CREATE_GROUP_REQUEST, CreateGroupRequestPacket.class);
+        PACKET_TYPE.put(Command.CREATE_GROUP_RESPONSE, CreateGroupResponsePacket.class);
+        PACKET_TYPE.put(Command.LOGOUT_REQUEST, LogoutRequestPacket.class);
+        PACKET_TYPE.put(Command.LOGOUT_RESPONSE, LogoutResponsePacket.class);
 
         SERIALIZER_TYPE = new HashMap<>();
         SERIALIZER_TYPE.put(SerializerAlgorithm.JSON, new JSONSerializer());

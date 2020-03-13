@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="Statistic">
+    <option name="excludedDirectories">
+      <list>
+        <option value="$PROJECT_DIR$/src/protobuf" />
+        <option value="$PROJECT_DIR$/src/main/java/com/xu" />
+        <option value="$PROJECT_DIR$/src/main/java/com/juejin/chapter7" />
+        <option value="$PROJECT_DIR$/src/main/java/com/juejin/chapter3" />
+        <option value="$PROJECT_DIR$/src/main/java/com/juejin/chapter2" />
+        <option value="$PROJECT_DIR$/src/main/java/com/juejin/chapter13" />
+      </list>
+    </option>
+  </component>
+</project>

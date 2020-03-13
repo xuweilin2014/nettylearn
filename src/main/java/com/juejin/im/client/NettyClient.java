@@ -1,22 +1,22 @@
 package com.juejin.im.client;
 
+import com.juejin.im.client.console.ConsoleCommandManager;
+import com.juejin.im.client.console.LoginConsoleCommand;
+import com.juejin.im.client.handler.CreateGroupResponseHandler;
 import com.juejin.im.client.handler.LoginResponseHandler;
+import com.juejin.im.client.handler.LogoutResponseHandler;
 import com.juejin.im.client.handler.MessageResponseHandler;
 import com.juejin.im.codec.PacketDecoder;
 import com.juejin.im.codec.PacketEncoder;
 import com.juejin.im.codec.Spliter;
-import com.juejin.im.protocol.request.LoginRequestPacket;
-import com.juejin.im.protocol.request.MessageRequestPacket;
 import com.juejin.im.util.SessionUtil;
 import io.netty.bootstrap.Bootstrap;
 import io.netty.buffer.ByteBuf;
 import io.netty.channel.*;
 import io.netty.channel.nio.NioEventLoopGroup;
 import io.netty.channel.socket.nio.NioSocketChannel;
-
 import io.netty.util.concurrent.Future;
 import io.netty.util.concurrent.GenericFutureListener;
-
 import java.nio.charset.StandardCharsets;
 import java.util.Date;
 import java.util.Scanner;
@@ -36,7 +36,9 @@ public class NettyClient {
                         ch.pipeline().addLast(new Spliter());
                         ch.pipeline().addLast(new PacketDecoder());
                         ch.pipeline().addLast(new LoginResponseHandler());
+                        ch.pipeline().addLast(new LogoutResponseHandler());
                         ch.pipeline().addLast(new MessageResponseHandler());
+                        ch.pipeline().addLast(new CreateGroupResponseHandler());
                         ch.pipeline().addLast(new PacketEncoder());
                     }
                 });
@@ -61,30 +63,20 @@ public class NettyClient {
     }
 
     private static void startConsoleThread(Channel channel) {
+        ConsoleCommandManager ccm = new ConsoleCommandManager();
+        Scanner scanner = new Scanner(System.in);
         /**
          * 如果校验客户端的状态为【登录成功】之后，则发送消息数据包到服务器端，
          * 数据包中有发送给的用户ID和发送的具体消息
-         * 如果校验客户端的状态为【首次等】之后，则要求用户输入登录的用户名，并且
+         * 如果校验客户端的状态为【首次登录】之后，则要求用户输入登录的用户名，并且
          * 发送登录数据包给服务器端
          */
         new Thread(() -> {
             while (!Thread.interrupted()){
-                Scanner scanner = new Scanner(System.in);
                 if (!SessionUtil.hasLogin(channel)) {
-                    System.out.println("输入用户名登录：");
-                    String userName = scanner.nextLine();
-
-                    LoginRequestPacket lrp = new LoginRequestPacket();
-                    lrp.setUsername(userName);
-                    lrp.setPassword("pwd");
-
-                    channel.writeAndFlush(lrp);
-                    waitForLoginResponse();
+                    new LoginConsoleCommand().exec(scanner, channel);
                 }else{
-                    MessageRequestPacket mrp = new MessageRequestPacket();
-                    mrp.setToUserId(scanner.next());
-                    mrp.setMessage(scanner.next());
-                    channel.writeAndFlush(mrp);
+                    ccm.exec(scanner, channel);
                 }
             }
         }).start();
