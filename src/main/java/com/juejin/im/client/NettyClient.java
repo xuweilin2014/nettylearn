@@ -7,6 +7,7 @@ import com.juejin.im.codec.PacketCodecHandler;
 import com.juejin.im.codec.PacketDecoder;
 import com.juejin.im.codec.PacketEncoder;
 import com.juejin.im.codec.Spliter;
+import com.juejin.im.handler.IMIdleStateHandler;
 import com.juejin.im.server.handler.JoinGroupRequestHandler;
 import com.juejin.im.server.handler.QuitGroupRequestHandler;
 import com.juejin.im.util.SessionUtil;
@@ -33,6 +34,8 @@ public class NettyClient {
                 .handler(new ChannelInitializer<NioSocketChannel>() {
                     @Override
                     protected void initChannel(NioSocketChannel ch) throws Exception {
+                        // 空闲检测
+                        ch.pipeline().addLast(new IMIdleStateHandler());
                         ch.pipeline().addLast(new Spliter());
                         ch.pipeline().addLast(PacketCodecHandler.INSTANCE);
                         // 登录响应处理器
@@ -50,6 +53,8 @@ public class NettyClient {
                         // 创建群聊响应处理器
                         ch.pipeline().addLast(CreateGroupResponseHandler.INSTANCE);
                         ch.pipeline().addLast(GroupMessageResponseHandler.INSTANCE);
+                        // 心跳定时器
+                        ch.pipeline().addLast(new HeartBeatTimeHandler());
                     }
                 });
 

@@ -1,9 +1,8 @@
 package com.juejin.im.server;
 
 import com.juejin.im.codec.PacketCodecHandler;
-import com.juejin.im.codec.PacketDecoder;
-import com.juejin.im.codec.PacketEncoder;
 import com.juejin.im.codec.Spliter;
+import com.juejin.im.handler.IMIdleStateHandler;
 import com.juejin.im.server.handler.*;
 import io.netty.bootstrap.ServerBootstrap;
 import io.netty.buffer.ByteBuf;
@@ -36,9 +35,11 @@ public class NettyServer {
                 .childHandler(new ChannelInitializer<NioSocketChannel>() {
                     @Override
                     protected void initChannel(NioSocketChannel ch) throws Exception {
+                        ch.pipeline().addLast(new IMIdleStateHandler());
                         ch.pipeline().addLast(new Spliter());
                         ch.pipeline().addLast(PacketCodecHandler.INSTANCE);
                         ch.pipeline().addLast(LoginRequestHandler.INSTANCE);
+                        ch.pipeline().addLast(HeartBeatRequestHandler.INSTANCE);
                         ch.pipeline().addLast(AuthHandler.INSTANCE);
                         ch.pipeline().addLast(IMHandler.INSTANCE);
                     }

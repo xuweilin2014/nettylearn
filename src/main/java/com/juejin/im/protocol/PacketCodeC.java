@@ -37,6 +37,8 @@ public class PacketCodeC {
         PACKET_TYPE.put(Command.LIST_GROUP_RESPONSE, ListGroupMembersResponsePacket.class);
         PACKET_TYPE.put(Command.GROUP_MESSAGE_REQUEST, GroupMessageRequestPacket.class);
         PACKET_TYPE.put(Command.GROUP_MESSAGE_RESPONSE, GroupMessageResponsePacket.class);
+        PACKET_TYPE.put(Command.HEART_BEAT_REQUEST, HeartBeatRequestPacket.class);
+        PACKET_TYPE.put(Command.HEART_BEAT_RESPONSE, HeartBeatResponsePacket.class);
 
         SERIALIZER_TYPE = new HashMap<>();
         SERIALIZER_TYPE.put(SerializerAlgorithm.JSON, new JSONSerializer());
