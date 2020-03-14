@@ -8,6 +8,8 @@ import io.netty.channel.ChannelInboundHandlerAdapter;
 @ChannelHandler.Sharable
 public class AuthHandler extends ChannelInboundHandlerAdapter {
 
+    public static final AuthHandler INSTANCE = new AuthHandler();
+
     /**
      * AuthHandler 继承自 ChannelInboundHandlerAdapter，覆盖了 channelRead() 方法，
      * 表明他可以处理所有类型的数据

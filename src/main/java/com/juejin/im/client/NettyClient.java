@@ -3,6 +3,7 @@ package com.juejin.im.client;
 import com.juejin.im.client.console.ConsoleCommandManager;
 import com.juejin.im.client.console.LoginConsoleCommand;
 import com.juejin.im.client.handler.*;
+import com.juejin.im.codec.PacketCodecHandler;
 import com.juejin.im.codec.PacketDecoder;
 import com.juejin.im.codec.PacketEncoder;
 import com.juejin.im.codec.Spliter;
@@ -33,22 +34,22 @@ public class NettyClient {
                     @Override
                     protected void initChannel(NioSocketChannel ch) throws Exception {
                         ch.pipeline().addLast(new Spliter());
-                        ch.pipeline().addLast(new PacketDecoder());
+                        ch.pipeline().addLast(PacketCodecHandler.INSTANCE);
                         // 登录响应处理器
-                        ch.pipeline().addLast(new LoginResponseHandler());
+                        ch.pipeline().addLast(LoginResponseHandler.INSTANCE);
                         // 登出响应处理器
-                        ch.pipeline().addLast(new LogoutResponseHandler());
+                        ch.pipeline().addLast(LogoutResponseHandler.INSTANCE);
                         // 收消息处理器群
-                        ch.pipeline().addLast(new MessageResponseHandler());
+                        ch.pipeline().addLast(MessageResponseHandler.INSTANCE);
                         // 创建群响应处理器
-                        ch.pipeline().addLast(new JoinGroupResponseHandler());
+                        ch.pipeline().addLast(JoinGroupResponseHandler.INSTANCE);
                         // 退出群响应处理器
-                        ch.pipeline().addLast(new QuitGroupResponseHandler());
+                        ch.pipeline().addLast(QuitGroupResponseHandler.INSTANCE);
                         // 获取群成员响应处理器
-                        ch.pipeline().addLast(new ListGroupMembersResponseHandler());
+                        ch.pipeline().addLast(ListGroupMembersResponseHandler.INSTANCE);
                         // 创建群聊响应处理器
-                        ch.pipeline().addLast(new CreateGroupResponseHandler());
-                        ch.pipeline().addLast(new PacketEncoder());
+                        ch.pipeline().addLast(CreateGroupResponseHandler.INSTANCE);
+                        ch.pipeline().addLast(GroupMessageResponseHandler.INSTANCE);
                     }
                 });
 

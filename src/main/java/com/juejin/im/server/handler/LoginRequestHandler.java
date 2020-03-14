@@ -5,17 +5,21 @@ import com.juejin.im.protocol.request.LoginRequestPacket;
 import com.juejin.im.protocol.response.LoginResponsePacket;
 import com.juejin.im.session.Session;
 import com.juejin.im.util.SessionUtil;
+import io.netty.channel.ChannelHandler;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.SimpleChannelInboundHandler;
 
 import java.util.Date;
 import java.util.UUID;
 
+@ChannelHandler.Sharable
 public class LoginRequestHandler extends SimpleChannelInboundHandler<LoginRequestPacket> {
+
+    public static final LoginRequestHandler INSTANCE = new LoginRequestHandler();
 
     @Override
     protected void channelRead0(ChannelHandlerContext ctx, LoginRequestPacket packet) throws Exception {
-        ctx.channel().writeAndFlush(login(packet, ctx));
+        ctx.writeAndFlush(login(packet, ctx));
     }
 
     private Packet login(LoginRequestPacket packet, ChannelHandlerContext ctx){

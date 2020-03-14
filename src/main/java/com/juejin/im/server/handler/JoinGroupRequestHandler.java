@@ -3,11 +3,15 @@ package com.juejin.im.server.handler;
 import com.juejin.im.protocol.request.JoinGroupRequestPacket;
 import com.juejin.im.protocol.response.JoinGroupResponsePacket;
 import com.juejin.im.util.SessionUtil;
+import io.netty.channel.ChannelHandler;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.SimpleChannelInboundHandler;
 import io.netty.channel.group.ChannelGroup;
 
+@ChannelHandler.Sharable
 public class JoinGroupRequestHandler extends SimpleChannelInboundHandler<JoinGroupRequestPacket> {
+
+    public static final JoinGroupRequestHandler INSTANCE = new JoinGroupRequestHandler();
 
     @Override
     protected void channelRead0(ChannelHandlerContext ctx, JoinGroupRequestPacket packet) throws Exception {
@@ -22,7 +26,7 @@ public class JoinGroupRequestHandler extends SimpleChannelInboundHandler<JoinGro
         joinGroupResponsePacket.setGroupId(groupId);
 
         // 3.将响应信息发送给客户端
-        ctx.channel().writeAndFlush(joinGroupResponsePacket);
+        ctx.writeAndFlush(joinGroupResponsePacket);
     }
 
 }

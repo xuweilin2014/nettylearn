@@ -3,11 +3,15 @@ package com.juejin.im.server.handler;
 import com.juejin.im.protocol.request.QuitGroupRequestPacket;
 import com.juejin.im.protocol.response.QuitGroupResponsePacket;
 import com.juejin.im.util.SessionUtil;
+import io.netty.channel.ChannelHandler;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.SimpleChannelInboundHandler;
 import io.netty.channel.group.ChannelGroup;
 
+@ChannelHandler.Sharable
 public class QuitGroupRequestHandler extends SimpleChannelInboundHandler<QuitGroupRequestPacket> {
+
+    public static final QuitGroupRequestHandler INSTANCE = new QuitGroupRequestHandler();
 
     @Override
     protected void channelRead0(ChannelHandlerContext ctx, QuitGroupRequestPacket packet) throws Exception {
@@ -22,6 +26,6 @@ public class QuitGroupRequestHandler extends SimpleChannelInboundHandler<QuitGro
         qgrp.setSuccess(true);
 
         // 3.将响应消息发送给客户端
-        ctx.channel().writeAndFlush(qgrp);
+        ctx.writeAndFlush(qgrp);
     }
 }

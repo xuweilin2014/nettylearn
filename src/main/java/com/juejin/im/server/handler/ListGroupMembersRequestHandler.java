@@ -5,6 +5,7 @@ import com.juejin.im.protocol.response.ListGroupMembersResponsePacket;
 import com.juejin.im.session.Session;
 import com.juejin.im.util.SessionUtil;
 import io.netty.channel.Channel;
+import io.netty.channel.ChannelHandler;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.SimpleChannelInboundHandler;
 import io.netty.channel.group.ChannelGroup;
@@ -12,7 +13,10 @@ import io.netty.channel.group.ChannelGroup;
 import java.util.ArrayList;
 import java.util.List;
 
+@ChannelHandler.Sharable
 public class ListGroupMembersRequestHandler extends SimpleChannelInboundHandler<ListGroupMembersRequestPacket> {
+
+    public static final ListGroupMembersRequestHandler INSTANCE = new ListGroupMembersRequestHandler();
 
     @Override
     protected void channelRead0(ChannelHandlerContext ctx, ListGroupMembersRequestPacket packet) throws Exception {
@@ -31,6 +35,6 @@ public class ListGroupMembersRequestHandler extends SimpleChannelInboundHandler<
         ListGroupMembersResponsePacket lgmrp = new ListGroupMembersResponsePacket();
         lgmrp.setSessionList(sessions);
         lgmrp.setGroupId(groupId);
-        ctx.channel().writeAndFlush(lgmrp);
+        ctx.writeAndFlush(lgmrp);
     }
 }

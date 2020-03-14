@@ -35,6 +35,8 @@ public class PacketCodeC {
         PACKET_TYPE.put(Command.QUIT_GROUP_RESPONSE, QuitGroupResponsePacket.class);
         PACKET_TYPE.put(Command.LIST_GROUP_REQUEST, ListGroupMembersRequestPacket.class);
         PACKET_TYPE.put(Command.LIST_GROUP_RESPONSE, ListGroupMembersResponsePacket.class);
+        PACKET_TYPE.put(Command.GROUP_MESSAGE_REQUEST, GroupMessageRequestPacket.class);
+        PACKET_TYPE.put(Command.GROUP_MESSAGE_RESPONSE, GroupMessageResponsePacket.class);
 
         SERIALIZER_TYPE = new HashMap<>();
         SERIALIZER_TYPE.put(SerializerAlgorithm.JSON, new JSONSerializer());
@@ -62,6 +64,7 @@ public class PacketCodeC {
 
         //3.得到序列化算法
         byte serializerAlgorithm = byteBuf.readByte();
+
         //4.得到指令类型
         byte command = byteBuf.readByte();
 
