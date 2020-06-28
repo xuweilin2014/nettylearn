@@ -17,9 +17,8 @@
     <dubbo:protocol name="dubbo" port="20880" />
 
     <!-- 声明需要暴露的服务接口 -->
-    <dubbo:service interface="com.dubbo.simple.common.DemoService" ref="demoService" />
-    <dubbo:service id="demo1" interface="com.dubbo.simple.common.DemoService" ref="demoService" />
+    <dubbo:service interface="com.dubbo.mock.common.DemoService" ref="demoService" mock="return null"/>
 
     <!-- 和本地bean一样实现服务 -->
-    <bean id="demoService" class="com.dubbo.simple.server.DemoServiceImpl" />
+    <bean id="demoService" class="com.dubbo.mock.server.DemoServiceImpl" />
 </beans>
