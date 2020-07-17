@@ -1,1 +1,4 @@
-simple=com.dubbo.filter.mfilter.SimpleFilter
+filter1=com.dubbo.filter.mfilter.FilterOne
+filter2=com.dubbo.filter.mfilter.FilterTwo
+filter3=com.dubbo.filter.mfilter.FilterThree
+filter4=com.dubbo.filter.mfilter.FilterFour
