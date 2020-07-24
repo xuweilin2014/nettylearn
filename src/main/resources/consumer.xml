@@ -11,8 +11,11 @@
     <dubbo:application name="consumer-of-helloworld-app"  />
 
     <!-- 使用multicast广播注册中心暴露发现服务地址 -->
-    <dubbo:registry address="zookeeper://127.0.0.1:2181" />
+    <dubbo:registry id="zk1" address="zookeeper://127.0.0.1:2181" />
+    <dubbo:registry id="zk2" address="zookeeper://127.0.0.1:2182" />
+    <dubbo:registry id="zk3" address="zookeeper://127.0.0.1:2183" />
 
     <!-- 生成远程服务代理，可以和本地bean一样使用demoService -->
-    <dubbo:reference id="demoService" interface="com.dubbo.simple.common.DemoService"/>
+    <dubbo:reference id="demoService" interface="com.dubbo.simple.common.DemoService" filter="filter2,filter3,default,filter4"
+                        registry="zk1,zk2,zk3" client="netty4"/>
 </beans>
