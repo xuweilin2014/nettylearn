@@ -1,4 +1,4 @@
-package com.dubbo.service.common;
+package com.dubbo.service.type;
 
 public interface CallbackService {
 

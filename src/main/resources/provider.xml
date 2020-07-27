@@ -21,8 +21,16 @@
     <!-- 声明需要暴露的服务接口 -->
     <dubbo:service registry="zk1,zk2,zk3" interface="com.dubbo.simple.common.DemoService" ref="demoService"/>
     <dubbo:service interface="com.dubbo.simple.common.CalculateService" ref="calcService"/>
+    <dubbo:service registry="zk1,zk2,zk3" interface="com.dubbo.service.type.CallbackService" ref="callbackService">
+        <dubbo:method name="addListener">
+            <dubbo:argument index="1" callback="true"/>
+        </dubbo:method>
+    </dubbo:service>
+    <dubbo:service interface="com.dubbo.service.type.NotifyService" ref="notifyService" />
 
     <!-- 和本地bean一样实现服务 -->
+    <bean id="callbackService" class="com.dubbo.service.impl.CallbackServiceImpl"/>
     <bean id="demoService" class="com.dubbo.simple.server.DemoServiceImpl" />
     <bean id="calcService" class="com.dubbo.simple.server.CalculateServiceImpl"/>
+    <bean id="notifyService" class="com.dubbo.service.impl.NotifyServiceImpl"/>
 </beans>

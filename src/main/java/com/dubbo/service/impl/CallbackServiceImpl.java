@@ -1,7 +1,7 @@
 package com.dubbo.service.impl;
 
-import com.dubbo.service.common.CallbackListener;
-import com.dubbo.service.common.CallbackService;
+import com.dubbo.service.type.CallbackListener;
+import com.dubbo.service.type.CallbackService;
 
 import java.util.Date;
 import java.util.HashMap;

@@ -1,7 +1,6 @@
 package com.dubbo.notify.client;
 
-import com.dubbo.service.common.NotifyService;
-import com.dubbo.simple.common.DemoService;
+import com.dubbo.service.type.NotifyService;
 import org.springframework.context.support.ClassPathXmlApplicationContext;
 
 public class Consumer {

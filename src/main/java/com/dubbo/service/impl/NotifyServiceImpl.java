@@ -1,6 +1,6 @@
 package com.dubbo.service.impl;
 
-import com.dubbo.service.common.NotifyService;
+import com.dubbo.service.type.NotifyService;
 
 public class NotifyServiceImpl implements NotifyService {
 
