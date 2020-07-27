@@ -1,8 +1,7 @@
 package com.dubbo.callback.consumer;
 
-import com.dubbo.service.common.CallbackListener;
-import com.dubbo.service.common.CallbackService;
-import com.dubbo.simple.common.DemoService;
+import com.dubbo.service.type.callback.CallbackListener;
+import com.dubbo.service.type.callback.CallbackService;
 import org.springframework.context.support.ClassPathXmlApplicationContext;
 
 import java.util.concurrent.CountDownLatch;

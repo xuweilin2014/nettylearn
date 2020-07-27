@@ -1,6 +1,6 @@
-package com.dubbo.service.impl;
+package com.dubbo.service.impl.notify;
 
-import com.dubbo.service.type.Notify;
+import com.dubbo.service.type.notify.Notify;
 
 import java.util.HashMap;
 import java.util.Map;

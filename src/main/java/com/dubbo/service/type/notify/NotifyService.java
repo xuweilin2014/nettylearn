@@ -1,4 +1,4 @@
-package com.dubbo.service.type;
+package com.dubbo.service.type.notify;
 
 public interface NotifyService {
 

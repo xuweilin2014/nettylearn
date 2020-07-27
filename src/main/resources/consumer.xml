@@ -18,10 +18,10 @@
     <!-- 生成远程服务代理，可以和本地bean一样使用demoService -->
     <dubbo:reference id="demoService" interface="com.dubbo.simple.common.DemoService" filter="filter2,filter3,default,filter4"
                         registry="zk1,zk2,zk3" client="netty4"/>
-    <dubbo:reference id="callbackService" interface="com.dubbo.service.type.CallbackService" registry="zk1,zk2,zk3" client="netty4"/>
-    <dubbo:reference id="notifyService" interface="com.dubbo.service.type.NotifyService" client="netty4">
+    <dubbo:reference id="callbackService" interface="com.dubbo.service.type.callback.CallbackService" registry="zk1,zk2,zk3" client="netty4"/>
+    <dubbo:reference id="notifyService" interface="com.dubbo.service.type.notify.NotifyService" client="netty4">
         <dubbo:method name="sayHello" onreturn="notify.onReturn" onthrow="notify.onThrow" />
     </dubbo:reference>
 
-    <bean id="notify" class="com.dubbo.service.impl.NotifyImpl"/>
+    <bean id="notify" class="com.dubbo.service.impl.notify.NotifyImpl"/>
 </beans>
