@@ -12,16 +12,17 @@
 
     <!-- 使用multicast广播注册中心暴露服务地址 -->
     <dubbo:registry id="zk1" address="zookeeper://127.0.0.1:2181" />
-    <dubbo:registry id="zk2" address="zookeeper://127.0.0.1:2182" />
-    <dubbo:registry id="zk3" address="zookeeper://127.0.0.1:2183" />
+<!--    <dubbo:registry id="zk2" address="zookeeper://127.0.0.1:2182" />-->
+<!--    <dubbo:registry id="zk3" address="zookeeper://127.0.0.1:2183" />-->
 
     <!-- 用dubbo协议在20880端口暴露服务 -->
-    <dubbo:protocol name="dubbo" port="20882" server="netty4"/>
+    <dubbo:protocol id="p1" name="dubbo" port="20881" server="netty4"/>
+    <dubbo:protocol id="p2" name="injvm" port="20881" server="netty4"/>
 
     <!-- 声明需要暴露的服务接口 -->
-    <dubbo:service registry="zk1,zk2,zk3" interface="com.dubbo.simple.common.DemoService" ref="demoService"/>
+    <dubbo:service registry="zk1" protocol="p1,p2"  interface="com.dubbo.simple.common.DemoService" ref="demoService" timeout="1000"/>
     <dubbo:service interface="com.dubbo.simple.common.CalculateService" ref="calcService"/>
-    <dubbo:service registry="zk1,zk2,zk3" interface="com.dubbo.service.type.callback.CallbackService" ref="callbackService">
+    <dubbo:service registry="zk1" interface="com.dubbo.service.type.callback.CallbackService" ref="callbackService">
         <dubbo:method name="addListener">
             <dubbo:argument index="1" callback="true"/>
         </dubbo:method>
