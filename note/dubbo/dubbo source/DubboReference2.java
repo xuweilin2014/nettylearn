@@ -59,7 +59,7 @@ public class DubboReference2{
      * 
      * 总结：
      * 
-     * 1.心跳请求发送以及超时处理
+     * 1.心跳请求发送以及心跳超时处理
      * 
      * Dubbo 对于建立的每一个连接，同时在客户端和服务端使用 ScheduledThreadPoolExecutor 开启了1个定时任务 HeartbeatTask，用于定时发送心跳以及定时重连、断连，
      * 在服务端和客户端开启的任务相同。
@@ -69,7 +69,7 @@ public class DubboReference2{
      * 
      * 2.心跳请求的接收与处理
      * 
-     * 在请求接收的Handler处理链路中，包含有一个 心跳消息处理器HeartbeatHandler，对于所有类型的请求消息，该处理器都会更新对应通道中 最近一次接收消息的时间。
+     * 在请求接收的Handler处理链路中，包含有一个心跳消息处理器HeartbeatHandler，对于所有类型的请求消息，该处理器都会更新对应通道中 最近一次接收消息的时间。
      * 对于心跳请求消息，该处理器接收心跳请求并构建对应的心跳响应通过通道Channel发送回去；对于心跳响应消息，则直接返回；对于其他数据，则交给另外的handler进行处理。
      */
 
@@ -421,12 +421,13 @@ public class DubboReference2{
 
         private final long shutdown_timeout;
 
+        private static final ScheduledThreadPoolExecutor reconnectExecutorService = new ScheduledThreadPoolExecutor(2, new NamedThreadFactory("DubboClientReconnectTimer", true));
+
         private final int reconnect_warning_period;
         // the last successed connected time
         private long lastConnectedTime = System.currentTimeMillis();
 
         private final AtomicInteger reconnect_count = new AtomicInteger(0);
-
          // Reconnection error log has been called before?
         private final AtomicBoolean reconnect_error_log_flag = new AtomicBoolean(false);
 
@@ -491,8 +492,9 @@ public class DubboReference2{
                 }
 
                 // 如果连接没有建立好，要么在上面的 if 判断中抛出异常，要么在 doConnect 方法的执行过程中抛出异常，被下面的 try-catch 语句块捕获。
+                // 所以，运行到这里的话，就表明已经和服务器端建立好了连接。
                 // 连接建立好或者重新建立好之后，将reconnect_count（表示重连次数）以及reconnect_error_log_flag（是否已经记录了重连警告信息）
-                // 重置为初始值0和false
+                // 重置为初始值0和false。
                 reconnect_count.set(0);
                 reconnect_error_log_flag.set(false);
             } catch (RemotingException e) {
@@ -508,9 +510,10 @@ public class DubboReference2{
 
         // 创建了一个Runnable，用来检测是否连接，如果连接断开，调用connect方法；定时调度交给 ScheduledThreadPoolExecutor 来执行
         private synchronized void initConnectStatusCheckCommand() {
+
             // reconnect=false to close reconnect
-            // 获取到<dubbo:reference/>中的reconnect参数。参数的值可以为true/false，也可以为进行重连接操作的间隔。reconnect参数如果为false，将其设置为0，
-            // 表示进行重连接操作，reconnect如果为true，就将其设置为 2000ms，或者用户自己设置的时间间隔数
+            // 获取到<dubbo:reference/>中的reconnect参数。参数的值可以为true/false，也可以为进行重连接操作的时间间隔。reconnect参数如果为false，将其设置为0s，
+            // 表示不进行重连接操作，reconnect如果为true，就将其设置为 2000ms，或者用户自己设置的时间间隔数
             int reconnect = getReconnectParam(getUrl());
 
             // reconnectExecutorFuture == null || reconnectExecutorFuture.isCancelled() 这个判断条件保证了当再一次连接操作的时候，
@@ -529,7 +532,7 @@ public class DubboReference2{
                             String errorMsg = "client reconnect to " + getUrl().getAddress() + " find error . url: " + getUrl();
                             // wait registry sync provider list
                             // shutdown_timeout表示服务器一直连不上的超时时间，如果距离上次连上的时间间隔（lastConnectedTime）超过
-                            // 了shutdown_timeout，且还没有在日志中记录重连警告，那么就在日志里面进行记录
+                            // 了shutdown_timeout，且还没有在日志中记录重连警告，那么就在日志里面进行记录，并且只记录一次
                             if (System.currentTimeMillis() - lastConnectedTime > shutdown_timeout) {
                                 if (!reconnect_error_log_flag.get()) {
                                     reconnect_error_log_flag.set(true);
@@ -545,8 +548,7 @@ public class DubboReference2{
                     }
                 };
                 // 创建好定时任务之后，就交给 ScheduledThreadPoolExecutor 来执行
-                reconnectExecutorFuture = reconnectExecutorService
-                                                .scheduleWithFixedDelay(connectStatusCheckCommand, reconnect, reconnect, TimeUnit.MILLISECONDS);
+                reconnectExecutorFuture = reconnectExecutorService.scheduleWithFixedDelay(connectStatusCheckCommand, reconnect, reconnect, TimeUnit.MILLISECONDS);
             }
         }
 
@@ -572,6 +574,17 @@ public class DubboReference2{
                 }
             }
             return reconnect;
+        }
+
+        private synchronized void destroyConnectStatusCheckCommand() {
+            try {
+                if (reconnectExecutorFuture != null && !reconnectExecutorFuture.isDone()) {
+                    reconnectExecutorFuture.cancel(true);
+                    reconnectExecutorService.purge();
+                }
+            } catch (Throwable e) {
+                logger.warn(e.getMessage(), e);
+            }
         }
 
     }

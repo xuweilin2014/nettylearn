@@ -157,7 +157,9 @@ public class DubboServiceInvokingProcess {
 
             // 省略代码
 
-            // 将 method 和 args 封装到 RpcInvocation 中，并执行后续的调用
+            // 将 method 和 args 封装到 RpcInvocation 中，并执行后续的调用。
+            // invoker.invoke 会返回 RpcResult 类型的对象，再调用其 recreate 方法，返回 RpcResult 中所封装的结果，也就是 Object 
+            // 类型的对象，然后再在 proxy0 类中将其转换为 String 类型的对象。
             return invoker.invoke(new RpcInvocation(method, args)).recreate();
         }
     }

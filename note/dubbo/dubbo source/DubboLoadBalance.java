@@ -10,7 +10,6 @@ public class DubboLoadBalance{
      * 在Dubbo中，所有的负载均衡都继承自AbstractLoadBalance，它实现了LoadBalance接口，并且并封装了一些公共的逻辑
      */
     public static abstract class AbstractLoadBalance implements LoadBalance {
-    
         /**
          * select 方法的逻辑比较简单，首先会检测 invokers 集合的合法性，然后再检测 invokers 集合元素数量。
          * 如果只包含一个 Invoker，直接返回该 Inovker 即可。如果包含多个 Invoker，此时需要通过负载均衡算法选择一个 Invoker。
@@ -33,7 +32,7 @@ public class DubboLoadBalance{
         // 服务预热是一个优化手段，与此类似的还有 JVM 预热。主要目的是让服务启动后"低功率"运行一段时间，使其效率慢慢提升至最佳状态。
         protected int getWeight(Invoker<?> invoker, Invocation invocation) {
             // 从 url 中获取权重 weight 的配置值，默认的权重为100
-            // Constants.WEIGHT_KEY的值为 weight
+            // Constants.WEIGHT_KEY 的值为 weight，Constants.DEFAULT_WEIGHT 的值为 100
             int weight = invoker.getUrl().getMethodParameter(invocation.getMethodName(), Constants.WEIGHT_KEY, Constants.DEFAULT_WEIGHT);
             if (weight > 0) {
                 // 获取服务提供者启动时间戳
@@ -57,7 +56,6 @@ public class DubboLoadBalance{
             int ww = (int) ((float) uptime / ((float) warmup / (float) weight));
             return ww < 1 ? 1 : (ww > weight ? weight : ww);
         }
-    
     }
 
     /**
@@ -89,7 +87,6 @@ public class DubboLoadBalance{
                     sameWeight = false;
                 }
             }
-
             // 下面的 if 分支主要用于获取随机数，并计算随机数落在哪个区间上
             if (totalWeight > 0 && !sameWeight) {
                 // If (not every invoker has the same weight & at least one invoker's weight>0), select randomly based on totalWeight.
@@ -111,12 +108,10 @@ public class DubboLoadBalance{
                     }
                 }
             }
-
             // 如果所有服务提供者权重值相同，此时直接随机返回一个即可
             // If all invokers have the same weight value or totalWeight=0, return evenly.
             return invokers.get(random.nextInt(length));
         }
-    
     }
 
     /**
@@ -284,7 +279,10 @@ public class DubboLoadBalance{
      * 则在下一次查询或写入缓存时，为缓存项查找另一个大于其 hash 值的缓存节点即可。大致效果如下图所示，每个缓存节点在圆环上占据一个位置。如果缓存项的 key 的 hash 值小于缓存节点 hash 值，
      * 则到该缓存节点中存储或读取缓存项。比如下面绿色点对应的缓存项将会被存储到 cache-2 节点中。由于 cache-3 挂了，原本应该存到该节点中的缓存项最终会存储到 cache-4 节点中。
      * 
-     * 实现逻辑：Dubbo 实现的负载均衡是客户端负载均衡。初始化的时候根据用户配置的 hash.nodes 创建指定数目的虚拟节点，默认为 160 个。获取配置的用作Hash映射的参数的索引，默认对第一个参数进行 hash 运算。
+     * 实现逻辑：Dubbo 实现的负载均衡是客户端负载均衡。初始化的时候根据用户配置的 hash.nodes 创建指定数目的虚拟节点，默认为 160 个。
+     * 
+     * Dubbo 对 Invoker 进行 hash 运算时使用的是 Invoker 的 ip + port + 0-39的数字；对发送的 rpc 请求则是使用方法中的参数值进行 hash 运算，默认是使用第 1 个参数（从 1 开始计数的话）。
+     * 
      * 需要特别说明的是，客户端发送的请求的 hash 值只和参数值有关，具有相同参数值的请求，在虚拟节点不发生变化的情况下，会传递给相同的 Invoker 进行处理。在 Dubbo 实现的一致性 hash 算法中，每一个节点 invoker
      * 的 hash 值就代表一个虚拟节点
      */
@@ -356,7 +354,7 @@ public class DubboLoadBalance{
                 }
 
                 /**
-                 * 以replicaNumber取默认值160为例，假设当前遍历到的Invoker地址为127.0.0.1:20880，它会依次获得"127.0.0.1:208800"、"127.0.0.1:208801"、......、"127.0.0.1:2088040" 的md5摘要，
+                 * 以replicaNumber取默认值160为例，假设当前遍历到的Invoker地址为127.0.0.1:20880，它会依次获得"127.0.0.1:208800"、"127.0.0.1:208801"、......、"127.0.0.1:2088039" 的md5摘要，
                  * 在每次获得摘要之后，还会对该摘要进行四次数位级别的散列。大致可以猜到其目的应该是为了加强散列效果。
                  */
 
@@ -379,6 +377,14 @@ public class DubboLoadBalance{
                         }
                     }
                 }
+            }
+
+            private long hash(byte[] digest, int number) {
+                return (((long) (digest[3 + number * 4] & 0xFF) << 24)
+                        | ((long) (digest[2 + number * 4] & 0xFF) << 16)
+                        | ((long) (digest[1 + number * 4] & 0xFF) << 8)
+                        | (digest[number * 4] & 0xFF))
+                        & 0xFFFFFFFFL;
             }
     
             public Invoker<T> select(Invocation invocation) {
@@ -451,9 +457,10 @@ public class DubboLoadBalance{
      * 
      * 将 invokers 集合中每个 invoker 的 weight 累加起来，得到 weightSum，然后将调用次数对 weightSum 取模，得到 mod。
      * 然后遍历 invokers 集合，对于遍历到的每一个invoker：
+     * 
      * 1.如果 mod 为0，则直接返回这个 invoker
      * 2.如果 mod 不为0
-     *      i.如果其 weight 不为0，且 mod 不为0，那么就把 mod 和这个 weight 的值减一，接着遍历下一个 invoker
+     *      i.如果其 weight 不为0，那么就把 mod 和这个 weight 的值减一，接着遍历下一个 invoker
      *      ii.如果其 weight 已经被减为0了，那么就不做操作，直接遍历下一个 invoker
      * 
      */

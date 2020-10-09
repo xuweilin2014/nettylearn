@@ -27,7 +27,7 @@ public class DubboCluster{
         public final static String NAME = "failover";
     
         public <T> Invoker<T> join(Directory<T> directory) throws RpcException {
-            //创建并返回FailoverClusterInvoker对象
+            // 创建并返回FailoverClusterInvoker对象
             return new FailoverClusterInvoker<T>(directory);
         }
     
@@ -90,7 +90,7 @@ public class DubboCluster{
             return doInvoke(invocation, invokers, loadbalance);
         }
 
-        //抽象方法，由AbstractClusterInvoker的子类实现
+        // 抽象方法，由AbstractClusterInvoker的子类实现
         protected abstract Result doInvoke(Invocation invocation, List<Invoker<T>> invokers,
                                        LoadBalance loadbalance) throws RpcException;
 
@@ -105,9 +105,11 @@ public class DubboCluster{
         protected Invoker<T> select(LoadBalance loadbalance, Invocation invocation, List<Invoker<T>> invokers, List<Invoker<T>> selected) throws RpcException {
             if (invokers == null || invokers.size() == 0)
                 return null;
-            //获取调用方法名
+
+            // 获取调用方法名
             String methodName = invocation == null ? "" : invocation.getMethodName();
-            // 获取 sticky 配置，sticky 表示粘滞连接。所谓粘滞连接是指让服务消费者尽可能的调用同一个服务提供者，除非该提供者挂了再进行切换
+
+            // 获取 sticky 配置，sticky 表示粘滞连接。所谓粘滞连接是指让服务消费者尽可能的调用同一个服务提供者，除非该提供者挂了再进行切换。
             // CLUSTER_STICKY_KEY为sticky，DEFAULT_CLUSTER_STICKY为false
             boolean sticky = invokers.get(0).getUrl().getMethodParameter(methodName, Constants.CLUSTER_STICKY_KEY, Constants.DEFAULT_CLUSTER_STICKY);
             {
@@ -127,7 +129,9 @@ public class DubboCluster{
                     }
                 }
             }
-            // 如果线程走到当前代码处，说明没有开启 sticky 配置，或者前面的 stickyInvoker 为空，或者不可用。此时继续调用 doSelect 选择 Invoker
+
+            // 如果线程走到当前代码处，说明没有开启 sticky 配置，或者前面的 stickyInvoker 为空，或者不可用。
+            // 此时继续调用 doSelect ，进入真正的选择逻辑，选择 Invoker
             Invoker<T> invoker = doselect(loadbalance, invocation, invokers, selected);
     
             // 如果 sticky 为 true，则将负载均衡组件选出的 Invoker 赋值给 stickyInvoker
@@ -140,7 +144,8 @@ public class DubboCluster{
         /**
          * doselect方法的流程如下：
          * 1.通过负载均衡组件选择invoker
-         * 2.如果选出来的 Invoker 不稳定，或不可用，此时需要调用 reselect 方法进行重选。若 reselect 选出来的 Invoker 为空，此时定位 invoker 在 invokers 列表中的位置 index，然后获取 index + 1 处的 invoker，
+         * 2.如果选出来的 Invoker 不稳定，或不可用，此时需要调用 reselect 方法进行重选。若 reselect 选出来的 Invoker 为空，此时定位 invoker 在 invokers 列表中的位置 index，
+         * 然后获取 index + 1 处的 invoker，
          */
         private Invoker<T> doselect(LoadBalance loadbalance, Invocation invocation, List<Invoker<T>> invokers, List<Invoker<T>> selected) throws RpcException {
             if (invokers == null || invokers.size() == 0)
@@ -167,7 +172,7 @@ public class DubboCluster{
                         // 如果 rinvoker 不为空，则将其赋值给 invoker
                         invoker = rinvoker;
                     } else {
-                        /// rinvoker 为空，定位 invoker 在 invokers 中的位置
+                        // rinvoker 为空，定位 invoker 在 invokers 中的位置
                         int index = invokers.indexOf(invoker);
                         try {
                             // 获取 index + 1 位置处的 Invoker，以下代码等价于：invoker = invokers.get((index + 1) % invokers.size());
@@ -181,6 +186,62 @@ public class DubboCluster{
                 }
             }
             return invoker;
+        }
+
+
+        private Invoker<T> reselect(LoadBalance loadbalance, Invocation invocation, List<Invoker<T>> invokers,
+                List<Invoker<T>> selected, boolean availablecheck) throws RpcException {
+
+            List<Invoker<T>> reselectInvokers = new ArrayList<Invoker<T>>(invokers.size() > 1 ? (invokers.size() - 1) : invokers.size());
+
+            // 根据 availablecheck 进行不同的处理
+            if (availablecheck) {
+                // 遍历 invokers 列表
+                for (Invoker<T> invoker : invokers) {
+                    // 检测可用性
+                    if (invoker.isAvailable()) {
+                        // 如果 selected 列表不包含当前 invoker，则将其添加到 reselectInvokers 中
+                        if (selected == null || !selected.contains(invoker)) {
+                            reselectInvokers.add(invoker);
+                        }
+                    }
+                }
+
+                // reselectInvokers 不为空，此时通过负载均衡组件进行选择
+                if (!reselectInvokers.isEmpty()) {
+                    return loadbalance.select(reselectInvokers, getUrl(), invocation);
+                }
+
+            // 不检查 Invoker 可用性
+            } else {
+                for (Invoker<T> invoker : invokers) {
+                    // 如果 selected 列表不包含当前 invoker，则将其添加到 reselectInvokers 中
+                    if (selected == null || !selected.contains(invoker)) {
+                        reselectInvokers.add(invoker);
+                    }
+                }
+                if (!reselectInvokers.isEmpty()) {
+                    // 通过负载均衡组件进行选择
+                    return loadbalance.select(reselectInvokers, getUrl(), invocation);
+                }
+            }
+
+            {
+                // 若线程走到此处，说明 reselectInvokers 集合为空，此时不会调用负载均衡组件进行筛选。
+                // 这里从 selected 列表中查找可用的 Invoker，并将其添加到 reselectInvokers 集合中
+                if (selected != null) {
+                    for (Invoker<T> invoker : selected) {
+                        if ((invoker.isAvailable()) && !reselectInvokers.contains(invoker)) {
+                            reselectInvokers.add(invoker);
+                        }
+                    }
+                }
+                if (!reselectInvokers.isEmpty()) {
+                    // 再次进行选择，并返回选择结果
+                    return loadbalance.select(reselectInvokers, getUrl(), invocation);
+                }
+            }
+            return null;
         }
 
     }
@@ -255,8 +316,8 @@ public class DubboCluster{
     /**
      * FailbackClusterInvoker 会在调用失败后，返回一个空结果给服务消费者。并通过定时任务对失败的调用进行重新调用，适合执行消息通知等操作
      * 
-     * doInvoker该方法负责初次的远程调用。若远程调用失败，则通过 addFailed 方法将调用信息存入到 failed 中，等待定时重试。addFailed 在开始阶段会根据 retryFuture 为空与否，来决定是否开启定时任务。
-     * retryFailed 方法则是包含了失败重试的逻辑，该方法会对 failed 进行遍历，然后依次对 Invoker 进行调用。调用成功则将 Invoker 从 failed 中移除，调用失败则忽略失败原因。
+     * doInvoke该方法负责初次的远程调用。若远程调用失败，则通过 addFailed 方法将调用信息存入到 failed 中，等待定时重试。addFailed 在开始阶段会根据 retryFuture 为空与否，来决定是否开启定时任务。
+     * retryFailed 方法则是包含了失败重试的逻辑，该方法会对 failed 进行遍历，然后依次对 Invoker 进行调用。调用成功则将 Invoker 从 failed 中移除，调用失败则忽略失败原因，继续进行重试。
      */
     public class FailbackClusterInvoker<T> extends AbstractClusterInvoker<T> {
 
@@ -305,8 +366,7 @@ public class DubboCluster{
             }
 
             // 遍历 failed，对失败的调用进行重试
-            for (Map.Entry<Invocation, AbstractClusterInvoker<?>> entry : new HashMap<Invocation, AbstractClusterInvoker<?>>(
-                    failed).entrySet()) {
+            for (Map.Entry<Invocation, AbstractClusterInvoker<?>> entry : new HashMap<Invocation, AbstractClusterInvoker<?>>(failed).entrySet()) {
                 Invocation invocation = entry.getKey();
                 Invoker<?> invoker = entry.getValue();
                 try {
