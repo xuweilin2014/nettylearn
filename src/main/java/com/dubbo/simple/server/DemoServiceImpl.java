@@ -10,8 +10,8 @@ public class DemoServiceImpl implements DemoService {
     }
 
     @Override
-    public String sayGoodBye(String name) {
-        return "GoodBye " + name;
+    public String sayGoodBye() {
+        return "GoodBye";
     }
 
 }

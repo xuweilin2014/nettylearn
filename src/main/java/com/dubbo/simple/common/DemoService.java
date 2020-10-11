@@ -4,6 +4,6 @@ public interface DemoService {
 
     String sayHello(String name);
 
-    String sayGoodBye(String name);
+    String sayGoodBye();
 
 }

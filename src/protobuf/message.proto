@@ -1,9 +1,9 @@
 syntax = "proto2";
 
-package com.xu.netty.seventhexample.multimsg.proto;
+package com.netty.example.seventhexample.multimsg.proto;
 
 option optimize_for = SPEED;
-option java_package = "com.xu.netty.seventhexample.multimsg.proto";
+option java_package = "com.netty.example.seventhexample.multimsg.proto";
 option java_outer_classname = "MyClientInfo";
 option java_multiple_files = true;
 

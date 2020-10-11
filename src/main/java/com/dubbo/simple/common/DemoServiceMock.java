@@ -15,7 +15,7 @@ public class DemoServiceMock implements DemoService {
     }
 
     @Override
-    public String sayGoodBye(String name) {
+    public String sayGoodBye() {
         return null;
     }
 }
