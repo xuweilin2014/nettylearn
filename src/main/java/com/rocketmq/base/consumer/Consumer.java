@@ -1,6 +1,7 @@
 package com.rocketmq.base.consumer;
 
 import org.apache.rocketmq.client.consumer.DefaultMQPushConsumer;
+import org.apache.rocketmq.client.consumer.MessageSelector;
 import org.apache.rocketmq.client.consumer.listener.ConsumeConcurrentlyContext;
 import org.apache.rocketmq.client.consumer.listener.ConsumeConcurrentlyStatus;
 import org.apache.rocketmq.client.consumer.listener.MessageListenerConcurrently;
@@ -21,7 +22,7 @@ public class Consumer {
         // 3.消费消息有两种模式：广播模式和负载均衡模式，不设置的话，默认是负载均衡模式
         consumer.setMessageModel(MessageModel.BROADCASTING);
         // 4.订阅主题 topic 和 tag
-        consumer.subscribe("nettylearn-mq", "Tag6");
+        consumer.subscribe("nettylearn-mq", MessageSelector.byTag("Tag2"));
         // 5.设置回调函数，处理消息
         consumer.registerMessageListener(new MessageListenerConcurrently() {
             @Override

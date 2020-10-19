@@ -2,8 +2,9 @@ public class RocketmqAnalysis{
 
     /**
      * 消息消费者概述：
-     * 消息服务器与消费者之间的消息传送也有两种方式：推模式、拉模式。所谓的拉模式，是消费端主动发起拉消息请求（也就是由用户手动调用消息拉取 API)，而推模式是消息到达消息服务器后，推送给消息消费者。
-     * RocketMQ 消息推模式的实现基于拉模式，在拉模式上包装一层，一个拉取任务完成后开始下一个拉取任务。
+     * 消息服务器与消费者之间的消息传送也有两种方式：推模式（PushConsumer）、拉模式（PullConsumer）。所谓的拉模式，是消费端主动发起拉消息请求（也就是由用户手动调用消息拉取 API)；
+     * 而推模式是 PushConsumer 在启动后，Consumer客户端会主动循环发送Pull请求到broker，如果没有消息，broker会把请求放入等待队列，新消息到达后返回response。
+     * 所以本质上，两种方式都是通过客户端Pull来实现的。RocketMQ 消息推模式的实现基于拉模式，在拉模式上包装一层，一个拉取任务完成后开始下一个拉取任务。
      * 
      * 集群模式下，多个消费者如何对消息队列进行负载呢？消息队列负载机制遵循一个通用的思想 一个消息 列同一时间 只允许被一个消费者消费，一个消费者可 消费多个消息队列
      * 
@@ -141,6 +142,13 @@ public class RocketmqAnalysis{
          * 默认使用第一种，平均分配策略
          */
         private AllocateMessageQueueStrategy allocateMessageQueueStrategy;
+
+        /**
+         * Max re-consume times. -1 means 16 times.
+         *
+         * If messages are re-consumed more than maxReconsumeTimes before success, it's be directed to a deletion queue waiting.
+         */
+        private int maxReconsumeTimes = -1;
 
         /**
          * Subscription relationship

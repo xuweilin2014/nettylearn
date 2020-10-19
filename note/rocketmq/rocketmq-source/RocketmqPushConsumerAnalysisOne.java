@@ -29,6 +29,16 @@ public class RocketmqPushConsumerAnalysis{
             return messageListenerInner;
         }
 
+        // 首先判断消费端有没有显式设置最大重试次数 MaxReconsumeTimes， 如果没有，则设置默认重试次数为 16，否则以设置的最大重试次数为准
+        private int getMaxReconsumeTimes() {
+            // default reconsume times: 16
+            if (this.defaultMQPushConsumer.getMaxReconsumeTimes() == -1) {
+                return 16;
+            } else {
+                return this.defaultMQPushConsumer.getMaxReconsumeTimes();
+            }
+        }
+
         // 构建主题订阅信息 SubscriptionData 并加入到 Rebalancelmpl 的订阅消息中
         // 这里的订阅关系主要来自于 DefaultMQPushConsumer#subscribe(String topic, String subExpression) 方法
         public void subscribe(String topic, String subExpression) throws MQClientException {
@@ -46,6 +56,8 @@ public class RocketmqPushConsumerAnalysis{
 
         private void copySubscription() throws MQClientException {
             try {
+                // 查找消费者的订阅主题信息，实际上，消费者在订阅主题的时候是通过调用 defaultMQPushConsumerImpl 中的 subscribe 得方法，订阅成功之后主题的信息是存储于
+                // defaultMQPushConsumerImpl 中的 RebalanceImpl 中的 subscriptionInner 中的
                 Map<String, String> sub = this.defaultMQPushConsumer.getSubscription();
                 if (sub != null) {
                     for (final Map.Entry<String, String> entry : sub.entrySet()) {
@@ -61,7 +73,7 @@ public class RocketmqPushConsumerAnalysis{
                 }
     
                 /**
-                 * 订阅重试主题消息，从这里可以看出，RocketMQ 消息重试是以消费组为单位，而不是主题，消息重试主题名为 %RETRY%＋消费组名，
+                 * 下面会订阅重试主题消息（如果是集群模式的话），从这里可以看出，RocketMQ 消息重试是以消费组为单位，而不是主题。消息重试主题名为 %RETRY%＋消费组名，
                  * 消费者在启动的时候会自动订阅该主题，参与该主题的消息队列负载
                  */
                 switch (this.defaultMQPushConsumer.getMessageModel()) {
@@ -81,12 +93,31 @@ public class RocketmqPushConsumerAnalysis{
             }
         }
 
+        /**
+         * 一共有两种方式让broker重发，先尝试给 broker 发送 send_msg_back 的命令，如果失败了，则通过 consumer 预留的 producer 给 %RETRY%topic 发送消息，
+         * 前面 consumer 启动的时候已经讲过，所有 consumer 都订阅 %RETRY%topic，所以等于是自己给自己发一条消息。
+         * 
+         * consumer 发送消费失败的消息和普通的 producer 发送消息的调用路径前面不太一样，使用下面的方法将消息发送回 Broker
+         */
         public void sendMessageBack(MessageExt msg, int delayLevel, final String brokerName) throws Exception{
             try {
                 String brokerAddr = (null != brokerName) ? this.mQClientFactory.findBrokerAddressInPublish(brokerName) : RemotingHelper.parseSocketAddressAddr(msg.getStoreHost());
+                // 首先尝试直接发送 CONSUMER_SEND_MSG_BACK 命令给 broker
                 this.mQClientFactory.getMQClientAPIImpl().consumerSendMessageBack(brokerAddr, msg, this.defaultMQPushConsumer.getConsumerGroup(), delayLevel, 5000, getMaxReconsumeTimes());
             } catch (Exception e) {
-                // ignore code
+                log.error("sendMessageBack Exception, " + this.defaultMQPushConsumer.getConsumerGroup(), e);
+                // 如果消费失败的消息发送回 broker 失败了，会再重试一次，和 try 里面的方法不一样的地方是这里直接修改 topic 为 %RETRY%topic
+                // 然后和 producer 发送消息的方法一样发送到 broker。这个 producer 是在 consumer 启动的时候预留的
+                Message newMsg = new Message(MixAll.getRetryTopic(this.defaultMQPushConsumer.getConsumerGroup()), msg.getBody());
+                String originMsgId = MessageAccessor.getOriginMessageId(msg);
+                MessageAccessor.setOriginMessageId(newMsg, UtilAll.isBlank(originMsgId) ? msg.getMsgId() : originMsgId);
+
+                newMsg.setFlag(msg.getFlag());
+                MessageAccessor.setProperties(newMsg, msg.getProperties());
+                MessageAccessor.putProperty(newMsg, MessageConst.PROPERTY_RETRY_TOPIC, msg.getTopic());
+                MessageAccessor.setReconsumeTime(newMsg, String.valueOf(msg.getReconsumeTimes() + 1));
+                MessageAccessor.setMaxReconsumeTimes(newMsg, String.valueOf(getMaxReconsumeTimes()));
+                newMsg.setDelayTimeLevel(3 + msg.getReconsumeTimes());
 
                 this.mQClientFactory.getDefaultMQProducer().send(newMsg);
             }
@@ -100,7 +131,13 @@ public class RocketmqPushConsumerAnalysis{
                     this.serviceState = ServiceState.START_FAILED;
                     // 基本的参数检查，group name 不能是 DEFAULT_CONSUMER
                     this.checkConfig();
-                    // 将 DefaultMQPushConsumer 的订阅信息 copy 到 RebalanceService 中如果是 cluster 模式，如果订阅了 topic,则自动订阅 %RETRY%topic
+
+                    // copySubscription 执行以下两步操作：
+                    // 1.将 DefaultMQPushConsumer 的订阅信息 copy 到 RebalanceService 中
+                    // 2.如果是 CLUSTERING 模式，则自动订阅 %RETRY%topic，可以进行消息重试；如果是 BROADCASTING 模式，则不会进行消息重试
+                    //
+                    // 那这个 %RETRY% 开头的 topic 是做什么的呢？我们知道 consumer 消费消息失败的话（其实也就是我们业务代码消费消息失败），
+                    // broker 会延时一定的时间重新推送消息给 consumer，重新推送不是跟其它新消息一起过来，而是通过单独的 %RETRY% 的 topic 过来
                     this.copySubscription();
     
                     // 修改 InstanceName 参数值为 pid
@@ -110,22 +147,21 @@ public class RocketmqPushConsumerAnalysis{
                     }
                     
                     /**
-                     * 初始化 MQCientInstance Rebalancelmple （消息重新负载实现类）等
-                     * 新建一个 MQClientInstance，客户端管理类，所有的i/o类操作由它管理，一个进程只有一个实例
+                     * 新建一个 MQClientInstance，客户端管理类，所有的 i/o 类操作由它管理，这个是和 Producer 共用一个实现
                      */
                     this.mQClientFactory = MQClientManager.getInstance().getAndCreateMQClientInstance(this.defaultMQPushConsumer, this.rpcHook);
     
                     this.rebalanceImpl.setConsumerGroup(this.defaultMQPushConsumer.getConsumerGroup());
                     this.rebalanceImpl.setMessageModel(this.defaultMQPushConsumer.getMessageModel());
+                    // 对于同一个 group 内的 consumer，RebalanceImpl 负责分配具体每个 consumer 应该消费哪些 queue 上的消息,以达到负载均衡的目的。
+                    // Rebalance 支持多种分配策略，比如平均分配、一致性 Hash 等(具体参考 AllocateMessageQueueStrategy 实现类)。默认采用平均分配策略(AVG)
                     this.rebalanceImpl.setAllocateMessageQueueStrategy(this.defaultMQPushConsumer.getAllocateMessageQueueStrategy());
                     this.rebalanceImpl.setmQClientFactory(this.mQClientFactory);
                     // PullRequest 封装实现类，封装了和 broker 的通信接口
                     this.pullAPIWrapper = new PullAPIWrapper(mQClientFactory, this.defaultMQPushConsumer.getConsumerGroup(), isUnitMode());
                     this.pullAPIWrapper.registerFilterMessageHook(filterMessageHookList);
     
-                    /* 
-                     * 初始化消息进度，如果消息消费是集群模式（负载均衡），那么消息进度保存在 Broker 上; 如果是广播模式，那么消息消进度存储在消费端
-                     */
+                    // 初始化消息进度，如果消息消费是集群模式（负载均衡），那么消息进度保存在 Broker 上; 如果是广播模式，那么消息消进度存储在消费端
                     if (this.defaultMQPushConsumer.getOffsetStore() != null) {
                         this.offsetStore = this.defaultMQPushConsumer.getOffsetStore();
                     } else {
@@ -144,9 +180,8 @@ public class RocketmqPushConsumerAnalysis{
                     // 如果是本地持久化会从文件中进行加载
                     this.offsetStore.load();
     
-                    /**
-                     * 根据是否是顺序消费，创建消费端消费线程服务。ConsumeMessageService 主要负责消息消费，内部维护一个线程池
-                     */
+                    // 根据是否是顺序消费，创建消费端消费线程服务。ConsumeMessageService 主要负责消息消费，内部维护一个线程池
+                    // 消息到达 Consumer 后会缓存到队列中，ConsumeMessageService 另起线程回调 Listener 消费。同时对于在缓存队列中等待的消息，会定时检查是否已超时，通知 Broker 重发
                     if (this.getMessageListenerInner() instanceof MessageListenerOrderly) {
                         this.consumeOrderly = true;
                         this.consumeMessageService = new ConsumeMessageOrderlyService(this, (MessageListenerOrderly) this.getMessageListenerInner());
@@ -154,22 +189,18 @@ public class RocketmqPushConsumerAnalysis{
                         this.consumeOrderly = false;
                         this.consumeMessageService = new ConsumeMessageConcurrentlyService(this, (MessageListenerConcurrently) this.getMessageListenerInner());
                     }
-                    // 启动了清理等待处理消息服务
+                    // 启动了消息消费服务
                     this.consumeMessageService.start();
     
-                    /**
-                     * 向 MQClientInstance 注册消费者，并启动 MQClientlnstance，在一个 JVM 中的所有消费者、生产者持有同一个 MQClientInstance, MQClientInstance 只会启动一次
-                     */
+                    // 向 MQClientInstance 注册消费者，并启动 MQClientlnstance，在一个进程中，只有一个 MQClientInstance, MQClientInstance 只会启动一次
                     boolean registerOK = mQClientFactory.registerConsumer(this.defaultMQPushConsumer.getConsumerGroup(), this);
                     if (!registerOK) {
                         this.serviceState = ServiceState.CREATE_JUST;
                         this.consumeMessageService.shutdown();
-                        throw new MQClientException("The consumer group[" + this.defaultMQPushConsumer.getConsumerGroup()
-                            + "] has been created before, specify another name please." + FAQUrl.suggestTodo(FAQUrl.GROUP_NAME_DUPLICATE_URL),
-                            null);
+                        throw new MQClientException();
                     }
     
-                    // 启动MQClientInstance，会启动PullMessageService和RebalanceService
+                    // 启动 MQClientInstance，会启动 PullMessageService 和 RebalanceService，并且会启动客户端，也就是 NettyRemotingClient
                     mQClientFactory.start();
                     log.info("the consumer [{}] start OK.", this.defaultMQPushConsumer.getConsumerGroup());
                     this.serviceState = ServiceState.RUNNING;
@@ -177,17 +208,17 @@ public class RocketmqPushConsumerAnalysis{
                 case RUNNING:
                 case START_FAILED:
                 case SHUTDOWN_ALREADY:
-                    throw new MQClientException("The PushConsumer service state not OK, maybe started once, "
-                        + this.serviceState
-                        + FAQUrl.suggestTodo(FAQUrl.CLIENT_SERVICE_NOT_OK),
-                        null);
+                    throw new MQClientException();
                 default:
                     break;
             }
-    
+            
+            // 从 NameServer 更新 topic 路由和订阅信息
             this.updateTopicSubscribeInfoWhenSubscriptionChanged();
             this.mQClientFactory.checkClientInBroker();
+            // 发送心跳，同步 consumer 配置到 broker，同步 FilterClass 到 FilterServer(PushConsumer)
             this.mQClientFactory.sendHeartbeatToAllBrokerWithLock();
+            // 进行一次 Rebalance，启动 RebalanceImpl，这里才真正开始的 Pull 消息的操作
             this.mQClientFactory.rebalanceImmediately();
         }
 
@@ -218,13 +249,8 @@ public class RocketmqPushConsumerAnalysis{
                 this.executePullRequestLater(pullRequest, PULL_TIME_DELAY_MILLS_WHEN_EXCEPTION);
                 return;
             }
-    
-            // 检查当前消费者是否暂停，否则，也将拉取任务延迟 1s 放入到 PullMessageService 的拉取任务队列中
-            if (this.isPause()) {
-                log.warn("consumer was paused, execute pull request later. instanceName={}, group={}", this.defaultMQPushConsumer.getInstanceName(), this.defaultMQPushConsumer.getConsumerGroup());
-                this.executePullRequestLater(pullRequest, PULL_TIME_DELAY_MILLS_WHEN_SUSPEND);
-                return;
-            }
+
+            // ignore code
 
             /**
              * 接下来进行消息拉取的流控
@@ -235,7 +261,7 @@ public class RocketmqPushConsumerAnalysis{
             // ProcessQueue 中消息的大小，cachedMessageSizeInMiB 单位为 MB
             long cachedMessageSizeInMiB = processQueue.getMsgSize().get() / (1024 * 1024);
     
-            // 如果 ProcessQueue 当前处理的消息条数超过了 pullThresholdForQueue = 1000 将触发流控，放弃本次拉取任务
+            // 如果 ProcessQueue 当前处理的消息条数超过了 pullThresholdForQueue = 1000 ，也就是堆积未处理的消息过多，将触发流控，放弃本次拉取任务
             // 将拉取任务延迟 50 ms 之后再次加入到拉取任务队列中，进行拉取操作
             if (cachedMessageCount > this.defaultMQPushConsumer.getPullThresholdForQueue()) {
                 this.executePullRequestLater(pullRequest, PULL_TIME_DELAY_MILLS_WHEN_FLOW_CONTROL);
@@ -245,7 +271,7 @@ public class RocketmqPushConsumerAnalysis{
                 return;
             }
     
-            // 如果 ProcessQueue 当前处理的消息总大小超过了 pullThresholdSizeForQueue = 1000 MB 将触发流控
+            // 如果 ProcessQueue 当前处理的消息总大小超过了 pullThresholdSizeForQueue = 1000 MB，也就是堆积的消息过大，也将触发流控，逻辑同上
             if (cachedMessageSizeInMiB > this.defaultMQPushConsumer.getPullThresholdSizeForQueue()) {
                 this.executePullRequestLater(pullRequest, PULL_TIME_DELAY_MILLS_WHEN_FLOW_CONTROL);
                 if ((queueFlowControlTimes++ % 1000) == 0) {
@@ -264,15 +290,14 @@ public class RocketmqPushConsumerAnalysis{
                     return;
                 }
             } else {
+                // 如果消息处理队列未被锁定，则延迟 3s 后再将 PullRequest 对象放入到拉取任务中，如果该处理队列是第一次拉取任务，则首先计算拉取偏移量，然后向消息服务端拉取消息
                 if (processQueue.isLocked()) {
                     if (!pullRequest.isLockedFirst()) {
                         final long offset = this.rebalanceImpl.computePullFromWhere(pullRequest.getMessageQueue());
                         boolean brokerBusy = offset < pullRequest.getNextOffset();
-                        log.info("the first time to pull message, so fix offset from broker. pullRequest: {} NewOffset: {} brokerBusy: {}",
-                            pullRequest, offset, brokerBusy);
+                        log.info("the first time to pull message, so fix offset from broker. pullRequest: {} NewOffset: {} brokerBusy: {}", pullRequest, offset, brokerBusy);
                         if (brokerBusy) {
-                            log.info("[NOTIFYME]the first time to pull message, but pull request offset larger than broker consume offset. pullRequest: {} NewOffset: {}",
-                                pullRequest, offset);
+                            log.info("[NOTIFYME]the first time to pull message, but pull request offset larger than broker consume offset. pullRequest: {} NewOffset: {}", pullRequest, offset);
                         }
     
                         pullRequest.setLockedFirst(true);
@@ -294,12 +319,18 @@ public class RocketmqPushConsumerAnalysis{
             }
     
             final long beginTimestamp = System.currentTimeMillis();
-    
+            // Pull Command 发送之后，返回的结果处理
             PullCallback pullCallback = new PullCallback() {
+
+                /**
+                 * 在消息返回后，会将消息放入ProcessQueue，然后通知 ConsumeMessageService 来异步处理消息，然后再次提交 Pull 请求。这样对于用户端来说，
+                 * 只有 ConsumeMessageService 回调 listener 这一步是可见的，其它都是透明的
+                 * @param pullResult
+                 */
                 @Override
                 public void onSuccess(PullResult pullResult) {
                     if (pullResult != null) {
-                        // 调用 pullAPIWrapper 中的 processPullResult 方法将消息字节数组解码成消息列表填充 msgFoundList，并且对消息进行消息过滤（TAG）模式
+                        // 调用 pullAPIWrapper#processPullResult 方法将消息字节数组解码成消息列表填充 msgFoundList，并且对消息进行消息过滤（TAG）模式
                         pullResult = DefaultMQPushConsumerImpl.this.pullAPIWrapper.processPullResult(pullRequest.getMessageQueue(), pullResult, subscriptionData);
     
                         switch (pullResult.getPullStatus()) {
@@ -308,10 +339,10 @@ public class RocketmqPushConsumerAnalysis{
                                 long prevRequestOffset = pullRequest.getNextOffset();
                                 pullRequest.setNextOffset(pullResult.getNextBeginOffset());
                                 long pullRT = System.currentTimeMillis() - beginTimestamp;
-                                DefaultMQPushConsumerImpl.this.getConsumerStatsManager().incPullRT(pullRequest.getConsumerGroup(),
-                                    pullRequest.getMessageQueue().getTopic(), pullRT);
+                                DefaultMQPushConsumerImpl.this.getConsumerStatsManager().incPullRT(pullRequest.getConsumerGroup(), pullRequest.getMessageQueue().getTopic(), pullRT);
     
                                 long firstMsgOffset = Long.MAX_VALUE;
+
                                 // 如果 msgFoundList 为空，则立即将 PullRequest 放入到 PullMessageService 的 pullRequestQueue，以便  PullMessageService 能够及时唤醒，
                                 // 并进行消息拉取操作，为什么 PullStatus.FOUND, msgFoundList 会为空呢？因为 RocketMQ 根据 TAG 消息过滤，在服务端只是验证了 TAG hashcode ，在客户端再次
                                 // 对消息进行过滤，故可能会出现 msgFoundList 为空的情况
@@ -325,6 +356,7 @@ public class RocketmqPushConsumerAnalysis{
     
                                     // 将拉取到的消息存入 ProcessQueue，然后将拉取到的消息提交给 ConsumeMessageService 中供消费者消费，该方法是一个异步方法
                                     // 也就是 PullCallBack 将消息提交给 ConsumeMessageService 中就会立即返回，至于这些消息如何消费， PullCallBack 不关注
+                                    // 在 ConsumeMessageService 中进行消息的消费时，会调用 MessageListener 对消息进行实际的处理，处理完成会通知ProcessQueue
                                     boolean dispathToConsume = processQueue.putMessage(pullResult.getMsgFoundList());
                                     DefaultMQPushConsumerImpl.this.consumeMessageService.submitConsumeRequest(pullResult.getMsgFoundList(), processQueue, pullRequest.getMessageQueue(), dispathToConsume);
     
@@ -363,8 +395,7 @@ public class RocketmqPushConsumerAnalysis{
                                 break;
 
                             case OFFSET_ILLEGAL:
-                                log.warn("the pull request offset illegal, {} {}",
-                                    pullRequest.toString(), pullResult.toString());
+                                log.warn("the pull request offset illegal, {} {}", pullRequest.toString(), pullResult.toString());
                                 pullRequest.setNextOffset(pullResult.getNextBeginOffset());
     
                                 pullRequest.getProcessQueue().setDropped(true);
@@ -419,7 +450,6 @@ public class RocketmqPushConsumerAnalysis{
                 if (this.defaultMQPushConsumer.isPostSubscriptionWhenPull() && !sd.isClassFilterMode()) {
                     subExpression = sd.getSubString();
                 }
-    
                 classFilter = sd.isClassFilterMode();
             }
     
@@ -557,19 +587,24 @@ public class RocketmqPushConsumerAnalysis{
         }
     
         public MQClientInstance(ClientConfig clientConfig, int instanceIndex, String clientId, RPCHook rpcHook) {
-            // 省略代码.....
-    
-            if (this.clientConfig.getNamesrvAddr() != null) {
-                this.mQClientAPIImpl.updateNameServerAddressList(this.clientConfig.getNamesrvAddr());
-                log.info("user specified name server address: {}", this.clientConfig.getNamesrvAddr());
-            }
-    
+            this.clientConfig = clientConfig;
+            this.instanceIndex = instanceIndex;
+            this.nettyClientConfig = new NettyClientConfig();
+            
+            // ignore code
+
             this.clientId = clientId;
             this.mQAdminImpl = new MQAdminImpl(this);
+
+            // Pull 请求服务，异步发送请求到 broker 并负责将返回结果放到缓存队列
             this.pullMessageService = new PullMessageService(this);
+            // 定时或者被触发做 subscribe queue 的 re-balance
             this.rebalanceService = new RebalanceService(this);
-    
-            // 省略代码
+            // 初始化一个自用的 producer，名称为 CLIENT_INNER_PRODUCER，主要用于在消费失败或者超时的时候，发送重试的消息给 Broker
+            this.defaultMQProducer = new DefaultMQProducer(MixAll.CLIENT_INNER_PRODUCER_GROUP);
+            this.defaultMQProducer.resetClientConfig(clientConfig);
+
+            this.consumerStatsManager = new ConsumerStatsManager(this.scheduledExecutorService);
         }
 
         public MQConsumerInner selectConsumer(final String group) {
@@ -587,13 +622,17 @@ public class RocketmqPushConsumerAnalysis{
                             this.mQClientAPIImpl.fetchNameServerAddr();
                         }
                         // Start request-response channel
+                        // 开启客户端 NettyRemotingClient
                         this.mQClientAPIImpl.start();
                         // Start various schedule tasks
                         this.startScheduledTask();
-                        // Start pull service
                         // 启动 PullMessageService
                         this.pullMessageService.start();
-                        // Start rebalance service
+                        // 启动 rebalance service，最终会调用 RebalanceImpl 类对象，来给 Consumer 重新调整和分配 queue，触发 rebalance 的情况如下：
+                        // 
+                        // 1.定时触发(20sec)做 rebalance
+                        // 2.当 consumer list 发生变化后需要重新做负载均衡，比如同一个 group 中新加入了 consumer 或者有 consumer 下线; 
+                        // 3.当 consumer 启动的时候，也会进行负载均衡
                         this.rebalanceService.start();
                         // Start push service
                         this.defaultMQProducer.getDefaultMQProducerImpl().start(false);
@@ -612,9 +651,68 @@ public class RocketmqPushConsumerAnalysis{
             }
         }
 
+        private void startScheduledTask() {
+            // ignore code...
+    
+            // 保存消费进度
+            this.scheduledExecutorService.scheduleAtFixedRate(new Runnable() {
+                @Override
+                public void run() {
+                    try {
+                        // 遍历 consumerTable 中的所有 MQConsumerInner，将其中的 offsetStore 进行持久化
+                        // 对于广播模式来说，offsetStore 是 LocalFileOffsetStore，会将其持久化到本地
+                        // 对于集群模式来说，offsetStore 是 RemoteBrokerOffsetStore，会将其同步到 Broker
+                        MQClientInstance.this.persistAllConsumerOffset();
+                    } catch (Exception e) {
+                        log.error("ScheduledTask persistAllConsumerOffset exception", e);
+                    }
+                }
+            }, 1000 * 10, this.clientConfig.getPersistConsumerOffsetInterval(), TimeUnit.MILLISECONDS);
+    
+            // 根据负载调整本地处理消息的线程池corePool大小
+            this.scheduledExecutorService.scheduleAtFixedRate(new Runnable() {
+                @Override
+                public void run() {
+                    try {
+                        MQClientInstance.this.adjustThreadPool();
+                    } catch (Exception e) {
+                        log.error("ScheduledTask adjustThreadPool exception", e);
+                    }
+                }
+            }, 1, 1, TimeUnit.MINUTES);
+        }
 
 
+    }
 
+    public class RebalanceService extends ServiceThread {
+        
+        private static long waitInterval = Long.parseLong(System.getProperty("rocketmq.client.rebalance.waitInterval", "20000"));
+        private final Logger log = ClientLogger.getLog();
+        private final MQClientInstance mqClientFactory;
+    
+        public RebalanceService(MQClientInstance mqClientFactory) {
+            this.mqClientFactory = mqClientFactory;
+        }
+    
+        @Override
+        public void run() {
+            log.info(this.getServiceName() + " service started");
+    
+            while (!this.isStopped()) {
+                // 默认阻塞等待 20s
+                this.waitForRunning(waitInterval);
+                // 调用 RebalanceImpl 的 doRebalance 操作
+                this.mqClientFactory.doRebalance();
+            }
+    
+            log.info(this.getServiceName() + " service end");
+        }
+    
+        @Override
+        public String getServiceName() {
+            return RebalanceService.class.getSimpleName();
+        }
     }
 
     public static class MixAll {
@@ -637,7 +735,7 @@ public class RocketmqPushConsumerAnalysis{
 
         // 获取或者创建一个 MQClientInstance 实例
         public MQClientInstance getAndCreateMQClientInstance(final ClientConfig clientConfig, RPCHook rpcHook) {
-            // 获取到 ClientId，由 消费者的 ip 地址 + @ + InstanceName 组成
+            // 获取到 ClientId，由 消费者的 ip 地址 + @ + InstanceName 组成，其中 InstanceName 如果用户不进行设置的话，就会自动设置为进程号 pid
             String clientId = clientConfig.buildMQClientId();
             MQClientInstance instance = this.factoryTable.get(clientId);
             // 如果没有对应的 MQClientInstance，就创建；有的话，就直接返回
@@ -687,6 +785,7 @@ public class RocketmqPushConsumerAnalysis{
         }
 
         public void changeInstanceNameToPID() {
+            // 如果用户没有设置 instanceName 的话，就将其设置为进程号 pid
             if (this.instanceName.equals("DEFAULT")) {
                 this.instanceName = String.valueOf(UtilAll.getPid());
             }
