@@ -468,8 +468,8 @@ public class RocketmqPushConsumerAnalysis{
                     this.defaultMQPushConsumer.getPullBatchSize(), // 本次拉取的最大消息条数，默认为 32 条
                     sysFlag,  // 拉取系统标记
                     commitOffsetValue, // 当前 MessageQueue 的消费进度（内存中）
-                    BROKER_SUSPEND_MAX_TIME_MILLIS, 
-                    CONSUMER_TIMEOUT_MILLIS_WHEN_SUSPEND, // 消息拉取的超时时间
+                    BROKER_SUSPEND_MAX_TIME_MILLIS, // Broker 长轮询时间
+                    CONSUMER_TIMEOUT_MILLIS_WHEN_SUSPEND, // 消息拉取的超时时间，也就是客户端阻塞等待的时间
                     CommunicationMode.ASYNC,  // 消息拉取模式，默认为异步拉取
                     pullCallback // 从 Broker 拉取消息之后的回调方法
                 );
@@ -529,8 +529,9 @@ public class RocketmqPushConsumerAnalysis{
                 final long brokerSuspendMaxTimeMillis, final long timeoutMillis,
                 final CommunicationMode communicationMode, final PullCallback pullCallback)
                 throws MQClientException, RemotingException, MQBrokerException, InterruptedException {
-
+            // 获取到 Broker
             FindBrokerResult findBrokerResult = this.mQClientFactory.findBrokerAddressInSubscribe(mq.getBrokerName(), this.recalculatePullFromWhichNode(mq), false);
+            // 如果查找不到 Broker 就更新一下路由信息，然后再次获取
             if (null == findBrokerResult) {
                 this.mQClientFactory.updateTopicRouteInfoFromNameServer(mq.getTopic());
                 findBrokerResult = this.mQClientFactory.findBrokerAddressInSubscribe(mq.getBrokerName(), this.recalculatePullFromWhichNode(mq), false);
@@ -539,6 +540,10 @@ public class RocketmqPushConsumerAnalysis{
             if (findBrokerResult != null) {
                 // 省略代码
 
+                // 与长轮询有关的参数有三个：
+                // 第一个是 sysFlag 中的第 2 个 bit 位，sysFlag 的构造为：{commitOffset：是否确认消息，suspend：是否长轮询，subscription：是否过滤消息，classFilter：是否类过滤}
+                // 第二个是 brokerSuspendMaxTimeMillis，长轮询不可能无限期等待下去，因此需要传递这个长轮询时间给到broker，如果超过这个时间还没有消息到达，那么直接返回空的Response
+                // 第三个是 timeoutMillis，broker在长轮询的时候，客户端也需要阻塞等待结果，单也不能无限制等待下去，如果超过timeoutMillis还没收到返回，那么我本地也需要做对应处理
                 int sysFlagInner = sysFlag;
 
                 if (findBrokerResult.isSlave()) {
@@ -565,6 +570,7 @@ public class RocketmqPushConsumerAnalysis{
                 }
 
                 // 使用 Netty 向 Broker 发送请求，从Broker 上拉取消息
+                // 这里根据 communicationMode 不同使用不同的拉取模式，如果是异步 pullResult 直接返回 null
                 PullResult pullResult = this.mQClientFactory.getMQClientAPIImpl().pullMessage(brokerAddr, requestHeader, timeoutMillis, communicationMode, pullCallback);
 
                 return pullResult;

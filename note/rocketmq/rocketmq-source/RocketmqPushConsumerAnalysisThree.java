@@ -1,12 +1,88 @@
 public class RocketmqPushConsumerAnalysisThree{
 
     /**
-     * 定时消息是指消息发送到 Broker 后，并不立即被消费者消费而是要等到特定的时间后才能被消费， RocketMQ 并不支持任意的时间精度， 如果要支持任意时间精度的定时调度，不可避免地需要在 Broker 层做消息排序，
-     * 再加上持久化方面的考量，将不可避免地带来具大的性能消耗，所以 RocketMQ 只支持特定级别的延迟消息。
+     * 消费者消息重试
      * 
-     * 说到定时任务，上文提到的消息重试正是借助定时任务实现的，在将消息存入 commitlog 文件之前需要判断消息的重试次数 ，如果大于 0，则会将消息的主题设置 SCHEDULE_TOPIC_XXXX，
-     * RocketMQ 定时消息 实现类为 org.apache.rocketmq.store.schedule.ScheduleMessageService。该类的实例在 DefaultMessageStore 中创建，通过在 DefaultMessageStore 中调用 load 方法
-     * 加载并调用 start 方法进行启动。
+     * Consumer 在启动的时候，会执行一个函数 copySubscription()，当用户注册的消息模型为集群模式的时候，会根据用户指定的组创建重试组话题并放入到注册信息中。
+     * 
+     * 假设用户的消费组名称为 "ORDER"，那么重试话题则为 "%RETRY%ORDER"，即前面加上了 "%RETRY%" 这个字符串。Consumer在一开始启动的时候，
+     * 就为用户自动注册了订阅组的重试话题。即用户不单单只接受这个组的话题的消息，也接受这个组的重试话题的消息。这样一来，就为接下来用户如何重试接受消息奠定了基础。
+     * 
+     * 当 Consumer 客户端在消费消息的时候，抛出了异常、返回了非正确消费的状态等错误的时候，这个时候 ConsumeMessageConcurrentlyService 会收集所有失败的消息，
+     * 然后将每一条消息封装进 CONSUMER_SEND_MSG_BACK 的请求中，并将其发送到 Broker 服务器。
+     * 
+     * 当消费失败的消息重新发送到服务器后，Broker 会为其指定新的话题重试 topic（就是 %RETRY% + ConsumerGroup），以及新的重试队列 id，并根据当前这条消息的已有的重试次数来选择定时级别，
+     * 即将这条消息变成定时消息投放到重试话题消息队列中。可见消息消费失败后并不是立即进行新的投递，而是有一定的延迟时间的。延迟时间随着重试次数的增加而增加，
+     * 也即投递的时间的间隔也越来越长。
+     * 
+     * 当然，消息如果一直消费不成功，那也不会一直无限次的尝试重新投递的。当重试次数大于最大重试次数 (默认为 16 次) 的时候，该消息将会被送往死信话题队列。
+     * 
+     */
+
+
+    /**
+     * 定时消息
+     * 
+     * 定时消息是指消息发送到 Broker 后，并不立即被消费者消费而是要等到特定的时间后才能被消费， RocketMQ 并不支持任意的时间精度， 
+     * 如果要支持任意时间精度的定时调度，不可避免地需要在 Broker 层做消息排序，再加上持久化方面的考量，将不可避免地带来具大的性能消耗，
+     * 所以 RocketMQ 只支持特定级别的延迟消息。
+     * 
+     * 说到定时任务，上文提到的消息重试正是借助定时任务实现的，在将消息存入 commitlog 文件之前需要判断消息的重试次数 ，如果大于 0，
+     * 则会将消息的主题设置 SCHEDULE_TOPIC_XXXX，RocketMQ 定时消息 实现类为 org.apache.rocketmq.store.schedule.ScheduleMessageService。
+     * 该类的实例在 DefaultMessageStore 中创建，具体的调用链如下：
+     * 
+     * BrokerStartup
+     * |-main
+     *      |-start
+     *          |-createBrokerController
+     *              |-BrokerController.initialize()    
+     *              |-controller.start()
+     *                  |-DefaultMessageStore.start()
+     *                      |-new ScheduleMessageService(this)
+     *                      |-scheduleMessageService.start()
+     * 
+     * 本文我们完整的对RocketMQ的定时消息实现方式进行了分析，我们总结一下它的完整流程：
+     * 
+     * 1.消息发送方发送消息，设置 delayLevel。
+     * 2.如果 delayLevel 大于 0，表明是一条延时消息，broker 处理该消息，将消息的原始主题、队列原始 id 进行备份后，改变消息的主题为 SCHEDULE_TOPIC_XXXX，
+     * 队列 id = 延迟级别 - 1，将消息持久化。
+     * 3.通过定时任务 ScheduleMessageService 对定时消息进行处理，每隔 1s 从上次拉取偏移量取出所有的消息进行处理
+     * 4.从消费队列中解析出消息的物理偏移量，从而从 commitLog 中取出消息
+     * 5.根据消息的属性重建消息，恢复消息的 topic、原队列 id，将消息的延迟级别属性 delayLevel 清除掉，再次保存到 commitLog 中，此时消费者可以对该消息进行消费
+     * 
+     * 综上，也就是说，rocketmq 对于延时消息是进行单独处理，如果一个消息的 delayLevel 大于 0，那么表明这个消息是延时消息，会将其暂存到延时队列中。其中，每一个
+     * 延时级别 DelayLevel 对应一个延时队列。同时，对于每一个延迟级别，都会开启一个任务 DeliverDelayedMessageTimerTask 判断其延时队列中的消息是否到期，如果到期，
+     * 则恢复其原始的主题 topic 和队列 id，并且将其重新写入到 commitLog 中，供消费者消费
+     */
+
+    /**
+     * 长轮询
+     * 
+     * Push 模式：
+     * Push 即服务端主动发送数据给客户端。在服务端收到消息之后立即推送给客户端。
+     * Push 模型最大的好处就是实时性。因为服务端可以做到只要有消息就立即推送，所以消息的消费没有"额外"的延迟。
+     * 但是 Push 模式在消息中间件的场景中会面临以下一些问题：
+     * 1.在 Broker 端需要维护 Consumer 的状态，不利于 Broker 去支持大量的 Consumer 的场景
+     * 2.Consumer 的消费速度是不一致的，由 Broker 进行推送难以处理不同的 Consumer 的状况
+     * 3.Broker 难以处理 Consumer 无法消费消息的情况（Broker 无法确定 Consumer 的故障是短暂的还是永久的）
+     * 4.大量的推送消息会加重 Consumer 的负载或者冲垮 Consumer
+     * 
+     * Pull 模式：
+     * Broker不再需要维护Consumer的状态（每一次pull都包含了其实偏移量等必要的信息）
+     * 状态维护在Consumer，所以Consumer可以很容易的根据自身的负载等状态来决定从Broker获取消息的频率
+     * 但是，和Push模式正好相反，Pull就面临了实时性的问题。因为由Consumer主动来Pull消息，所以实时性和Pull的周期相关，这里就产生了“额外”延迟。
+     * 如果为了降低延迟来提升 Pull 的执行频率，可能在没有消息的时候产生大量的Pull请求，也就是空轮询（消息中间件是完全解耦的，Broker 和 Consumer 无法预测下一条消息在什么时候产生）;
+     * 如果频率低了，那延迟自然就大了。
+     * 
+     * 
+     * 通过研究源码可知，RocketMQ的消费方式都是基于拉模式拉取消息的，而在这其中有一种长轮询机制（对普通轮询的一种优化），来平衡上面Push/Pull模型的各自缺点。
+     * 
+     * 基本设计思路是：消费者如果第一次尝试 Pull 消息失败（比如：Broker 端没有可以消费的消息），Broker 并不立即给消费者客户端返回 Response 的响应，而是先 hold 住并且挂起请求
+     * （将请求保存至 pullRequestTable 本地缓存变量中），然后 Broker 端的后台独立线程 — PullRequestHoldService 会每隔 5s 去检查是否有新的消息到达。
+     * Broker 在一直有新消息到达的情况下，长轮询就变为执行时间间隔为 0 的 pull 模式
+     * Broker 在一直没有新消息到达的情况下，请求阻塞在了 Broker，在下一条新消息到达或者长轮询等待时间超时的时候响应请求给 Consumer
+     * 
+     * RocketMQ 消息 Pull 的长轮询机制的关键在于 Broker 端的 PullRequestHoldService 和 ReputMessageService 两个后台线程
      */
 
     public class ScheduleMessageService extends ConfigManager {
@@ -22,21 +98,24 @@ public class RocketmqPushConsumerAnalysisThree{
         private final DefaultMessageStore defaultMessageStore;
         // 最大消息延迟级别
         private int maxDelayLevel;
-        // 延迟级别，将 "1s 5s 10s 30s 1m 2m 3m 4m Sm 6m 7m 8m 9m 10m 20m 30m lh 2h" 字符串解析成 delayLevelTable，转换后的数据结构类似 {1: 1000 ,2 :5000 30000, ...}
+        // 延迟级别，将 "1s 5s 10s 30s 1m 2m 3m 4m Sm 6m 7m 8m 9m 10m 20m 30m lh 2h" 字符串解析成 delayLevelTable，
+        // 转换后的数据结构类似 {1: 1000 ,2 :5000 30000, ...}
         private final ConcurrentMap<Integer /* level */, Long/* delay timeMillis */> delayLevelTable = new ConcurrentHashMap<Integer, Long>(32);
-
+        // offsetTable,延迟级别对应的消费进度，key=延迟级别，value=对应延迟级别下的消费进度
         private final ConcurrentMap<Integer /* level */, Long/* offset */> offsetTable = new ConcurrentHashMap<Integer, Long>(32);
 
-        // 该方法主要完成延迟消息消费队列消息进度的加载与 delayLevelTable 数据的构造，延迟队列消息消费进度默认存储路径为 ${ROCKET HOME}/store/config/delayOffset.json
         public boolean load() {
+            // 延迟消息消费队列消息进度的加载，迟队列消息消费进度默认存储路径为 ${ROCKET HOME}/store/config/delayOffset.json
             boolean result = super.load();
+            // delayLevelTable 数据的构造
             result = result && this.parseDelayLevel();
             return result;
         }
 
         public void start() {
-            // 根据延迟队列创建定时任务，遍历延迟级别，根据延迟级别 level 从 offsetTable 中获取到消费队列的消费进度，如果不存在，则使用 0，也就是说，每一个延迟级别对应一个消息消费队列，
-            // 然后创建定时任务，每一个时任务第一次启动时默认延迟 ls 先执行一次定时任务，第二次调度开始才使用相应的延迟时间。延迟级别与消息消费队列的映射关系为：消息队列 ID = 延迟级别 - 1
+            // 对不同的延迟级别创建对应的定时任务
+            // 遍历延迟级别，根据延迟级别 level 从 offsetTable 中获取到消费队列的消费进度，如果不存在，则使用 0，
+            // 也就是说，每一个延迟级别对应一个消息消费队列，也就是每一个消息队列有自己的消费进度 offset
             for (Map.Entry<Integer, Long> entry : this.delayLevelTable.entrySet()) {
                 Integer level = entry.getKey();
                 Long timeDelay = entry.getValue();
@@ -45,17 +124,19 @@ public class RocketmqPushConsumerAnalysisThree{
                     offset = 0L;
                 }
     
+                // 然后创建定时任务，每一个时任务第一次启动时默认延迟 ls 先执行一次定时任务，第二次调度开始才使用相应的延迟时间。
+                // 延迟级别与消息消费队列的映射关系为：消息队列 ID = 延迟级别 - 1
                 if (timeDelay != null) {
                     this.timer.schedule(new DeliverDelayedMessageTimerTask(level, offset), FIRST_DELAY_TIME);
                 }
             }
     
             this.timer.scheduleAtFixedRate(new TimerTask() {
-    
                 @Override
                 public void run() {
                     try {
-                        // 创建定时任务，每隔 10s 持久化一次延迟队列的消息消费进度（延迟消息调进度），持久化频率可以通过 flushDelayOffsetInterval 配置属性进行设置
+                        // 创建定时任务，每隔 10s 持久化一次延迟队列的消息消费进度（延迟消息调进度），也就是持久化 offsetTable 到磁盘的 delayOffset.json 上，
+                        // 持久化频率可以通过 flushDelayOffsetInterval 配置属性进行设置
                         ScheduleMessageService.this.persist();
                     } catch (Throwable e) {
                         log.error("scheduleAtFixedRate flush exception", e);
@@ -81,12 +162,14 @@ public class RocketmqPushConsumerAnalysisThree{
 
         public void executeOnTimeup() {
             // 根据队列 ID 与延迟主题查找消息消费队列，如果未找到，说明目前并不存在该延时级别的消息，忽略本次任务，根据延时级别创建下一次调度任务即可
+            // queueId = delayLevel - 1
             ConsumeQueue cq = ScheduleMessageService.this.defaultMessageStore.findConsumeQueue(SCHEDULE_TOPIC, delayLevel2QueueId(delayLevel));
 
             long failScheduleOffset = offset;
 
             if (cq != null) {
-                // 根据 offset 从消息消费队列中获取当前队列中所有有效的消息。如果未找到，更新一下延迟队列定时拉取进度并创建定时任务待下一次继续尝试
+                // 从消息消费队列 ConsumeQueue 中获取偏移量为 offset 的数据，包含多条消息。
+                // 如果未找到，更新一下延迟队列定时拉取进度并创建定时任务待下一次继续尝试
                 SelectMappedBufferResult bufferCQ = cq.getIndexBuffer(this.offset);
 
                 if (bufferCQ != null) {
@@ -113,10 +196,11 @@ public class RocketmqPushConsumerAnalysisThree{
                             }
 
                             long now = System.currentTimeMillis();
+                            // 这里的 tagsCode 是消息到期的时间戳
                             long deliverTimestamp = this.correctDeliverTimestamp(now, tagsCode);
-
                             nextOffset = offset + (i / ConsumeQueue.CQ_STORE_UNIT_SIZE);
 
+                            // 定时任务每次执行到这里都进行时间比较，计算延迟时间与当前时间的差值，如果延迟时间-当前时间<=0说明该延迟消息应当被处理，使其能够被消费者消费
                             long countdown = deliverTimestamp - now;
 
                             if (countdown <= 0) {
@@ -125,10 +209,13 @@ public class RocketmqPushConsumerAnalysisThree{
 
                                 if (msgExt != null) {
                                     try {
+                                        // messageTimeup 执行消息的恢复操作，这里会清除掉消息的 delayLevel 属性，复原先的队列以及消息 topic，确保在保存到 commitLog 时，
+                                        // 不会被再次放入到延迟队列。
                                         MessageExtBrokerInner msgInner = this.messageTimeup(msgExt);
-                                        // 将消息再次存入到 commitlog，并转发到主题对应的消息队列上，供消费者再次消费
+                                        // 对消息执行重新存储操作，将消息重新持久化到 commitLog 中，此时的消息已经能够被消费者拉取到
                                         PutMessageResult putMessageResult = ScheduleMessageService.this.defaultMessageStore.putMessage(msgInner);
                                         
+                                        // 如果写成功了，则继续写下一条消息
                                         if (putMessageResult != null && putMessageResult.getPutMessageStatus() == PutMessageStatus.PUT_OK) {
                                             continue;
                                         } else {
@@ -142,13 +229,17 @@ public class RocketmqPushConsumerAnalysisThree{
                                     }
                                 }
                             } else {
+                                // 延迟时间还没到，所以等待 countdown 时间之后再次进行执行
                                 ScheduleMessageService.this.timer.schedule(new DeliverDelayedMessageTimerTask(this.delayLevel, nextOffset), countdown);
                                 ScheduleMessageService.this.updateOffset(this.delayLevel, nextOffset);
                                 return;
                             }
                         } // end of for
+                        // offset 是一个逻辑值，而 i 表示消费的真实字节数
                         nextOffset = offset + (i / ConsumeQueue.CQ_STORE_UNIT_SIZE);
-                        ScheduleMessageService.this.timer.schedule(new DeliverDelayedMessageTimerTask(his.delayLevel, nextOffset), DELAY_FOR_A_WHILE);
+                        // 继续处理延迟级别 delayLevel 的消息队列中的延迟消息，其实也就是 delayLevel - 1 的
+                        ScheduleMessageService.this.timer.schedule(new DeliverDelayedMessageTimerTask(this.delayLevel, nextOffset), DELAY_FOR_A_WHILE);
+                        // 更新当前延迟队列的消息拉取进度
                         ScheduleMessageService.this.updateOffset(this.delayLevel, nextOffset);
                         return;
                     } finally {
@@ -156,7 +247,7 @@ public class RocketmqPushConsumerAnalysisThree{
                     }
                 } // end of if (bufferCQ != null)
                 else {
-
+                    // 如果根据 offset 未取到 SelectMappedBufferResult，则纠正下次定时任务的 offset 为当前定时任务队列的最小值
                     long cqMinOffset = cq.getMinOffsetInQueue();
                     if (offset < cqMinOffset) {
                         failScheduleOffset = cqMinOffset;
@@ -170,32 +261,35 @@ public class RocketmqPushConsumerAnalysisThree{
 
         // 根据消息重新构建新的消息对象，清除消息的延迟级别属性(delayLevel)、并恢复消息原先的消息主题与消息消费队列，消息的消费次数 reconsumeTimes 并不会丢失
         private MessageExtBrokerInner messageTimeup(MessageExt msgExt) {
+            // 创建一个新的 MessageExtBrokerInner 对象
             MessageExtBrokerInner msgInner = new MessageExtBrokerInner();
             msgInner.setBody(msgExt.getBody());
             msgInner.setFlag(msgExt.getFlag());
             MessageAccessor.setProperties(msgInner, msgExt.getProperties());
 
-            TopicFilterType topicFilterType = MessageExt.parseTopicFilterType(msgInner.getSysFlag());
-            long tagsCodeValue = MessageExtBrokerInner.tagsString2tagsCode(topicFilterType, msgInner.getTags());
-            msgInner.setTagsCode(tagsCodeValue);
-            msgInner.setPropertiesString(MessageDecoder.messageProperties2String(msgExt.getProperties()));
-
-            msgInner.setSysFlag(msgExt.getSysFlag());
-            msgInner.setBornTimestamp(msgExt.getBornTimestamp());
-            msgInner.setBornHost(msgExt.getBornHost());
-            msgInner.setStoreHost(msgExt.getStoreHost());
-            msgInner.setReconsumeTimes(msgExt.getReconsumeTimes());
+            // ignore code
 
             msgInner.setWaitStoreMsgOK(false);
+            // 删除掉 msgInner 中的 delayLevel 属性
             MessageAccessor.clearProperty(msgInner, MessageConst.PROPERTY_DELAY_TIME_LEVEL);
-
+            // 恢复 msgInner 中的原始 topic
             msgInner.setTopic(msgInner.getProperty(MessageConst.PROPERTY_REAL_TOPIC));
-
+            // 恢复 msgInner 中的原始队列 id
             String queueIdStr = msgInner.getProperty(MessageConst.PROPERTY_REAL_QUEUE_ID);
             int queueId = Integer.parseInt(queueIdStr);
             msgInner.setQueueId(queueId);
 
             return msgInner;
+        }
+
+        // 计算消息的到期时间，也就是消息的存储时间 + 延迟时间
+        public long computeDeliverTimestamp(final int delayLevel, final long storeTimestamp) {
+            Long time = this.delayLevelTable.get(delayLevel);
+            if (time != null) {
+                return time + storeTimestamp;
+            }
+    
+            return storeTimestamp + 1000;
         }
 
     }
@@ -204,7 +298,6 @@ public class RocketmqPushConsumerAnalysisThree{
      * RocketMQ 支持局部消息顺序消费，可以确保同一个消息消费队列中的消息被顺序消费，如果需要做到全局顺序消费则可以将主题配置成一个队列。
      * 消息消费包含如下 4 个步骤：消息队列负载、消息拉取、消息消费、消息消费进度存储。
      */
-
     public abstract class RebalanceImpl{
 
         /**
@@ -734,6 +827,42 @@ public class RocketmqPushConsumerAnalysisThree{
             }
     
             return -1;
+        }
+
+    }
+
+
+    public class DefaultMessageStore extends MessageStore{
+
+        public ConsumeQueue findConsumeQueue(String topic, int queueId) {
+            ConcurrentMap<Integer, ConsumeQueue> map = consumeQueueTable.get(topic);
+            if (null == map) {
+                ConcurrentMap<Integer, ConsumeQueue> newMap = new ConcurrentHashMap<Integer, ConsumeQueue>(128);
+                ConcurrentMap<Integer, ConsumeQueue> oldMap = consumeQueueTable.putIfAbsent(topic, newMap);
+                if (oldMap != null) {
+                    map = oldMap;
+                } else {
+                    map = newMap;
+                }
+            }
+    
+            ConsumeQueue logic = map.get(queueId);
+            if (null == logic) {
+                ConsumeQueue newLogic = new ConsumeQueue(
+                    topic,
+                    queueId,
+                    StorePathConfigHelper.getStorePathConsumeQueue(this.messageStoreConfig.getStorePathRootDir()),
+                    this.getMessageStoreConfig().getMapedFileSizeConsumeQueue(),
+                    this);
+                ConsumeQueue oldLogic = map.putIfAbsent(queueId, newLogic);
+                if (oldLogic != null) {
+                    logic = oldLogic;
+                } else {
+                    logic = newLogic;
+                }
+            }
+    
+            return logic;
         }
 
     }

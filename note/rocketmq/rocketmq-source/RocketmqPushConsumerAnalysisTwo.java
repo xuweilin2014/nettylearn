@@ -13,13 +13,15 @@ public class RocketmqPushConsumerAnalysisTwo{
     public class PullMessageProcessor implements NettyRequestProcessor {
 
         private RemotingCommand processRequest(final Channel channel, RemotingCommand request, boolean brokerAllowSuspend) throws RemotingCommandException {
-
+            // Broker 是否开启长轮询
+            final boolean hasSuspendFlag = PullSysFlag.hasSuspendFlag(requestHeader.getSysFlag());
+            // Broker 开启长轮询的等待时间
             final long suspendTimeoutMillisLong = hasSuspendFlag ? requestHeader.getSuspendTimeoutMillis() : 0;
 
             switch (response.getCode()) {
                 case ResponseCode.PULL_NOT_FOUND:
                 
-                // brokerAllowSuspend 表示 Broker 是否支持挂起，表示在未找到消息时会挂起。处理消息拉取时默认传入 true。
+                // brokerAllowSuspend 表示 Broker 是否支持挂起，即在未找到消息时会挂起。处理消息拉取时默认传入 true。
                 // 如果该参数为 true，表示支持挂起，则会先将响应对象 response 设置为 null，将不会立即向客户端写入响应
                 // 如果该参数为 false，未找到消息时直接返回客户端消息未找到
                 if (brokerAllowSuspend && hasSuspendFlag) {
@@ -32,9 +34,11 @@ public class RocketmqPushConsumerAnalysisTwo{
                     String topic = requestHeader.getTopic();
                     long offset = requestHeader.getQueueOffset();
                     int queueId = requestHeader.getQueueId();
-                    // 创建拉取任务 PullRequest，并且提交到 PullRequestHoldService 线程中，PullRequestHoldService 线程每隔 5s 重试一次
+                    // 创建拉取任务 PullRequest
                     PullRequest pullRequest = new PullRequest(request, channel, pollingTimeMills, this.brokerController.getMessageStore().now(), offset, subscriptionData, messageFilter);
+                    // 将创建好的 PullRequest 提交到 PullRequestHoldService 线程中，PullRequestHoldService 线程每隔 5s 重试一次
                     this.brokerController.getPullRequestHoldService().suspendPullRequest(topic, queueId, pullRequest);
+                    // 这次请求在这里先不返回，suspendPullRequest 那里会返回
                     response = null;
                     break;
                 }
@@ -49,8 +53,10 @@ public class RocketmqPushConsumerAnalysisTwo{
                     try {
                         // 这里又是长轮询的核心代码，其核心是设置 brokerAllowSuspend 为 false，表示不支持拉取线程挂起，
                         // 即当根据偏移量无法获取到消息时将不挂起线程等待新消息的到来，而是直接返回告诉客户端本次消息拉取未找到消息
+                        // 因为这里 brokerAllowSuspend 为 false，也就表明不支持长轮询，因此不会将 response 置为 null
                         final RemotingCommand response = PullMessageProcessor.this.processRequest(channel, request, false);
 
+                        // 获取到拉取结果，返回客户端
                         if (response != null) {
                             response.setOpaque(request.getOpaque());
                             response.markResponseType();
@@ -135,6 +141,12 @@ public class RocketmqPushConsumerAnalysisTwo{
             while (!this.isStopped()) {
                 try {
                     // 如果开启了长轮询机制，每 5s 尝试一次，判断消息是否到达。如果未开启长轮询，则等待 shortPollingTimeMills 之后再尝试，默认 1s
+                    // 现在有一种场景，在 PullRequest 休眠的5秒钟，如果有消息到达，也需要等待下次调度。
+                    // RocketMQ 在这边做了优化，在下面是通过 notifyMessageArriving 来做消息是否达到的处理以及再次触发消息拉取。
+                    // 因此可以在消息达到的时候直接触发 notifyMessageArriving，来拉取消息返回到客户端。这个逻辑封装在 NotifyMessageArrivingListener 中。
+                    // 而这个 Listener 会在消息做 reput 的时候触发
+                    // 简单的来讲，我们生产的消息落到broker之后，先是持久化到commitlog，然后在通过reput持久化到consumequeue和index。也正因为持久化到consumequeue，
+                    // 我们的客户端才能感知到这条消息的存在。然后在reput这个操作中顺带激活了长轮询休眠的PullRequest
                     if (this.brokerController.getBrokerConfig().isLongPollingEnable()) {
                         this.waitForRunning(5 * 1000);
                     } else {
@@ -156,7 +168,8 @@ public class RocketmqPushConsumerAnalysisTwo{
         }
 
         private void checkHoldRequest() {
-            // 遍历拉取任务列表，根据键 主题@队列 获取到消息消费队列最大偏移量，如果该偏移量大于待拉取的偏移量，说明有新的消息到达，调用 notifyMessageArriving 触发消息拉取
+            // 遍历拉取任务列表，根据键 主题@队列 获取到消息消费队列最大偏移量，如果该偏移量大于待拉取的偏移量，说明有新的消息到达，
+            // 调用 notifyMessageArriving 触发消息拉取
             for (String key : this.pullRequestTable.keySet()) {
                 String[] kArray = key.split(TOPIC_QUEUEID_SEPARATOR);
                 if (2 == kArray.length) {
@@ -184,11 +197,14 @@ public class RocketmqPushConsumerAnalysisTwo{
 
                     for (PullRequest request : requestList) {
                         long newestOffset = maxOffset;
+                        // newestOffset 表明消息队列中最新的消息 offset
+                        // 如果小于待拉取的偏移量 offset，则重新获取一下消息队列中最新的消息 offset
                         if (newestOffset <= request.getPullFromThisOffset()) {
                             newestOffset = this.brokerController.getMessageStore().getMaxOffsetInQueue(topic, queueId);
                         }
 
-                        // 如果消息队列的最大偏移量大于待拉取的偏移量，并且消息匹配，则调用 executeRequestWhenWakeup 将消息返回给消息拉取客户端，否则等待下一次尝试
+                        // 如果消息队列的最大偏移量大于待拉取的偏移量，说明有新的消息到达
+                        // 调用 executeRequestWhenWakeup 将消息返回给消息拉取客户端，否则等待下一次尝试
                         if (newestOffset > request.getPullFromThisOffset()) {
                             boolean match = request.getMessageFilter().isMatchedByConsumeQueue(tagsCode, new ConsumeQueueExt.CqExtUnit(tagsCode, msgStoreTime, filterBitMap));
                             // match by bit map, need eval again when properties is not null.
@@ -749,6 +765,13 @@ public class RocketmqPushConsumerAnalysisTwo{
 
             long beginTime = this.getSystemClock().now();
             // 这句代码，通过 commitLog 我们可以认为这里是真实刷盘操作，也就是消息被持久化了
+            //
+            // 
+            // 我们知道后台重放消息服务 ReputMessageService 会一直监督 CommitLog 文件是否添加了新的消息。
+            // 当有了新的消息后，重放消息服务会取出消息并封装为 DispatchRequest 请求，然后将其分发给不同的三个分发服务，建立消费队列文件服务就是这其中之一。
+            // 而此处当取消息封装为 DispatchRequest 的时候，当遇到定时消息时，又多做了一些额外的事情。
+            // 当遇见定时消息时，CommitLog 计算 tagsCode 标签码与普通消息不同。对于定时消息，tagsCode 值设置的是这条消息的投递时间，即建立消费队列文件的时候，
+            // 文件中的 tagsCode 存储的是这条消息未来在什么时候被投递
             PutMessageResult result = this.commitLog.putMessage(msg);
 
             long eclipseTime = this.getSystemClock().now() - beginTime;
@@ -814,6 +837,42 @@ public class RocketmqPushConsumerAnalysisTwo{
             return putMessageResult;
         }
 
+        public DispatchRequest checkMessageAndReturnSize(java.nio.ByteBuffer byteBuffer, final boolean checkCRC, final boolean readBody) {
+
+            // ignore code
+
+            // Timing message processing
+            {
+                String t = propertiesMap.get(MessageConst.PROPERTY_DELAY_TIME_LEVEL);
+                if (ScheduleMessageService.SCHEDULE_TOPIC.equals(topic) && t != null) {
+                    int delayLevel = Integer.parseInt(t);
+
+                    if (delayLevel > this.defaultMessageStore.getScheduleMessageService().getMaxDelayLevel()) {
+                        delayLevel = this.defaultMessageStore.getScheduleMessageService().getMaxDelayLevel();
+                    }
+
+                    if (delayLevel > 0) {
+                        tagsCode = this.defaultMessageStore.getScheduleMessageService().computeDeliverTimestamp(delayLevel, storeTimestamp);
+                    }
+                }
+            }
+
+        }
+
+    }
+
+    public class NotifyMessageArrivingListener implements MessageArrivingListener {
+        private final PullRequestHoldService pullRequestHoldService;
+    
+        public NotifyMessageArrivingListener(final PullRequestHoldService pullRequestHoldService) {
+            this.pullRequestHoldService = pullRequestHoldService;
+        }
+    
+        @Override
+        public void arriving(String topic, int queueId, long logicOffset, long tagsCode,
+            long msgStoreTime, byte[] filterBitMap, Map<String, String> properties) {
+            this.pullRequestHoldService.notifyMessageArriving(topic, queueId, logicOffset, tagsCode, msgStoreTime, filterBitMap, properties);
+        }
     }
     
 
