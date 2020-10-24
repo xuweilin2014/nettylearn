@@ -254,6 +254,9 @@ public class RocketmqPushConsumerAnalysis{
 
             /**
              * 接下来进行消息拉取的流控
+             * 
+             * rocketmq 拉取消息其实是一个循环的过程，这里就来到了一个问题，如果消息队列消费的速度跟不上消息发送的速度，那么就会出现消息堆积，
+             * 如果不进行流控的话，会有很多的 message 存在于我们的内存中，会导致我们的JVM出现OOM也就是内存溢出。
              */
     
             // 消息的总数
@@ -290,10 +293,16 @@ public class RocketmqPushConsumerAnalysis{
                     return;
                 }
             } else {
-                // 如果消息处理队列未被锁定，则延迟 3s 后再将 PullRequest 对象放入到拉取任务中，如果该处理队列是第一次拉取任务，则首先计算拉取偏移量，然后向消息服务端拉取消息
+                // 如果 processQueue 被锁定的话
+                // processQueue 被锁定（设置其 locked）属性是在 RebalanceImpl#lock 方法中，在 consumer 向 Broker 发送锁定消息队列请求之后，Broker 会返回
+                // 已经锁定好的消息队列集合，接着就会依次遍历这些消息队列 mq，并且从缓存 processQueueTable 中获取到和 mq 对应的 ProcessQueue，
+                // 并且将这些 ProcessQueue 的 locked 属性设置为 true
                 if (processQueue.isLocked()) {
+                    // 该处理队列是第一次拉取任务，则首先计算拉取偏移量，然后向消息服务端拉取消息
+                    // pullRequest 第一次被处理的时候，lockedFirst 属性为 false，之后都为 true
                     if (!pullRequest.isLockedFirst()) {
                         final long offset = this.rebalanceImpl.computePullFromWhere(pullRequest.getMessageQueue());
+                        // 如果 Broker 的 offset 小于 pullRequest 的 offset，则说明 Broker 可能比较繁忙，来不及更新消息队列的 offset
                         boolean brokerBusy = offset < pullRequest.getNextOffset();
                         log.info("the first time to pull message, so fix offset from broker. pullRequest: {} NewOffset: {} brokerBusy: {}", pullRequest, offset, brokerBusy);
                         if (brokerBusy) {
@@ -301,8 +310,11 @@ public class RocketmqPushConsumerAnalysis{
                         }
     
                         pullRequest.setLockedFirst(true);
+                        // 拉取的偏移量以 Broker 为准
                         pullRequest.setNextOffset(offset);
                     }
+                
+                // 如果消息处理队列未被锁定，则延迟 3s 后再将 PullRequest 对象放入到拉取任务中
                 } else {
                     this.executePullRequestLater(pullRequest, PULL_TIME_DELAY_MILLS_WHEN_EXCEPTION);
                     log.info("pull message later because not locked in broker, {}", pullRequest);
@@ -354,10 +366,11 @@ public class RocketmqPushConsumerAnalysis{
                                     DefaultMQPushConsumerImpl.this.getConsumerStatsManager().incPullTPS(pullRequest.getConsumerGroup(),
                                         pullRequest.getMessageQueue().getTopic(), pullResult.getMsgFoundList().size());
     
-                                    // 将拉取到的消息存入 ProcessQueue，然后将拉取到的消息提交给 ConsumeMessageService 中供消费者消费，该方法是一个异步方法
+                                    // 将拉取到的消息存入 ProcessQueue
+                                    boolean dispathToConsume = processQueue.putMessage(pullResult.getMsgFoundList());
+                                    // 将拉取到的消息提交给 ConsumeMessageService 中供消费者消费，该方法是一个异步方法
                                     // 也就是 PullCallBack 将消息提交给 ConsumeMessageService 中就会立即返回，至于这些消息如何消费， PullCallBack 不关注
                                     // 在 ConsumeMessageService 中进行消息的消费时，会调用 MessageListener 对消息进行实际的处理，处理完成会通知ProcessQueue
-                                    boolean dispathToConsume = processQueue.putMessage(pullResult.getMsgFoundList());
                                     DefaultMQPushConsumerImpl.this.consumeMessageService.submitConsumeRequest(pullResult.getMsgFoundList(), processQueue, pullRequest.getMessageQueue(), dispathToConsume);
     
                                     // 将消息提交给消费者线程之后 PullCallBack 将立即返回，可以说本次消息拉取顺利完成，然后根据 PullInterval 参数，如果 pullInterval > 0 ，则等待 pullInterval 毫秒后将
@@ -657,6 +670,20 @@ public class RocketmqPushConsumerAnalysis{
             }
         }
 
+        // 遍历已经注册的消费者，对消费者执行 doRebalance 操作
+        public void doRebalance() {
+            for (Map.Entry<String, MQConsumerInner> entry : this.consumerTable.entrySet()) {
+                MQConsumerInner impl = entry.getValue();
+                if (impl != null) {
+                    try {
+                        impl.doRebalance();
+                    } catch (Throwable e) {
+                        log.error("doRebalance exception", e);
+                    }
+                }
+            }
+        }
+
         private void startScheduledTask() {
             // ignore code...
     
@@ -701,6 +728,7 @@ public class RocketmqPushConsumerAnalysis{
             this.mqClientFactory = mqClientFactory;
         }
     
+        // RebalanceService 每隔 20s 执行一次 mqClientFactory.doRebalance 方法
         @Override
         public void run() {
             log.info(this.getServiceName() + " service started");

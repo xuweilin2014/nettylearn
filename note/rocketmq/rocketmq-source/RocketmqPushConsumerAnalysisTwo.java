@@ -21,7 +21,7 @@ public class RocketmqPushConsumerAnalysisTwo{
             switch (response.getCode()) {
                 case ResponseCode.PULL_NOT_FOUND:
                 
-                // brokerAllowSuspend 表示 Broker 是否支持挂起，即在未找到消息时会挂起。处理消息拉取时默认传入 true。
+                // brokerAllowSuspend 表示 Broker 是否支持挂起，即是否允许在未找到消息时暂时挂起线程。第一次调用时默认为 true。
                 // 如果该参数为 true，表示支持挂起，则会先将响应对象 response 设置为 null，将不会立即向客户端写入响应
                 // 如果该参数为 false，未找到消息时直接返回客户端消息未找到
                 if (brokerAllowSuspend && hasSuspendFlag) {
@@ -38,7 +38,7 @@ public class RocketmqPushConsumerAnalysisTwo{
                     PullRequest pullRequest = new PullRequest(request, channel, pollingTimeMills, this.brokerController.getMessageStore().now(), offset, subscriptionData, messageFilter);
                     // 将创建好的 PullRequest 提交到 PullRequestHoldService 线程中，PullRequestHoldService 线程每隔 5s 重试一次
                     this.brokerController.getPullRequestHoldService().suspendPullRequest(topic, queueId, pullRequest);
-                    // 这次请求在这里先不返回，suspendPullRequest 那里会返回
+                    // 关键，设置 response = null，则此时此次调用不会向客户端输出任何字节，客户端网络请求的读事件不会触发，客户端处于等待状态
                     response = null;
                     break;
                 }
@@ -519,7 +519,15 @@ public class RocketmqPushConsumerAnalysisTwo{
                 default:
                     break;
             }
-            // 将消费前缓存的消息清除
+            // 将消费前缓存的消息从 ProcessQueue 中清除
+            // 这里有一个问题，在普通消息消费的时候，是并发处理，如果出现offset靠后的消息先被消费完，但是我们的offset靠前的还没有被消费完，
+            // 这个时候出现了宕机，我们的offset靠前的这部分数据是否会丢失呢？也就是下次消费的时候是否会从offset靠后的没有被消费的开始消费呢？
+            // 如果不是的话，rocketmq是怎么做到的呢？
+            // 
+            // 将消费前缓存的消息从 ProcessQueue 中清除，如果不深入进去看内部逻辑，这里会误以为，它会将当前消息的offset给更新到最新的消费进度，
+            // 那问题三中说的中间的offset是有可能被丢失的，但实际上是不会发生的，具体的逻辑保证在removeMessage中。
+            // 在removeMessage中通过msgTreeMap去做了一个保证，msgTreeMap是一个TreeMap，根据offset升序排序，如果treeMap中有值的话，他返回的offset就会是当前msgTreeMap中的firstKey，
+            // 而不是当前的offset，从而就解决了上面的问题
             long offset = consumeRequest.getProcessQueue().removeMessage(consumeRequest.getMsgs());
             // 更新 offset
             if (offset >= 0 && !consumeRequest.getProcessQueue().isDropped()) {

@@ -85,6 +85,59 @@ public class RocketmqPushConsumerAnalysisThree{
      * RocketMQ 消息 Pull 的长轮询机制的关键在于 Broker 端的 PullRequestHoldService 和 ReputMessageService 两个后台线程
      */
 
+    /**
+     * 从使用上可以推断顺序消息需要从发送到消费整个过程中保证有序，所以顺序消息具体表现为:
+     * 
+     * i.发送消息是顺序的
+     * ii.broker 存储消息是顺序的
+     * iii.consumer 消费是顺序的
+     * 
+     * 1.发送消息是顺序的
+     * 
+     * 因为 broker 存储消息有序的前提是 producer 发送消息是有序的，所以这两个结合在一起说。消息发布是有序的含义：producer 发送消息应该是依次发送的，
+     * 所以要求发送消息的时候保证：
+     * 
+     * i.消息不能异步发送，同步发送的时候才能保证 broker 收到是有序的。
+     * ii.每次发送选择的是同一个 MessageQueue
+     * 
+     * producer 发送消息的时候是同步发送的。同步发送表示，producer 发送消息之后不会立即返回，会等待 broker 的 response。
+     * broker 收到 producer 的请求之后虽然是启动线程处理的，但是在线程中将消息写入 commitLog 中以后会发送 response 给 producer，producer 在收到 broker 的 response
+     * 并且是处理成功之后才算是消息发送成功。
+     * 
+     * 2.保证 Broker 存储消息是顺序的
+     * 
+     * 为了保证 broker 收到消息也是顺序的，所以 producer 只能向其中一个队列发送消息。因为只有是同一个队列才能保证消息是发往同一个 broker，
+     * 只有同一个 broker 处理发来的消息才能保证顺序。所以发送顺序消息的时候需要用户指定 MessageQueue
+     * 
+     * 3.保证 consumer 消息消费时顺序的
+     * 
+     * 保证了 Broker 中物理存储的消息是顺序的，只要保证消息消费是顺序的就能保证整个过程是顺序消息了。顺序消费和普通消费的 Listener 是不一样的，
+     * 顺序消费需要实现的是下面这个接口：org.apache.rocketmq.client.consumer.listener.MessageListenerOrderly
+     * 
+     * 在 consumer 启动的时候会根据 listener 的类型判断应该使用哪一个 service 来消费，如果是顺序消息，就使用 ConsumeMessageOrderlyService
+     * consumer 拉取消息是按照 offset 拉取的，所以 consumer 能保证拉取到 consumer 的消息是连续有序的，但是 consumer 拉取到消息后又启动了线程池去处理消息，
+     * ，所以线程执行的顺序又不确定了，那么 consumer 消费就变成无序的了吗？
+     * 
+     * 这里要额外提一下 ProcessQueue 这个关键的数据结构。一个 MessageQueue 对应一个 ProcessQueue，这是一个有序队列，该队列记录一个 queueId 下所有从 broker 拉取回来的消息，
+     * 如果消费成功了就会从队列中删除。ProcessQueue 有序的原因是维护了一个 TreeMap。msgTreeMap：里面维护了从broker 拉取回来的所有消息，TreeMap 是有序的，
+     * key 是 Long 类型的，没有指定 comparator，因为key是当前消息的offset，而Long实现了Comparable接口，所以msgTreeMap里面的消息是按照offset排序的。
+     * 所以是ProcessQueue保证了拉取回来的消息是有序的。
+     * 
+     * 但是，如果一个 processQueue 在同一时刻有多个线程去消费，那么还是不能保证消息消费的顺序性。这里就要引入锁的概念。Consumer 在严格顺序消费时，通过 3 把锁保证严格顺序消费。
+     * Broker 消息队列锁（分布式锁） ：
+     *      集群模式下，Consumer 从 Broker 获得该锁后，才能进行消息拉取、消费。
+     *      广播模式下，Consumer 无需该锁。
+     * Consumer 消息队列锁（本地锁） ：Consumer 获得该锁才能操作消息队列。
+     * Consumer 消息处理队列消费锁（本地锁） ：Consumer 获得该锁才能消费消息队列。
+     * 
+     * 锁的逻辑是这样，在最初通过 RebalanceImpl#updateProcessQueueTableInRebalance 方法给消费者 Consumer 分配消息队列时，如果有新的消息队列分配给 
+     * Consumer，如果是顺序消息，通过 lock 方法会向 Broker 发起锁定消息队列的请求，然后该方法会返回被当前消费者成功锁定的消息队列集合。接着就会将这些
+     * 消息队列对应的 ProcessQueue 设置为锁定状态。这些锁有过期期限，默认为 60s，所以 ConsumeMessageOrderlyService 的 start 方法中会每隔 20s 锁定
+     * 这个 consumer 对应的 processQueue。
+     * 
+     * 在进行消息消费时，要首先获取到这个 MessageQueue 对应的锁（其实就是一个对象，每个 mq 都对应一个），然后还要获取到这个 processQueue 对应的消费锁。
+     * 这就保证了一个消息队列在某一个时刻只能允许一个线程进行访问。
+     */
     public class ScheduleMessageService extends ConfigManager {
         // 定时消息统一主题
         public static final String SCHEDULE_TOPIC = "SCHEDULE_TOPIC_XXXX";
@@ -297,12 +350,15 @@ public class RocketmqPushConsumerAnalysisThree{
     /**
      * RocketMQ 支持局部消息顺序消费，可以确保同一个消息消费队列中的消息被顺序消费，如果需要做到全局顺序消费则可以将主题配置成一个队列。
      * 消息消费包含如下 4 个步骤：消息队列负载、消息拉取、消息消费、消息消费进度存储。
+     * 
+     * 每个 DefaultMQPushConsumerImpl 都持有一个单独的 RebalanceImpl 对象，该方法主要是遍历订阅信息对每个主题的队列进行重新的负载均衡，
+     * 在调用 DefaultMQPushConsumerImpl#subscribe 方法时会对 RebalanceImpl 中的 subTable 属性进行填充
      */
     public abstract class RebalanceImpl{
 
         /**
-         * RocketMQ 首先需要通过 RebalanceService 线程实现消息队列的负载， 集群模式下同一个消费组内的消费者共同承担其订阅主题下消息队列的消费，同一个消息消费队列在同一
-         * 时刻只会被消费组内一个消费者消费，一个消费者同一时刻可以分配多个消费队列
+         * RocketMQ 首先需要通过 RebalanceService 线程实现消息队列的负载， 集群模式下同一个消费组内的消费者共同承担其订阅主题下消息队列的消费，
+         * 同一个消息消费队列在同一时刻只会被消费组内一个消费者消费，一个消费者同一时刻可以分配多个消费队列
          */
         private boolean updateProcessQueueTableInRebalance(final String topic, final Set<MessageQueue> mqSet, final boolean isOrder) {
 
@@ -311,13 +367,15 @@ public class RocketmqPushConsumerAnalysisThree{
             List<PullRequest> pullRequestList = new ArrayList<PullRequest>();
 
             /**
-             * 如果经过消息队列重新负载（分配）后，分配到新的消息队列时，首先需要尝试向 Broker 发起锁定该消息队列的请求，如果返回加锁成功则创建该消息队列的拉取任务，
-             * 否则将跳过，等待其他消费者释放该消息队列的锁，然后在下一次队列重新负载时再尝试加锁。
+             * 如果经过消息队列重新负载（分配）后，分配到新的消息队列时，首先需要尝试向 Broker 发起锁定该消息队列的请求，
+             * 如果返回加锁成功则创建该消息队列的拉取任务，否则将跳过，等待其他消费者释放该消息队列的锁，然后在下一次队列
+             * 重新负载时再尝试加锁。
              * 
              * 顺序消息消费与并发消息消费的第一个关键区别：顺序消息在创建消息队列拉取任务时需要在 Broker 服务器锁定该消息队列。
              */
             for (MessageQueue mq : mqSet) {
                 if (!this.processQueueTable.containsKey(mq)) {
+                    // 尝试向 Broker 发起锁定该消息队列的请求
                     if (isOrder && !this.lock(mq)) {
                         log.warn("doRebalance, {}, add a new mq failed, {}, because lock failed", consumerGroup, mq);
                         continue;
@@ -337,6 +395,7 @@ public class RocketmqPushConsumerAnalysisThree{
                             pullRequest.setNextOffset(nextOffset);
                             pullRequest.setMessageQueue(mq);
                             pullRequest.setProcessQueue(pq);
+                            // 把 pullRequest 加入到 pullRequestList 中，从而可以让 PullMessageService 不断地向  Broker 发起请求
                             pullRequestList.add(pullRequest);
                             changed = true;
                         }
@@ -346,6 +405,7 @@ public class RocketmqPushConsumerAnalysisThree{
                 }
             }
 
+            // 将 pullRequestList 中的 pullRequest 向 Broker 发起请求
             this.dispatchPullRequest(pullRequestList);
 
             return changed;
@@ -369,6 +429,7 @@ public class RocketmqPushConsumerAnalysisThree{
         }
 
         public void lockAll() {
+            // 将消息队列按照 Broker 组织成 Map<String, Set<MessageQueue>>，方便下一步向 Broker 发送锁定请求消息队列的请求
             HashMap<String, Set<MessageQueue>> brokerMqs = this.buildProcessQueueTableByBrokerName();
     
             Iterator<Entry<String, Set<MessageQueue>>> it = brokerMqs.entrySet().iterator();
@@ -387,7 +448,7 @@ public class RocketmqPushConsumerAnalysisThree{
                     requestBody.setClientId(this.mQClientFactory.getClientId());
                     requestBody.setMqSet(mqs);
                     try {
-                        // 向 Broker ( Master 主节点) 发送锁定消息队列，该方法返回成功被当前消费者锁定的消息消费队列
+                        // 向 Broker ( Master 主节点) 发送锁定消息队列的请求，该方法返回成功被当前消费者锁定的消息消费队列
                         Set<MessageQueue> lockOKMQSet = this.mQClientFactory.getMQClientAPIImpl().lockBatchMQ(findBrokerResult.getBrokerAddr(), requestBody, 1000);
     
                         // 将成功锁定的消息消费队列相对应的处理队列 ProcessQueue 设置为锁定状态，同时更新加锁时间
@@ -398,7 +459,9 @@ public class RocketmqPushConsumerAnalysisThree{
                                     log.info("the message queue locked OK, Group: {} {}", this.consumerGroup, mq);
                                 }
     
+                                // 将 pq 设定成锁定状态
                                 processQueue.setLocked(true);
+                                // 更新 pq 的锁定时间
                                 processQueue.setLastLockTimestamp(System.currentTimeMillis());
                             }
                         }
@@ -444,6 +507,7 @@ public class RocketmqPushConsumerAnalysisThree{
             this.truncateMessageQueueNotMyTopic();
         }
 
+        // 
         private void rebalanceByTopic(final String topic, final boolean isOrder) {
             switch (messageModel) {
                 case BROADCASTING: {
@@ -462,7 +526,10 @@ public class RocketmqPushConsumerAnalysisThree{
                 case CLUSTERING: {
                     // 从路由信息中获取 topic 对应所有的 Queue
                     Set<MessageQueue> mqSet = this.topicSubscribeInfoTable.get(topic);
-                    // 从 Broker 获取所有同一个 Group 的所有 Consumer ID
+                    // 发送请求从 Broker 中获取该 topic 下消费组内所有的消费者客户端 id
+                    // 某个主题 topic 的队列可能分布在多个 Broker 上，请求该发送给哪个 Broker 呢？RocketeMQ 会从主题的路由信息表中随机选择一个 Broker，
+                    // 为什么呢？因为消费者在启动的时候，会向 MQClientInstance 中注册消费者，然后 MQClientInstance 会向所有的 Broker 发送心跳包，而这个
+                    // 心跳包中包含了 MQClientInstance 的消费者信息
                     List<String> cidAll = this.mQClientFactory.findConsumerIdList(topic, consumerGroup);
 
                     if (null == mqSet) {
@@ -478,7 +545,7 @@ public class RocketmqPushConsumerAnalysisThree{
                     if (mqSet != null && cidAll != null) {
                         List<MessageQueue> mqAll = new ArrayList<MessageQueue>();
                         mqAll.addAll(mqSet);
-                        // 将 MQ 和 cid 都排好序
+                        // 将 MQ 和 cid 都排好序，这个很重要，因为要确保同一个消费队列不会被分配给多个消费者
                         Collections.sort(mqAll);
                         Collections.sort(cidAll);
     
@@ -519,7 +586,9 @@ public class RocketmqPushConsumerAnalysisThree{
         }
 
         /**
-         * 从以上的代码可以看出，rebalanceImpl 每次都会检查分配到的 queue 列表，如果发现有新的 queue 加入，就会给这个 queue 初始化一个缓存队列，然后新发起一个 PullRequest 给 PullMessageService 执行。
+         * 从以上的代码可以看出，rebalanceImpl 每次都会检查分配到的 queue 列表，如果发现有新的 queue 加入，就会给这个 queue 初始化一个缓存队列，
+         * 然后新发起一个 PullRequest 给 PullMessageService 执行。
+         * 
          * 由此可见，新增的 queue 只有第一次 Pull 请求时 RebalanceImpl 发起的，后续请求是在 broker 返回数据后，处理线程发起的。
          */
         private boolean updateProcessQueueTableInRebalance(final String topic, final Set<MessageQueue> mqSet, final boolean isOrder) {
@@ -532,7 +601,7 @@ public class RocketmqPushConsumerAnalysisThree{
                 ProcessQueue pq = next.getValue();
 
                 if (mq.getTopic().equals(topic)) {
-                    // 不再消费这个Queue的消息
+                    // 不再消费这个 MessageQueue 的消息，也就是说经过负载均衡的分配策略之后，分配给这个 consumer 的消息队列发生了变化
                     if (!mqSet.contains(mq)) {
                         pq.setDropped(true);
                         if (this.removeUnnecessaryMessageQueue(mq, pq)) {
@@ -549,8 +618,11 @@ public class RocketmqPushConsumerAnalysisThree{
 
             List<PullRequest> pullRequestList = new ArrayList<PullRequest>();
             for (MessageQueue mq : mqSet) {
-                // 如果是新加入的 Queue
+                // 如果是新加入的 MessageQueue，也就是说新分配给这个 consumer 的 MessageQueue
                 if (!this.processQueueTable.containsKey(mq)) {
+                    // 如果是顺序消息，对于新分配的消息队列，首先尝试向 Broker 发起锁定该消息队列的请求
+                    // 如果返回加锁成功则创建该消息队列的拉取请求，否则直接跳过。等待其他消费者释放该消息队列的锁，然后在下一次队列重新负载均衡的时候
+                    //  再尝试重新加锁
                     if (isOrder && !this.lock(mq)) {
                         log.warn("doRebalance, {}, add a new mq failed, {}, because lock failed", consumerGroup, mq);
                         continue;
@@ -558,16 +630,17 @@ public class RocketmqPushConsumerAnalysisThree{
 
                     // 从 OffsetStore 中移除过时数据
                     this.removeDirtyOffset(mq);
+                    // 为新的 MessageQueue 初始化一个 ProcessQueue，用来缓存收到的消息
                     ProcessQueue pq = new ProcessQueue();
                     // 获取起始消费的 Offset
                     long nextOffset = this.computePullFromWhere(mq);
                     if (nextOffset >= 0) {
-                        // 为新的 MessageQueue 初始化一个 ProcessQueue，用来缓存收到的消息
                         ProcessQueue pre = this.processQueueTable.putIfAbsent(mq, pq);
                         if (pre != null) {
                             log.info("doRebalance, {}, mq already exists, {}", consumerGroup, mq);
                         } else {
-                            // 对于新加的 MessageQueue，初始化一个 PullRequest
+                            // 对于新加的 MessageQueue，初始化一个 PullRequest，并且将其加入到 pullRequestList 中
+                            // 在一个 JVM 进程中，同一个消费组中同一个队列只会存在一个 PullRequest 对象
                             log.info("doRebalance, {}, add a new mq, {}", consumerGroup, mq);
                             PullRequest pullRequest = new PullRequest();
                             pullRequest.setConsumerGroup(consumerGroup);
@@ -630,14 +703,16 @@ public class RocketmqPushConsumerAnalysisThree{
             this.scheduledExecutorService = Executors.newSingleThreadScheduledExecutor(new ThreadFactoryImpl("ConsumeMessageScheduledThread_"));
         }
 
-        /**
-         * 如果消费模式为集群模式，启动定时任务，默认每隔 20s 执行一次锁定分配给自己的消息消费队列。通过 -Drocketmq.client.rebalance.locklnterval = 20000 设置间隔，该值建议与一次消息负载频率设置相同。
-         * 从上文可知，集群模式下顺序消息消费在创建拉取任务时并未将 ProcessQueue 的 locked 状态设置为 true，在未锁定消息队列之前无法执行消息拉取任务， ConsumeMessageOrderlyService 以每秒 20s 频率对
-         * 分配给自己的消息队列进行自动锁操作，从而消费加锁成功的消息消费队列
-         */
+        
         public void start() {
             if (MessageModel.CLUSTERING.equals(ConsumeMessageOrderlyService.this.defaultMQPushConsumerImpl.messageModel())) {
                 this.scheduledExecutorService.scheduleAtFixedRate(new Runnable() {
+                    // 如果消费模式为集群模式，启动定时任务，默认每隔 20s 执行一次锁定分配给自己的消息消费队列。
+                    // 通过 -Drocketmq.client.rebalance.locklnterval = 20000 设置间隔，该值建议与一次消息负载频率设置相同。
+                    // 从之前 RebalanceImpl#updateProcessQueueTableInRebalance 方法中，集群模式下顺序消息消费对于新分配到的 mq，
+                    // 在创建拉取任务和 processQueue 时并未将 ProcessQueue 的 locked 状态设置为 true，在未锁定消息队列之前无法执行消息拉取任务。
+                    // 
+                    // ConsumeMessageOrderlyService 以每秒 20s 频率对分配给自己的消息队列进行自动锁操作，从而消费加锁成功的消息消费队列
                     @Override
                     public void run() {
                         ConsumeMessageOrderlyService.this.lockMQPeriodically();
@@ -652,13 +727,112 @@ public class RocketmqPushConsumerAnalysisThree{
             }
         }
 
-        public void submitConsumeRequest(final List<MessageExt> msgs, final ProcessQueue processQueue, final MessageQueue messageQueue, final boolean dispathToConsume) {
+        public void submitConsumeRequest(final List<MessageExt> msgs, final ProcessQueue processQueue, final MessageQueue messageQueue, 
+                    final boolean dispathToConsume) {
             // 构建消费任务，并且提交到消费线程池中
+            // 从这里可以看出，顺序消息的 ConsumeRequest 消费任务不会直接消费本次拉取的消息 msgs，也就是构建 ConsumeRequest 对象时，
+            // msgs 完全被忽略了。而事实上，是在消息消费时从处理队列 processQueue 中拉取的消息
             if (dispathToConsume) {
                 ConsumeRequest consumeRequest = new ConsumeRequest(processQueue, messageQueue);
                 this.consumeExecutor.submit(consumeRequest);
             }
+        }
 
+        /**
+         * 顺序消费消息结果 (ConsumeOrderlyStatus) 有四种情况:
+         * 
+         * SUCCESS：消费成功并且提交。
+         * ROLLBACK：消费失败，消费回滚。
+         * COMMIT：消费成功提交并且提交。
+         * SUSPEND_CURRENT_QUEUE_A_MOMENT：消费失败，挂起消费队列一会，稍后继续消费。
+         * 
+         * 考虑到 ROLLBACK 、COMMIT 暂时只使用在 MySQL binlog 场景，官方将这两状态标记为 @Deprecated。当然，相应的实现逻辑依然保留。
+         * 在并发消费场景时，如果消费失败，Consumer 会将消费失败消息发回到 Broker 重试队列，跳过当前消息，等待下次拉取该消息再进行消费。
+         * 但是在完全严格顺序消费消费时，这样做显然不行，有可能会破坏掉消息消费的顺序性。也因此，消费失败的消息，会挂起队列一会会，稍后继续消费。
+         * 不过消费失败的消息一直失败，也不可能一直消费。当超过消费重试上限时，Consumer 会将消费失败超过上限的消息发回到 Broker 死信队列。
+         */
+        public boolean processConsumeResult(final List<MessageExt> msgs, final ConsumeOrderlyStatus status, final ConsumeOrderlyContext context, final ConsumeRequest consumeRequest) {
+            boolean continueConsume = true;
+            long commitOffset = -1L;
+            if (context.isAutoCommit()) {
+                switch (status) {
+                    case COMMIT:
+                    case ROLLBACK:
+                        log.warn("the message queue consume result is illegal, we think you want to ack these message {}", consumeRequest.getMessageQueue());
+                    case SUCCESS:
+                        // 将这批消息从 processQueue 中移除，同时维护 processQueue 中的状态信息
+                        commitOffset = consumeRequest.getProcessQueue().commit();
+                        this.getConsumerStatsManager().incConsumeOKTPS(consumerGroup, consumeRequest.getMessageQueue().getTopic(), msgs.size());
+                        break;
+                    case SUSPEND_CURRENT_QUEUE_A_MOMENT:
+                        this.getConsumerStatsManager().incConsumeFailedTPS(consumerGroup, consumeRequest.getMessageQueue().getTopic(), msgs.size());
+                        if (checkReconsumeTimes(msgs)) {
+                            // 消息消费重试，先将这批消息重新放入到 processQueue 的 msgTree 中，同时从 consumingMsgOrderlyTreeMap 中移除掉，
+                            consumeRequest.getProcessQueue().makeMessageToCosumeAgain(msgs);
+                            this.submitConsumeRequestLater(consumeRequest.getProcessQueue(), consumeRequest.getMessageQueue(), context.getSuspendCurrentQueueTimeMillis());
+                            continueConsume = false;
+                        } else {
+                            commitOffset = consumeRequest.getProcessQueue().commit();
+                        }   
+                        break;
+                    default:
+                        break;
+                }
+            } else {
+                // ignore code
+            }
+
+            if (commitOffset >= 0 && !consumeRequest.getProcessQueue().isDropped()) {
+                this.defaultMQPushConsumerImpl.getOffsetStore().updateOffset(consumeRequest.getMessageQueue(), commitOffset, false);
+            }
+
+            return continueConsume;
+        }
+
+        // 如果 msgs 中的任何一条消息 msg 的重试次数小于最大重试次数，或者超过最大重试次数但是 sendMessageBack 失败的话，checkReconsumeTimes
+        // 都会返回 true，在 processConsumeResult 方法中执行消息的重新消费工作
+        private boolean checkReconsumeTimes(List<MessageExt> msgs) {
+            boolean suspend = false;
+            if (msgs != null && !msgs.isEmpty()) {
+                for (MessageExt msg : msgs) {
+                    // 检查消息 msg 的最大重试次数，如果大于或者等于允许的最大重试次数，那么就将该消息发送到 Broker 端，
+                    // 该消息在消息服务端最终会进入到 DLQ 队列。
+                    if (msg.getReconsumeTimes() >= getMaxReconsumeTimes()) {
+                        MessageAccessor.setReconsumeTime(msg, String.valueOf(msg.getReconsumeTimes()));
+                        // 如果消息成功进入到 DLQ 队列，sendMessageBack 返回 true
+                        if (!sendMessageBack(msg)) {
+                            suspend = true;
+                            msg.setReconsumeTimes(msg.getReconsumeTimes() + 1);
+                        }
+                    } else {
+                        suspend = true;
+                        msg.setReconsumeTimes(msg.getReconsumeTimes() + 1);
+                    }
+                }
+            }
+            return suspend;
+        }
+
+        public boolean sendMessageBack(final MessageExt msg) {
+            try {
+                // max reconsume times exceeded then send to dead letter queue.
+                Message newMsg = new Message(MixAll.getRetryTopic(this.defaultMQPushConsumer.getConsumerGroup()), msg.getBody());
+                String originMsgId = MessageAccessor.getOriginMessageId(msg);
+                MessageAccessor.setOriginMessageId(newMsg, UtilAll.isBlank(originMsgId) ? msg.getMsgId() : originMsgId);
+                newMsg.setFlag(msg.getFlag());
+                MessageAccessor.setProperties(newMsg, msg.getProperties());
+                MessageAccessor.putProperty(newMsg, MessageConst.PROPERTY_RETRY_TOPIC, msg.getTopic());
+                MessageAccessor.setReconsumeTime(newMsg, String.valueOf(msg.getReconsumeTimes()));
+                MessageAccessor.setMaxReconsumeTimes(newMsg, String.valueOf(getMaxReconsumeTimes()));
+                newMsg.setDelayTimeLevel(3 + msg.getReconsumeTimes());
+    
+                this.defaultMQPushConsumer.getDefaultMQPushConsumerImpl().getmQClientFactory().getDefaultMQProducer().send(newMsg);
+                return true;
+            } catch (Exception e) {
+                log.error("sendMessageBack exception, group: " + this.consumerGroup + " msg: " + msg.toString(), e);
+            }
+    
+            return false;
         }
     }
 
@@ -699,10 +873,28 @@ public class RocketmqPushConsumerAnalysisThree{
 
                     final long beginTime = System.currentTimeMillis();
                     for (boolean continueConsume = true; continueConsume; ) {
-                        // ignore code
+                        
+                        // 再次检查 processQueue 是否被锁定，如果没有，这延迟该消息队列的消费
+                        if (MessageModel.CLUSTERING.equals(ConsumeMessageOrderlyService.this.defaultMQPushConsumerImpl.messageModel())
+                            && !this.processQueue.isLocked()) {
+                            log.warn("the message queue not locked, so consume later, {}", this.messageQueue);
+                            ConsumeMessageOrderlyService.this.tryLockLaterAndReconsume(this.messageQueue, this.processQueue, 10);
+                            break;
+                        }
+
+                        // 同样，再次检查 processQueue 的锁是否超时，如果超时，也延迟该消息队列的消费
+                        if (MessageModel.CLUSTERING.equals(ConsumeMessageOrderlyService.this.defaultMQPushConsumerImpl.messageModel())
+                            && this.processQueue.isLockExpired()) {
+                            log.warn("the message queue lock expired, so consume later, {}", this.messageQueue);
+                            ConsumeMessageOrderlyService.this.tryLockLaterAndReconsume(this.messageQueue, this.processQueue, 10);
+                            break;
+                        }
 
                         long interval = System.currentTimeMillis() - beginTime;
+                        // 顺序消息的消费的处理逻辑，每一个 ConsumeRequest 消费任务不是以消费消息条数来计算的，而是根据消费时间，
+                        // 默认当消费时长超过 MAX_TIME_CONSUME_CONTINUOUSLY 之后，会延迟 10ms 再进行消息队列的消费，默认情况下，每消费 1 分钟休息 10ms
                         if (interval > MAX_TIME_CONSUME_CONTINUOUSLY) {
+                            // 延迟 10ms 之后再消费
                             ConsumeMessageOrderlyService.this.submitConsumeRequestLater(processQueue, messageQueue, 10);
                             break;
                         }
@@ -710,6 +902,8 @@ public class RocketmqPushConsumerAnalysisThree{
                         // 每次从处理队列中按顺序取出 consumeBatchSize 消息，如果未取到消息，也就是 msgs 为空，则设置 continueConsume 为 false ，本次消费任务结束。
                         // 顺序消息消费时，从 ProceessQueue 取出的消息，会临时存储在 ProceeQueue 的 consumingMsgOrderlyTreeMap 属性中
                         final int consumeBatchSize = ConsumeMessageOrderlyService.this.defaultMQPushConsumer.getConsumeMessageBatchMaxSize();
+                        
+                        // 注意这里和并发处理消息不同，并发消费请求在 ConsumeRequest 创建时，已经设置好消费哪些消息
                         List<MessageExt> msgs = this.processQueue.takeMessags(consumeBatchSize);
 
                         if (!msgs.isEmpty()) {
@@ -719,8 +913,7 @@ public class RocketmqPushConsumerAnalysisThree{
 
                             if (ConsumeMessageOrderlyService.this.defaultMQPushConsumerImpl.hasHook()) {
                                 // ignore code
-                                // 执行消息消费钩子函数（消息消费之前 before 方法），通过 DefaultMQPushConsumerimpl#registerConsumeMessageHook
-                                // 注册消息消费钩子函数并可以注册多个
+                                // 执行消息消费钩子函数（消息消费之前 before 方法）
                                 ConsumeMessageOrderlyService.this.defaultMQPushConsumerImpl.executeHookBefore(consumeMessageContext);
                             }
 
@@ -731,8 +924,7 @@ public class RocketmqPushConsumerAnalysisThree{
                                 // 申请消息消费锁，然后执行消息消费监听器，调用业务方具体消息监听器执行真正的消息消费处理逻辑，并通知 RocketMQ 消息消费结果
                                 this.processQueue.getLockConsume().lock();
                                 if (this.processQueue.isDropped()) {
-                                    log.warn("consumeMessage, the message queue not be able to consume, because it's dropped. {}",
-                                        this.messageQueue);
+                                    log.warn("consumeMessage, the message queue not be able to consume, because it's dropped. {}", this.messageQueue);
                                     break;
                                 }
 
@@ -771,12 +963,6 @@ public class RocketmqPushConsumerAnalysisThree{
                                 status = ConsumeOrderlyStatus.SUSPEND_CURRENT_QUEUE_A_MOMENT;
                             }
 
-                            if (ConsumeMessageOrderlyService.this.defaultMQPushConsumerImpl.hasHook()) {
-                                consumeMessageContext.setStatus(status.toString());
-                                consumeMessageContext.setSuccess(ConsumeOrderlyStatus.SUCCESS == status || ConsumeOrderlyStatus.COMMIT == status);
-                                ConsumeMessageOrderlyService.this.defaultMQPushConsumerImpl.executeHookAfter(consumeMessageContext);
-                            }
-
                             ConsumeMessageOrderlyService.this.getConsumerStatsManager().incConsumeRT(ConsumeMessageOrderlyService.this.consumerGroup, messageQueue.getTopic(), consumeRT);
                             // 如果消息消费结果为 ConsumeOrderlyStatus.SUCCESS，执行 ProceeQueue 的 commit 方法，并返回待更新的消息消费进度
                             continueConsume = ConsumeMessageOrderlyService.this.processConsumeResult(msgs, status, context, this);
@@ -803,8 +989,9 @@ public class RocketmqPushConsumerAnalysisThree{
     public class ProcessQueue{
 
         /**
-         * 提交，就是将该批消息从 ProceeQueue 中移除，维护 msgCount (消息处理队列中消息条数) 并获取消息消费的偏移量 offset，然后将该批消息从 msgTreeMapTemp 中移除，
-         * 并返回待保存的消息消费进度 (offset+ 1)，从中可以看出 offset 表示消息消费队列的逻辑偏移似于数组的下标，代表第 n 个 ConsumeQueue 条目
+         * 提交，就是将该批消息从 ProceeQueue 中移除，维护 msgCount (消息处理队列中消息条数) 并获取消息消费的偏移量 offset，
+         * 然后将该批消息从 msgTreeMapTemp 中移除，并返回待保存的消息消费进度 (offset+ 1)，从中可以看出 offset 表示消息消费队列的逻辑偏移似于数组的下标，
+         * 代表第 n 个 ConsumeQueue 条目
          */
         public long commit() {
             try {
@@ -815,6 +1002,7 @@ public class RocketmqPushConsumerAnalysisThree{
                     for (MessageExt msg : this.consumingMsgOrderlyTreeMap.values()) {
                         msgSize.addAndGet(0 - msg.getBody().length);
                     }
+                    // 将该批消息从 msgTreeMapTemp 中移除
                     this.consumingMsgOrderlyTreeMap.clear();
                     if (offset != null) {
                         return offset + 1;
@@ -835,6 +1023,7 @@ public class RocketmqPushConsumerAnalysisThree{
     public class DefaultMessageStore extends MessageStore{
 
         public ConsumeQueue findConsumeQueue(String topic, int queueId) {
+
             ConcurrentMap<Integer, ConsumeQueue> map = consumeQueueTable.get(topic);
             if (null == map) {
                 ConcurrentMap<Integer, ConsumeQueue> newMap = new ConcurrentHashMap<Integer, ConsumeQueue>(128);
@@ -848,12 +1037,8 @@ public class RocketmqPushConsumerAnalysisThree{
     
             ConsumeQueue logic = map.get(queueId);
             if (null == logic) {
-                ConsumeQueue newLogic = new ConsumeQueue(
-                    topic,
-                    queueId,
-                    StorePathConfigHelper.getStorePathConsumeQueue(this.messageStoreConfig.getStorePathRootDir()),
-                    this.getMessageStoreConfig().getMapedFileSizeConsumeQueue(),
-                    this);
+                ConsumeQueue newLogic = new ConsumeQueue(topic, queueId, StorePathConfigHelper.getStorePathConsumeQueue(this.messageStoreConfig.getStorePathRootDir()),
+                    this.getMessageStoreConfig().getMapedFileSizeConsumeQueue(), this);
                 ConsumeQueue oldLogic = map.putIfAbsent(queueId, newLogic);
                 if (oldLogic != null) {
                     logic = oldLogic;
@@ -863,6 +1048,75 @@ public class RocketmqPushConsumerAnalysisThree{
             }
     
             return logic;
+        }
+
+        class ReputMessageService extends ServiceThread {
+
+            @Override
+            public void run() {
+                DefaultMessageStore.log.info(this.getServiceName() + " service started");
+
+                while (!this.isStopped()) {
+                    try {
+                        Thread.sleep(1);
+                        this.doReput();
+                    } catch (Exception e) {
+                        DefaultMessageStore.log.warn(this.getServiceName() + " service has exception. ", e);
+                    }
+                }
+
+                DefaultMessageStore.log.info(this.getServiceName() + " service end");
+            }
+
+            private void doReput() {
+                for (boolean doNext = true; this.isCommitLogAvailable() && doNext; ) {
+    
+                    if (DefaultMessageStore.this.getMessageStoreConfig().isDuplicationEnable() && this.reputFromOffset >= DefaultMessageStore.this.getConfirmOffset()) {
+                        break;
+                    }
+    
+                    SelectMappedBufferResult result = DefaultMessageStore.this.commitLog.getData(reputFromOffset);
+                    if (result != null) {
+                        try {
+                            this.reputFromOffset = result.getStartOffset();
+    
+                            for (int readSize = 0; readSize < result.getSize() && doNext; ) {
+                                DispatchRequest dispatchRequest = DefaultMessageStore.this.commitLog.checkMessageAndReturnSize(result.getByteBuffer(), false, false);
+                                int size = dispatchRequest.getMsgSize();
+    
+                                if (dispatchRequest.isSuccess()) {
+                                    if (size > 0) {
+                                        DefaultMessageStore.this.doDispatch(dispatchRequest);
+                                        // 如果开启了长轮询，并且 Broker 的角色为主节点的话，则通知有新消息到达，执行 NotifyMessageArrivingListener 代码，
+                                        // 最终调用 pullRequestHoldService 的 notifyMessageArriving 方法，进行一次消息拉取
+                                        if (BrokerRole.SLAVE != DefaultMessageStore.this.getMessageStoreConfig().getBrokerRole()
+                                            && DefaultMessageStore.this.brokerConfig.isLongPollingEnable()) {
+                                            DefaultMessageStore.this.messageArrivingListener.arriving(dispatchRequest.getTopic(),
+                                                dispatchRequest.getQueueId(), dispatchRequest.getConsumeQueueOffset() + 1,
+                                                dispatchRequest.getTagsCode(), dispatchRequest.getStoreTimestamp(),
+                                                dispatchRequest.getBitMap(), dispatchRequest.getPropertiesMap());
+                                        }
+    
+                                        // ignore code
+                                    } else if (size == 0) {
+                                        this.reputFromOffset = DefaultMessageStore.this.commitLog.rollNextFile(this.reputFromOffset);
+                                        readSize = result.getSize();
+                                    }
+                                } else if (!dispatchRequest.isSuccess()) {
+
+                                    // ignore code
+
+                                }
+                            }
+                        } finally {
+                            result.release();
+                        }
+                    } else {
+                        doNext = false;
+                    }
+                }
+            }
+
         }
 
     }
