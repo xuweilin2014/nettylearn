@@ -177,7 +177,7 @@ public class RocketmqPushConsumerAnalysis{
                         }
                         this.defaultMQPushConsumer.setOffsetStore(this.offsetStore);
                     }
-                    // 如果是本地持久化会从文件中进行加载
+                    // 加载消息消费的进度，从磁盘或者是 Broker 中加载消息的消费进度
                     this.offsetStore.load();
     
                     // 根据是否是顺序消费，创建消费端消费线程服务。ConsumeMessageService 主要负责消息消费，内部维护一个线程池
@@ -227,7 +227,6 @@ public class RocketmqPushConsumerAnalysis{
          * 1.客户端封装消息拉取请求
          * 2.消息服务器查找并返回消息
          * 3.消息拉取客户端处理返回的消息
-         * @param pullRequest
          */
         public void pullMessage(final PullRequest pullRequest) {
             // 从 pullRequest 中获取到 ProcessQueue
@@ -347,8 +346,8 @@ public class RocketmqPushConsumerAnalysis{
     
                         switch (pullResult.getPullStatus()) {
                             case FOUND:
-                                // 更新 PullRequest 的下一次拉取偏移量
                                 long prevRequestOffset = pullRequest.getNextOffset();
+                                // 更新 PullRequest 的下一次拉取偏移量
                                 pullRequest.setNextOffset(pullResult.getNextBeginOffset());
                                 long pullRT = System.currentTimeMillis() - beginTimestamp;
                                 DefaultMQPushConsumerImpl.this.getConsumerStatsManager().incPullRT(pullRequest.getConsumerGroup(), pullRequest.getMessageQueue().getTopic(), pullRT);
@@ -370,7 +369,8 @@ public class RocketmqPushConsumerAnalysis{
                                     boolean dispathToConsume = processQueue.putMessage(pullResult.getMsgFoundList());
                                     // 将拉取到的消息提交给 ConsumeMessageService 中供消费者消费，该方法是一个异步方法
                                     // 也就是 PullCallBack 将消息提交给 ConsumeMessageService 中就会立即返回，至于这些消息如何消费， PullCallBack 不关注
-                                    // 在 ConsumeMessageService 中进行消息的消费时，会调用 MessageListener 对消息进行实际的处理，处理完成会通知ProcessQueue
+                                    // 在 ConsumeMessageService 中进行消息的消费时，会调用 MessageListener 对消息进行实际的处理，
+                                    // 处理完成会通知 ProcessQueue，从 ProcessQueue 中移除掉这些处理完的 msg
                                     DefaultMQPushConsumerImpl.this.consumeMessageService.submitConsumeRequest(pullResult.getMsgFoundList(), processQueue, pullRequest.getMessageQueue(), dispathToConsume);
     
                                     // 将消息提交给消费者线程之后 PullCallBack 将立即返回，可以说本次消息拉取顺利完成，然后根据 PullInterval 参数，如果 pullInterval > 0 ，则等待 pullInterval 毫秒后将
@@ -481,7 +481,7 @@ public class RocketmqPushConsumerAnalysis{
                     this.defaultMQPushConsumer.getPullBatchSize(), // 本次拉取的最大消息条数，默认为 32 条
                     sysFlag,  // 拉取系统标记
                     commitOffsetValue, // 当前 MessageQueue 的消费进度（内存中）
-                    BROKER_SUSPEND_MAX_TIME_MILLIS, // Broker 长轮询时间
+                    BROKER_SUSPEND_MAX_TIME_MILLIS, // Broker 长轮询时间，也就是消息拉取过程中允许 Broker 挂起的时间，默认为 15s
                     CONSUMER_TIMEOUT_MILLIS_WHEN_SUSPEND, // 消息拉取的超时时间，也就是客户端阻塞等待的时间
                     CommunicationMode.ASYNC,  // 消息拉取模式，默认为异步拉取
                     pullCallback // 从 Broker 拉取消息之后的回调方法
@@ -496,6 +496,40 @@ public class RocketmqPushConsumerAnalysis{
             if (this.serviceState != ServiceState.RUNNING) {
                 throw new MQClientException("The consumer service state not OK, " + this.serviceState + FAQUrl.suggestTodo(FAQUrl.CLIENT_SERVICE_NOT_OK), null);
             }
+        }
+
+    }
+
+    public static class FilterAPI {
+
+        public static SubscriptionData buildSubscriptionData(final String consumerGroup, String topic, String subString) throws Exception {
+
+            SubscriptionData subscriptionData = new SubscriptionData();
+            subscriptionData.setTopic(topic);
+            subscriptionData.setSubString(subString);
+
+            if (null == subString || subString.equals(SubscriptionData.SUB_ALL) || subString.length() == 0) {
+                subscriptionData.setSubString(SubscriptionData.SUB_ALL);
+            } else {
+                // 将 subString 中的各个 tag （使用 || 进行分割）保存到 subscriptionData 的 tagSet 中
+                // 并且将 tag 字符串的 hashcode 值保存到 codeSet 中，用于以后的消息过滤
+                String[] tags = subString.split("\\|\\|");
+                if (tags.length > 0) {
+                    for (String tag : tags) {
+                        if (tag.length() > 0) {
+                            String trimString = tag.trim();
+                            if (trimString.length() > 0) {
+                                subscriptionData.getTagsSet().add(trimString);
+                                subscriptionData.getCodeSet().add(trimString.hashCode());
+                            }
+                        }
+                    }
+                } else {
+                    throw new Exception("subString split error");
+                }
+            }
+
+            return subscriptionData;
         }
 
     }
@@ -542,7 +576,7 @@ public class RocketmqPushConsumerAnalysis{
                 final long brokerSuspendMaxTimeMillis, final long timeoutMillis,
                 final CommunicationMode communicationMode, final PullCallback pullCallback)
                 throws MQClientException, RemotingException, MQBrokerException, InterruptedException {
-            // 获取到 Broker
+            // 根据 BrokerName、BrokerId 从 MQClientInstance 中获取到 Broker 的地址。相同名称的 Broker 形成主从结构，其 BrokerId 会不一样
             FindBrokerResult findBrokerResult = this.mQClientFactory.findBrokerAddressInSubscribe(mq.getBrokerName(), this.recalculatePullFromWhichNode(mq), false);
             // 如果查找不到 Broker 就更新一下路由信息，然后再次获取
             if (null == findBrokerResult) {
@@ -590,6 +624,50 @@ public class RocketmqPushConsumerAnalysis{
             }
 
             throw new MQClientException("The broker[" + mq.getBrokerName() + "] not exist", null);
+        }
+
+        // 将消息字节数组解码成消息列表填充 msgFoundList，并且对消息进行消息过滤（TAG）模式
+        public PullResult processPullResult(final MessageQueue mq, final PullResult pullResult, final SubscriptionData subscriptionData) {
+
+            PullResultExt pullResultExt = (PullResultExt) pullResult;
+
+            this.updatePullFromWhichNode(mq, pullResultExt.getSuggestWhichBrokerId());
+            if (PullStatus.FOUND == pullResult.getPullStatus()) {
+                // 将消息字节数组解码成消息列表填充
+                ByteBuffer byteBuffer = ByteBuffer.wrap(pullResultExt.getMessageBinary());
+                List<MessageExt> msgList = MessageDecoder.decodes(byteBuffer);
+
+                // 对解码得到的消息列表进行 Tag 过滤操作，也就是判断 msg 的 Tag 是否在 subscriptionData 的 tagSet 集合中
+                List<MessageExt> msgListFilterAgain = msgList;
+                if (!subscriptionData.getTagsSet().isEmpty() && !subscriptionData.isClassFilterMode()) {
+                    msgListFilterAgain = new ArrayList<MessageExt>(msgList.size());
+                    for (MessageExt msg : msgList) {
+                        if (msg.getTags() != null) {
+                            if (subscriptionData.getTagsSet().contains(msg.getTags())) {
+                                msgListFilterAgain.add(msg);
+                            }
+                        }
+                    }
+                }
+
+                if (this.hasHook()) {
+                    FilterMessageContext filterMessageContext = new FilterMessageContext();
+                    filterMessageContext.setUnitMode(unitMode);
+                    filterMessageContext.setMsgList(msgListFilterAgain);
+                    this.executeHook(filterMessageContext);
+                }
+
+                for (MessageExt msg : msgListFilterAgain) {
+                    MessageAccessor.putProperty(msg, MessageConst.PROPERTY_MIN_OFFSET, Long.toString(pullResult.getMinOffset()));
+                    MessageAccessor.putProperty(msg, MessageConst.PROPERTY_MAX_OFFSET, Long.toString(pullResult.getMaxOffset()));
+                }
+
+                pullResultExt.setMsgFoundList(msgListFilterAgain);
+            }
+
+            pullResultExt.setMessageBinary(null);
+
+            return pullResult;
         }
 
     }
@@ -879,6 +957,9 @@ public class RocketmqPushConsumerAnalysis{
             }, timeDelay, TimeUnit.MILLISECONDS);
         }
     
+        // PullMessageService#executePullRequestImmediately 主要有两个地方会调用这个方法，一个是在 DefaultMQPushConsumerImpl#pullMessage 方法中
+        // 一次消息拉取任务执行完成之后，又将 PullRequest 对象放入到 pullRequestQueue 中，这样 Consumer 就可以进行连续不断地拉取操作。第二个是在 RebalanceImpl
+        // 中创建，如果有新分配给消费者 Consumer 的 MessageQueue 的话，就创建一个新的 PullRequest，执行对应的 mq 的消息拉取工作。
         public void executePullRequestImmediately(final PullRequest pullRequest) {
             try {
                 this.pullRequestQueue.put(pullRequest);
@@ -956,6 +1037,10 @@ public class RocketmqPushConsumerAnalysis{
         private boolean lockedFirst = false;
     }
 
+    /*
+     * ProcessQueue 是 MessageQueue 在消费端的重现以及快照，PullMessageService 每次从 Broker 端默认拉取 32 条消息，按照消息的队列偏移量顺序
+     * 放在 ProcessQueue 中，然后交给消费线程池处理，消息成功消费后从 ProcessQueue 中移除掉
+     */
     public class ProcessQueue {
 
         // 消息存储容器，键为消息在 ConsumeQueue 中的偏移量，而 MessageExt 为消息实体
@@ -972,6 +1057,19 @@ public class RocketmqPushConsumerAnalysis{
         private volatile long lastPullTimestamp;
         // 上一次消息消费的时间戳
         private volatile long lastConsumeTimestamp = System.currentTimeMillis();
+
+        // 判断锁是否过期，默认为 30s
+        public boolean isLockExpired() {
+            return (System.currentTimeMillis() - this.lastLockTimestamp) > REBALANCE_LOCK_MAX_LIVE_TIME;
+        }
+
+        public void cleanExpiredMsg(DefaultMQPushConsumer pushConsumer) {
+            // 移除消费超时的消息，默认超过 15 分钟未消费的消息将延迟 3 个级别再消费
+        }
+
+        public boolean putMessage(final List<MessageExt> msgs) {
+            // 添加消息，PullMessageService 拉取到消息后，先调用这个方法将消息添加到 processQueue 中
+        }
 
     }
 

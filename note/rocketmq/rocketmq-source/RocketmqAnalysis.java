@@ -2,13 +2,19 @@ public class RocketmqAnalysis{
 
     /**
      * 消息消费者概述：
-     * 消息服务器与消费者之间的消息传送也有两种方式：推模式（PushConsumer）、拉模式（PullConsumer）。所谓的拉模式，是消费端主动发起拉消息请求（也就是由用户手动调用消息拉取 API)；
-     * 而推模式是 PushConsumer 在启动后，Consumer客户端会主动循环发送Pull请求到broker，如果没有消息，broker会把请求放入等待队列，新消息到达后返回response。
-     * 所以本质上，两种方式都是通过客户端Pull来实现的。RocketMQ 消息推模式的实现基于拉模式，在拉模式上包装一层，一个拉取任务完成后开始下一个拉取任务。
      * 
-     * 集群模式下，多个消费者如何对消息队列进行负载呢？消息队列负载机制遵循一个通用的思想 一个消息 列同一时间 只允许被一个消费者消费，一个消费者可 消费多个消息队列
+     * 消息消费是以组的形式展开，一个消费组内可以包含多个消费者，每一个消费组可以订阅【多个主题】，消费组之间有集群模式与广播模式两种消费模式。
+     * 集群模式下，主题下的同一条消息只允许被其中一个消费者消费，而在广播模式下，主题下的同一条消息可以被消费组中的所有消费者消费。
      * 
-     * RocketMQ 支持局部顺序消息消费，也就是保证同一个消息队列上的消息顺序消费。不支持消息的全局顺序消费，如果要实现某一主题的全局顺序消息消费，可以将该主题的队列数设置为 1，牺牲高可用性
+     * 消息服务器与消费者之间的消息传送也有两种方式：推模式（PushConsumer）、拉模式（PullConsumer）。所谓的拉模式，是消费端主动发起拉消息请求
+     * （也就是由用户手动调用消息拉取 API)；而推模式是 PushConsumer 在启动后，Consumer 客户端会主动循环发送 PullRequest 请求到 broker，
+     * 如果没有消息并且开启了长轮询的话，broker 会把请求放入等待队列，新消息到达后返回 response。所以本质上，两种方式都是通过客户端 Pull 来实现的。
+     * RocketMQ 消息推模式的实现也是基于拉模式，在拉模式上包装一层，一个拉取任务完成后开始下一个拉取任务。
+     * 
+     * 集群模式下，多个消费者如何对消息队列进行负载呢？消息队列负载机制遵循一个通用的思想：一个消息队列同一时间只允许被一个消费者消费，一个消费者可以消费多个消息队列
+     * 
+     * RocketMQ 支持局部顺序消息消费，也就是保证同一个消息队列上的消息顺序消费。不支持消息的全局顺序消费，如果要实现某一主题的全局顺序消息消费，
+     * 可以将该主题的队列数设置为 1，牺牲高可用性
      * 
      * RocketMQ 支持两种消息过滤模式:表达式（TAG 和 SQL92）与类过滤模式
      */
@@ -166,6 +172,10 @@ public class RocketmqAnalysis{
          */
         private OffsetStore offsetStore;
 
+        // 并发消息消费时处理队列的最大跨度，默认为 2000，表示如果消息处理队列中消息的最大偏移量减去消息的最小偏移量大于 2000，
+        // 那么就要进行流控
+        private int consumeConcurrentlyMaxSpan = 2000;
+
         /**
          * Minimum consumer thread number
          */
@@ -175,6 +185,13 @@ public class RocketmqAnalysis{
          * Max consumer thread number
          */
         private int consumeThreadMax = 64;
+
+        // 推模式下拉取任务的时间间隔，默认一次拉取任务完成继续拉取
+        private long pullInterval = 0;
+
+        // 每次消息拉取所拉取的条数，默认为 32 条
+        private int pullBatchSize = 32;
+
 
         public DefaultMQPushConsumer(final String consumerGroup) {
             this(consumerGroup, null, new AllocateMessageQueueAveragely());
@@ -579,6 +596,17 @@ public class RocketmqAnalysis{
             }
         }
 
+    }
+
+    public interface MessageFilter {
+        
+        // 根据 ConsumeQueue 判断消息是否匹配
+        // tagsCode 表示消息 tag 的 hashcode
+        boolean isMatchedByConsumeQueue(final Long tagsCode, final ConsumeQueueExt.CqExtUnit cqExtUnit);
+    
+        // 根据存储在 commitLog 文件中的内容消息是否匹配
+        // 主要用于表达式 SQL92 的过滤模式
+        boolean isMatchedByCommitLog(final ByteBuffer msgBuffer, final Map<String, String> properties);
     }
 
 

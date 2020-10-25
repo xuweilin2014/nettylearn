@@ -13,6 +13,21 @@ public class RocketmqPushConsumerAnalysisTwo{
     public class PullMessageProcessor implements NettyRequestProcessor {
 
         private RemotingCommand processRequest(final Channel channel, RemotingCommand request, boolean brokerAllowSuspend) throws RemotingCommandException {
+            
+            MessageFilter messageFilter;
+            
+            // 构建消息过滤对象 ExpressionForRetryMessageFilter，支持对重试主题的过滤
+            if (this.brokerController.getBrokerConfig().isFilterSupportRetry()) {
+                messageFilter = new ExpressionForRetryMessageFilter(subscriptionData, consumerFilterData, this.brokerController.getConsumerFilterManager());
+            // 构建消息过滤对象 ExpressionMessageFilter，不支持对重试主题消息的过滤
+            } else {
+                messageFilter = new ExpressionMessageFilter(subscriptionData, consumerFilterData, this.brokerController.getConsumerFilterManager());
+            }
+
+            final GetMessageResult getMessageResult = this.brokerController.getMessageStore().getMessage(
+                    requestHeader.getConsumerGroup(), requestHeader.getTopic(), requestHeader.getQueueId(),
+                    requestHeader.getQueueOffset(), requestHeader.getMaxMsgNums(), messageFilter);
+            
             // Broker 是否开启长轮询
             final boolean hasSuspendFlag = PullSysFlag.hasSuspendFlag(requestHeader.getSysFlag());
             // Broker 开启长轮询的等待时间
@@ -142,11 +157,14 @@ public class RocketmqPushConsumerAnalysisTwo{
                 try {
                     // 如果开启了长轮询机制，每 5s 尝试一次，判断消息是否到达。如果未开启长轮询，则等待 shortPollingTimeMills 之后再尝试，默认 1s
                     // 现在有一种场景，在 PullRequest 休眠的5秒钟，如果有消息到达，也需要等待下次调度。
+                    //
+                    // 如果开启了长轮询，则需要等待 5s 之后才能被唤醒去检查是否有新的消息到达，这样消息的实时性比较差。
                     // RocketMQ 在这边做了优化，在下面是通过 notifyMessageArriving 来做消息是否达到的处理以及再次触发消息拉取。
                     // 因此可以在消息达到的时候直接触发 notifyMessageArriving，来拉取消息返回到客户端。这个逻辑封装在 NotifyMessageArrivingListener 中。
                     // 而这个 Listener 会在消息做 reput 的时候触发
-                    // 简单的来讲，我们生产的消息落到broker之后，先是持久化到commitlog，然后在通过reput持久化到consumequeue和index。也正因为持久化到consumequeue，
-                    // 我们的客户端才能感知到这条消息的存在。然后在reput这个操作中顺带激活了长轮询休眠的PullRequest
+                    //
+                    // 简单的来讲，我们生产的消息落到 broker 之后，先是持久化到 commitlog，然后在通过 reput 持久化到 consumequeue 和 index。也正因为持久化到 
+                    // consumequeue，我们的客户端才能感知到这条消息的存在。然后在reput这个操作中顺带激活了长轮询休眠的PullRequest
                     if (this.brokerController.getBrokerConfig().isLongPollingEnable()) {
                         this.waitForRunning(5 * 1000);
                     } else {

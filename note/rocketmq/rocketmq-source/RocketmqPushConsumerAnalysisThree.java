@@ -58,6 +58,7 @@ public class RocketmqPushConsumerAnalysisThree{
     /**
      * 长轮询
      * 
+     * 
      * Push 模式：
      * Push 即服务端主动发送数据给客户端。在服务端收到消息之后立即推送给客户端。
      * Push 模型最大的好处就是实时性。因为服务端可以做到只要有消息就立即推送，所以消息的消费没有"额外"的延迟。
@@ -83,6 +84,16 @@ public class RocketmqPushConsumerAnalysisThree{
      * Broker 在一直没有新消息到达的情况下，请求阻塞在了 Broker，在下一条新消息到达或者长轮询等待时间超时的时候响应请求给 Consumer
      * 
      * RocketMQ 消息 Pull 的长轮询机制的关键在于 Broker 端的 PullRequestHoldService 和 ReputMessageService 两个后台线程
+     * 
+     * 接下来对 rocketmq 中长轮询的过程做一个概述：
+     * 
+     * RocketMQ 并没有真正实现推模式，而是消费者主动向消息服务器拉取消息， RocketMQ 推模式是循环向消息服务端发送消息拉取请求，
+     * 如果消息消费者向 RocketMQ 发送消息拉取时，消息并未到达消费队列，如果不启用长轮询机制，则会在服务端等待 shortPollingTimeMills 时间后（挂起）、
+     * （具体源码查看 PullRequestHoldService#run 方法）再去判断消息是否已到达消息队列，如果消息未到达则提示消息拉取客户端 PULL_NOT_FOUND （消息不存在）。
+     * 
+     * 如果开启长轮询模式，RocketMQ 一方面会每 5s 轮询检查一次消息是否可达。同时，有新消息到达后立马通知挂起线程再次验证新消息是否是自己感兴趣的消息，
+     * 如果是则从 commitlog 文件提取消息返回给消息拉取客户端，否则直到挂起超时，超时时间由消息拉取方在消息拉取时封装在请求参数中， PUSH 模式默认为 15s, 
+     * RocketMQ 通过在 Broker 端配置 longPollingEnable 为仕回来开启长轮询模式
      */
 
     /**
@@ -138,6 +149,24 @@ public class RocketmqPushConsumerAnalysisThree{
      * 在进行消息消费时，要首先获取到这个 MessageQueue 对应的锁（其实就是一个对象，每个 mq 都对应一个），然后还要获取到这个 processQueue 对应的消费锁。
      * 这就保证了一个消息队列在某一个时刻只能允许一个线程进行访问。
      */
+
+    /**
+     * 消息过滤
+     * 
+     * 1.tag 过滤：Consumer 端在订阅消息时除了指定 Topic 还可以指定 tag，如果一个消息有多个 tag，可以用 || 分隔。其中，Consumer 端会将这个订阅请求构建成一个 
+     * SubscriptionData，发送一个 pull 消息的请求给 Broker 端。Broker 端从 RocketMQ 的文件存储层 -- Store 读取数据之前，会用这些数据先构建一个 MessageFilter，
+     * 然后传给 Store。
+     * 
+     * Store 从 ConsumeQueue 读取到一条消息记录后，会用这条消息记录的 tag hashcode 值去做过滤，其实也就是判断这条消息记录的 hashcode 值是否在
+     * subscriptionData 的 codeSet 中。subscriptionData 中的 codeSet 其实就是将 tagSet 中的每个 tag 字符串调用其 hashcode 方法的返回值添加到其中。
+     * 不过这里要注意，如果 subscriptionData 中的 subString 为 "*"，那么就表明是订阅一个 topic 下的所有 tag，因此其 tagSet 和 codeSet 均为 null。
+     * 
+     * 由于在服务端只是根据 hashcode 进行判断，无法精确对 tag 原始字符串进行过滤，故在消息消费端拉取到消息后，还需要对消息的原始 tag 字符串进行比对，如果不同，
+     * 则丢弃该消息，不进行消息消费。
+     * 
+     * 2.SQL92 的过滤方式：这种方式的大致做法和上面的 tag 过滤方式一样，只是在 Store 层的具体过滤过程不太一样，真正的 SQL expression 的构建和执行由 rocketmq-filter
+     * 模块负责的。每次过滤都去执行 SQL 表达式会影响效率，所以 RocketMQ 使用了 BloomFilter 避免了每次都去执行。SQL92 的表达式上下文为消息的属性。 
+     */ 
     public class ScheduleMessageService extends ConfigManager {
         // 定时消息统一主题
         public static final String SCHEDULE_TOPIC = "SCHEDULE_TOPIC_XXXX";
@@ -488,6 +517,7 @@ public class RocketmqPushConsumerAnalysisThree{
         // 2.定时每隔 20s 来重新进行一次负载均衡
         public void doRebalance(final boolean isOrder) {
             // 获取到该 DefaultMQPushConsumerImpl 中所有的订阅信息
+            // subTable 在调用消费者 DefaultMQPushConsumerImpl#subscribe 方法时进行填充
             Map<String, SubscriptionData> subTable = this.getSubscriptionInner();
             if (subTable != null) {
                 for (final Map.Entry<String, SubscriptionData> entry : subTable.entrySet()) {
@@ -628,11 +658,11 @@ public class RocketmqPushConsumerAnalysisThree{
                         continue;
                     }
 
-                    // 从 OffsetStore 中移除过时数据
+                    // 从内存中移除该消息队列的消费进度
                     this.removeDirtyOffset(mq);
                     // 为新的 MessageQueue 初始化一个 ProcessQueue，用来缓存收到的消息
                     ProcessQueue pq = new ProcessQueue();
-                    // 获取起始消费的 Offset
+                    // 从磁盘中读取该消息队列的消费进度
                     long nextOffset = this.computePullFromWhere(mq);
                     if (nextOffset >= 0) {
                         ProcessQueue pre = this.processQueueTable.putIfAbsent(mq, pq);
@@ -656,7 +686,7 @@ public class RocketmqPushConsumerAnalysisThree{
                 }
             }
 
-            // 分发 Pull Request 到 PullMessageService 中的 pullRequestQueue 中
+            // 分发 Pull Request 到 PullMessageService 中的 pullRequestQueue 中以便唤醒 PullMessageService 线程
             this.dispatchPullRequest(pullRequestList);
 
             return changed;
