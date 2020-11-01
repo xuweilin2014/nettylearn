@@ -763,7 +763,45 @@ public class RocketmqPushConsumerAnalysis{
         }
 
         private void startScheduledTask() {
-            // ignore code...
+            // 获取 NameServer 的地址
+            if (null == this.clientConfig.getNamesrvAddr()) {
+                this.scheduledExecutorService.scheduleAtFixedRate(new Runnable() {
+    
+                    @Override
+                    public void run() {
+                        try {
+                            MQClientInstance.this.mQClientAPIImpl.fetchNameServerAddr();
+                        } catch (Exception e) {
+                            log.error("ScheduledTask fetchNameServerAddr exception", e);
+                        }
+                    }
+                }, 1000 * 10, 1000 * 60 * 2, TimeUnit.MILLISECONDS);
+            }
+
+            // 从 NameServer 获取数据更新 topicRouteInfo
+            this.scheduledExecutorService.scheduleAtFixedRate(new Runnable() {
+                @Override
+                public void run() {
+                    try {
+                        MQClientInstance.this.updateTopicRouteInfoFromNameServer();
+                    } catch (Exception e) {
+                        log.error("ScheduledTask updateTopicRouteInfoFromNameServer exception", e);
+                    }
+                }
+            }, 10, this.clientConfig.getPollNameServerInterval(), TimeUnit.MILLISECONDS);
+    
+            // 清除已经下线的broker，并发送心跳
+            this.scheduledExecutorService.scheduleAtFixedRate(new Runnable() {
+                @Override
+                public void run() {
+                    try {
+                        MQClientInstance.this.cleanOfflineBroker();
+                        MQClientInstance.this.sendHeartbeatToAllBrokerWithLock();
+                    } catch (Exception e) {
+                        log.error("ScheduledTask sendHeartbeatToAllBroker exception", e);
+                    }
+                }
+            }, 1000, this.clientConfig.getHeartbeatBrokerInterval(), TimeUnit.MILLISECONDS);
     
             // 保存消费进度
             this.scheduledExecutorService.scheduleAtFixedRate(new Runnable() {
