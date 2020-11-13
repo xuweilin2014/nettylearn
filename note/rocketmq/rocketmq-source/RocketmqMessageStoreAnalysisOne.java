@@ -1,7 +1,7 @@
 public class RocketmqMessageStoreAnalysis{
 
     /**
-     * Rocketmq 文件存储目录存为 ${ROCKETMQ_HOME}/store/commitlog 目录，每一个文件默认大小为 1 G，一个文件写满之后再创建另外一个，
+     * Rocketmq 消息文件存储目录存为 ${ROCKETMQ_HOME}/store/commitlog 目录，每一个文件默认大小为 1 G，一个文件写满之后再创建另外一个，
      * 并且以该文件中的第一个偏移量为文件名，偏移量小于 20 位用 0 补齐。这样就可以根据偏移量快速定位到消息的位置。
      * 
      * MappedFileQueue 可以看成是 ${ROCKET_HOME}/store/commitlog/ 文件夹，而 MappedFile 则可以看成是 commitlog 文件夹下的一个文件
@@ -350,9 +350,69 @@ public class RocketmqMessageStoreAnalysis{
             return putMessageResult;
         }
 
+        // 获取当前 commitlog 目录的最小偏移量，首先获取目录下的第一个文件，如果该文件可用，那么返回该文件的起始偏移量，
+        // 否则返回下一个文件的起始偏移量
+        public long getMinOffset() {
+            MappedFile mappedFile = this.mappedFileQueue.getFirstMappedFile();
+            if (mappedFile != null) {
+                if (mappedFile.isAvailable()) {
+                    return mappedFile.getFileFromOffset();
+                } else {
+                    return this.rollNextFile(mappedFile.getFileFromOffset());
+                }
+            }
+            return -1;
+        }
+
+        // 根据偏移量与消息长度查找消息
+        public SelectMappedBufferResult getMessage(final long offset, final int size) {
+            // 获取一个 commitlog 文件的大小
+            int mappedFileSize = this.defaultMessageStore.getMessageStoreConfig().getMapedFileSizeCommitLog();
+            // 根据 offset 找到这个偏移量所在的 mappedFile 或者说 commitlog
+            MappedFile mappedFile = this.mappedFileQueue.findMappedFileByOffset(offset, offset == 0);
+            if (mappedFile != null) {
+                // 取余得到文件内部的偏移量 pos，然后从该偏移量 pos 开始读取 size 个字节长度的内容就可以返回
+                int pos = (int) (offset % mappedFileSize);
+                return mappedFile.selectMappedBuffer(pos, size);
+            }
+            return null;
+        }
+
     }
 
     public class MappedFile extends ReferenceResource{
+        // 操作系统每页的大小，默认为 4KB
+        public static final int OS_PAGE_SIZE = 1024 * 4;
+        private static final AtomicLong TOTAL_MAPPED_VIRTUAL_MEMORY = new AtomicLong(0);
+        // 当前 JVM 实例中 MappedFile 对象的个数
+        private static final AtomicInteger TOTAL_MAPPED_FILES = new AtomicInteger(0);
+        // 当前文件的写指针（内存映射文件中的写指针），从 0 开始
+        protected final AtomicInteger wrotePosition = new AtomicInteger(0);
+        // ADD BY ChenYang
+        protected final AtomicInteger committedPosition = new AtomicInteger(0);
+        // 刷写到磁盘指针，该指针之前的数据已经被刷写到磁盘中
+        private final AtomicInteger flushedPosition = new AtomicInteger(0);
+        // 文件大小
+        protected int fileSize;
+        // 文件通道
+        protected FileChannel fileChannel;
+        /**
+         * Message will put to here first, and then reput to FileChannel if writeBuffer is not null.
+         * 如果开启了 transientStorePool 的话，数据首先应该存储在该 writeBuffer 中，然后提交到 MappedFile 对应的内存映射文件
+         */
+        protected ByteBuffer writeBuffer = null;
+        protected TransientStorePool transientStorePool = null;
+        // 文件名
+        private String fileName;
+        // 该文件的初始偏移量
+        private long fileFromOffset;
+        // 物理文件
+        private File file;
+        private MappedByteBuffer mappedByteBuffer;
+        // 文件上一次写入内容的时间
+        private volatile long storeTimestamp = 0;
+        // 是否是 MappedFileQueue 队列的第一个文件
+        private boolean firstCreateInQueue = false;
 
         public AppendMessageResult appendMessage(final MessageExtBrokerInner msg, final AppendMessageCallback cb) {
             return appendMessagesInner(msg, cb);
@@ -385,6 +445,263 @@ public class RocketmqMessageStoreAnalysis{
 
             log.error("MappedFile.appendMessage return null, wrotePosition: {} fileSize: {}", currentPos, this.fileSize);
             return new AppendMessageResult(AppendMessageStatus.UNKNOWN_ERROR);
+        }
+
+        public MappedFile(final String fileName, final int fileSize) throws IOException {
+            init(fileName, fileSize);
+        }
+
+        public MappedFile(final String fileName, final int fileSize, final TransientStorePool transientStorePool)throws IOException {
+            init(fileName, fileSize, transientStorePool);
+        }
+
+        public void init(final String fileName, final int fileSize, final TransientStorePool transientStorePool)throws IOException {
+            init(fileName, fileSize);
+            this.writeBuffer = transientStorePool.borrowBuffer();
+            this.transientStorePool = transientStorePool;
+        }
+
+        /**
+         * 根据是否开启 transientStorePoolEnable 存在两种初始化情况。
+         * 
+         * transientStorePoolEnable 为 true 表明先将内容存储到对外内存，也就是 MappedFile 对象的 writeBuffer 中（writeBuffer 就是从 transientStorePool
+         * 对象中得到的）。然后在 commit 的时候将 writeBuffer 中的内容写入到 fileChannel 中去（这个时候由于内核的缓存机制，真正写入到 fileChannel 中的数据
+         * 可能已经写入到磁盘中，也可能还存在于内核缓冲区中），最后在 flush 的时候，强制将其刷到磁盘中。
+         * 
+         * transientStorePoolEnable 为 false 的时候，则把内容直接写入到 mappedByteBuffer 中，而 mappedByteBuffer 是 fileChannel 在内存中的映射，可以看成是
+         * 直接写入到磁盘上的文件里面，所以不需要提交（这一点可以从 MappedFile#commit 方法看出来），然后在 flush 的时候，将所有内容强制刷入到磁盘中。
+         */
+        private void init(final String fileName, final int fileSize) throws IOException {
+            this.fileName = fileName;
+            this.fileSize = fileSize;
+            this.file = new File(fileName);
+            // fileFromOffset 是文件的初始偏移量，和文件名相同
+            this.fileFromOffset = Long.parseLong(this.file.getName());
+            boolean ok = false;
+
+            ensureDirOK(this.file.getParent());
+
+            try {
+                // Java NIO中的FileChannel是一个连接到文件的通道。可以通过文件通道读写文件，fileChannel 无法设置为非阻塞模式，它总是运行在阻塞模式下
+                // 这里获取到指定文件 file 的 fileChannel
+                this.fileChannel = new RandomAccessFile(this.file, "rw").getChannel();
+                // 将文件内容使用 NIO 的内存映射 Buffer 映射到内存中
+                // MappedByteBuffer 是Java NIO中引入的一种硬盘物理文件和内存映射方式，当磁盘上的物理文件较大时，采用MappedByteBuffer，读写性能较高，
+                // 内部的核心实现是DirectByteBuffer(JVM 堆外直接物理内存)。由于 commitlog 文件的大小默认为 1G，比较大，所以使用 mappedByteBuffer 加快
+                // 消息写入磁盘上的 commitlog 文件的速度
+                this.mappedByteBuffer = this.fileChannel.map(MapMode.READ_WRITE, 0, fileSize);
+                TOTAL_MAPPED_VIRTUAL_MEMORY.addAndGet(fileSize);
+                TOTAL_MAPPED_FILES.incrementAndGet();
+                ok = true;
+            } catch (FileNotFoundException e) {
+                log.error("create file channel " + this.fileName + " Failed. ", e);
+                throw e;
+            } catch (IOException e) {
+                log.error("map file " + this.fileName + " Failed. ", e);
+                throw e;
+            } finally {
+                if (!ok && this.fileChannel != null) {
+                    this.fileChannel.close();
+                }
+            }
+        }
+
+        public int commit(final int commitLeastPages) {
+            // 如果 writeBuffer 为空，说明是 transientStorePoolEnable 为 false，也就是说消息内容是直接写入到 mappedByteBuffer 中，
+            // 所以不需要进行提交
+            if (writeBuffer == null) {
+                // no need to commit data to file channel, so just regard wrotePosition as committedPosition.
+                return this.wrotePosition.get();
+            }
+
+            // commitLeastPages 为本次提交最小的页数，如果待提交数据不满 commitLeastPages ，则不执行本次提交操作，待下次提交
+            if (this.isAbleToCommit(commitLeastPages)) {
+                if (this.hold()) {
+                    commit0(commitLeastPages);
+                    this.release();
+                } else {
+                    log.warn("in commit, hold failed, commit offset = " + this.committedPosition.get());
+                }
+            }
+
+            // All dirty data has been committed to FileChannel.
+            if (writeBuffer != null && this.transientStorePool != null
+                    && this.fileSize == this.committedPosition.get()) {
+                this.transientStorePool.returnBuffer(writeBuffer);
+                this.writeBuffer = null;
+            }
+
+            return this.committedPosition.get();
+        }
+
+        protected void commit0(final int commitLeastPages) {
+            int writePos = this.wrotePosition.get();
+            int lastCommittedPosition = this.committedPosition.get();
+
+            // 把 commitedPosition 到 wrotePosition 之间的数据写入到 FileChannel 中， 然后更新 committedPosition 指针为
+            // wrotePosition。commit 的作用就是将 MappedFile#writeBuffer 中的数据提交到文件通道 FileChannel 中
+            if (writePos - this.committedPosition.get() > 0) {
+                try {
+                    // 创建 writeBuffer 的共享缓存区。slice 方法创建一个共享缓冲区，与原先的 ByteBuffer 共享内存，但是维护一套独立的指针
+                    ByteBuffer byteBuffer = writeBuffer.slice();
+                    byteBuffer.position(lastCommittedPosition);
+                    byteBuffer.limit(writePos);
+
+                    this.fileChannel.position(lastCommittedPosition);
+                    this.fileChannel.write(byteBuffer);
+                    this.committedPosition.set(writePos);
+                } catch (Throwable e) {
+                    log.error("Error occurred when commit data to FileChannel.", e);
+                }
+            }
+        }
+
+        protected boolean isAbleToCommit(final int commitLeastPages) {
+            // 得到 mappedFile 的 flush 指针和 write 指针，一般来说 flush <= write
+            int flush = this.committedPosition.get();
+            int write = this.wrotePosition.get();
+    
+            if (this.isFull()) {
+                return true;
+            }
+    
+            // commitLeastPages 小于 0 的话，就表示只要存在脏页就提交
+            if (commitLeastPages > 0) {
+                // write 指针减去 flush 指针的值，除以 OS_PAGE_SIZE 的值，就是当前脏页的数量
+                // commitLeastPages 为本次提交最小的页数，如果待提交数据不满 commitLeastPages ，则不执行本次提交操作，待下次提交
+                return ((write / OS_PAGE_SIZE) - (flush / OS_PAGE_SIZE)) >= commitLeastPages;
+            }
+    
+            return write > flush;
+        }
+
+        /**
+         * @return The max position which have valid data
+         * 
+         * 返回有效数据的指针。在 MappedFile 设计中，只有提交了的数据（写入到 MappedByteBuffer 或者 FileChannel 中的数据）才是安全有效的数据;
+         * 
+         * 如果 writeBuffer 为空，则直接返回当前的写指针;如果 writeBuffer 是空，就说明 transientStorePoolEnable 为 false，消息内容是直接写入到 mappedByteBuffer 中，
+         * 也就是说可以看成是直接写入到磁盘文件中，所以写入的数据都可以看成是合法的数据
+         * 如果 writeBuffer 不为空，则返回上一次提交的指针。
+         */
+        public int getReadPosition() {
+            return this.writeBuffer == null ? this.wrotePosition.get() : this.committedPosition.get();
+        }
+
+        public int flush(final int flushLeastPages) {
+            if (this.isAbleToFlush(flushLeastPages)) {
+                if (this.hold()) {
+                    int value = getReadPosition();
+    
+                    try {
+                        // We only append data to fileChannel or mappedByteBuffer, never both.
+                        // 刷写磁盘，直接调用 mappedByteBuffer 或者 fileChannel 的 force 方法将内存中数据持久化到磁盘
+                        if (writeBuffer != null || this.fileChannel.position() != 0) {
+                            this.fileChannel.force(false);
+                        } else {
+                            this.mappedByteBuffer.force();
+                        }
+                    } catch (Throwable e) {
+                        log.error("Error occurred when force data to disk.", e);
+                    }
+    
+                    this.flushedPosition.set(value);
+                    this.release();
+                } else {
+                    log.warn("in flush, hold failed, flush offset = " + this.flushedPosition.get());
+                    this.flushedPosition.set(getReadPosition());
+                }
+            }
+            return this.getFlushedPosition();
+        }
+
+        /**
+         * 先介绍一下，NIO 中 slice 方法的作用。java.nio.ByteBuffer类的slice()方法用于创建一个新的字节缓冲区，其内容是给定缓冲区内容的共享子序列。
+         * 新缓冲区的内容将从该缓冲区的当前位置（也就是 position）开始。对该缓冲区内容的更改将在新缓冲区中可见，反之亦然。这两个缓冲区的位置，限制和标记值将是独立的。
+         * 新缓冲区的位置（position）将为零，其容量（capacity）和限制（limit）将为该缓冲区中剩余的空间。当且仅当该缓冲区是直接缓冲区时，新缓冲区才是直接缓冲区；
+         * 当且仅当该缓冲区是只读缓冲区时，新缓冲区才是只读缓冲区。
+         * 
+         * 查找从 pos 开始，size 个大小的数据，由于在整个写入期间都未曾改变 MappedByteBuffer 的指针（注意，在 appendMessagesInner 方法中，
+         * 获取到的 byteBuffer 是 writeBuffer 或者 mappedByteBuffer 的 slice 片段，也就是说 slice 方法新得到的 ByteBuffer 区域的 position
+         * 和 limit 指针和原始的 writeBuffer 以及 mappedByteBuffer 区域是相互独立的）。
+         * 
+         * 所以 mappedByteBuffer.slice() 法返回的共享缓存区空间为整个 MappedFile ，然后通过设置 byteBuffer 的 position 为待查找的值，再次通过 slice 
+         * 方法得到的 byteBufferNew 的就是 byteBuffer 从 pos 开始往后的区域，byteBufferNew 的 position 为  0，而 limit 为 size，也就说明
+         * byteBufferNew 中可以读取到 size 个字节的数据，也就是 byteBuffer 中从 pos 开始往后 size 个字节的数据。
+         */
+        public SelectMappedBufferResult selectMappedBuffer(int pos, int size) {
+            int readPosition = getReadPosition();
+            if ((pos + size) <= readPosition) {
+    
+                if (this.hold()) {
+                    ByteBuffer byteBuffer = this.mappedByteBuffer.slice();
+                    byteBuffer.position(pos);
+                    ByteBuffer byteBufferNew = byteBuffer.slice();
+                    byteBufferNew.limit(size);
+                    return new SelectMappedBufferResult(this.fileFromOffset + pos, byteBufferNew, size, this);
+                } else {
+                    log.warn("matched, but hold failed, request pos: " + pos + ", fileFromOffset: "
+                        + this.fileFromOffset);
+                }
+            } else {
+                log.warn("selectMappedBuffer request pos invalid, request pos: " + pos + ", size: " + size
+                    + ", fileFromOffset: " + this.fileFromOffset);
+            }
+    
+            return null;
+        }
+    
+
+    }
+
+    /**
+     * TransientStorePool 短暂的存储池。RocketMQ 在 MappedFile 中从 TransientStorePool 对象中获取（borrow）一个内存缓存池，
+     * 其实也就是一个 ByteBuffer 对象，用来临时存储数据，数据先写入该 ByteBuffer 中，然后由 commit 线程定时将数据从该内存复制到与目的物理文件对应的内存映射中，
+     * 也就是从 ByteBuffer 写入到 fileChannel 中。然后再在 flush 线程中，将 fileChannel 中的数据写入到磁盘上
+     */
+    public class TransientStorePool {
+        // availableBuffers 中 ByteBuffer 的个数
+        private final int poolSize;
+        // 每个 ByteBuffer 的大小
+        private final int fileSize;
+        // 双端队列
+        private final Deque<ByteBuffer> availableBuffers;
+
+        private final MessageStoreConfig storeConfig;
+
+        public TransientStorePool(final MessageStoreConfig storeConfig) {
+            this.storeConfig = storeConfig;
+            this.poolSize = storeConfig.getTransientStorePoolSize();
+            this.fileSize = storeConfig.getMapedFileSizeCommitLog();
+            this.availableBuffers = new ConcurrentLinkedDeque<>();
+        }
+
+        public void init() {
+            for (int i = 0; i < poolSize; i++) {
+                // 创建 poolSize 个堆外内存
+                ByteBuffer byteBuffer = ByteBuffer.allocateDirect(fileSize);
+                final long address = ((DirectBuffer) byteBuffer).address();
+                Pointer pointer = new Pointer(address);
+
+                // 并利用 com.sun.jna.Library 类库将该批内存锁定，避免被置换到交换区，提高存储性能
+                LibC.INSTANCE.mlock(pointer, new NativeLong(fileSize));
+    
+                availableBuffers.offer(byteBuffer);
+            }
+        }
+
+        public void returnBuffer(ByteBuffer byteBuffer) {
+            byteBuffer.position(0);
+            byteBuffer.limit(fileSize);
+            this.availableBuffers.offerFirst(byteBuffer);
+        }
+    
+        public ByteBuffer borrowBuffer() {
+            ByteBuffer buffer = availableBuffers.pollFirst();
+            if (availableBuffers.size() < poolSize * 0.4) {
+                log.warn("TransientStorePool only remain {} sheets.", availableBuffers.size());
+            }
+            return buffer;
         }
 
     }
