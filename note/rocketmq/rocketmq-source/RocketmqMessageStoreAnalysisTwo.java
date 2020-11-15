@@ -1,7 +1,4 @@
 public class RocketmqMessageStoreAnalysisTwo{
-
-    public class ConsumeQueue{
-
         /**
          * ConsumeQueue 文件
          * 
@@ -47,11 +44,47 @@ public class RocketmqMessageStoreAnalysisTwo{
          * indexMsgTimestamp: 索引文件刷盘时间点
          */
 
+        /**
+         * 消息消费队列文件 ConsumeQueue、消息属性索引文件 IndexFile 都是基于 CommitLog 文件构建的，当消息生产者提交的消息
+         * 存储在 CommitLog 文件中的时候，ConsumeQueue、IndexFile 需要及时更新，否则消息无法及时消费。根据消息属性查找消息也会
+         * 出现较大的延迟。RocketMQ 通过开启一个线程 ReputMessageService 来准实时转发 CommitLog 文件更新事件，相应的任务处理器
+         * 根据转发的消息及时更新 ConsumeQueue、IndexFile 文件。
+         */
+
+        /**
+         * 刷盘策略
+         * 
+         * rocketmq 的存储于读写是基于 JDK NIO 的内存映射机制（MappedByteBuffer）的，消息存储时首先将消息追加到内存，再根据配置的
+         * 刷盘策略在不同时间进行刷写磁盘。
+         * 
+         * i.如果是同步刷盘，消息追加到内存后，将同步调用 MappedByteBuffer 的 force 方法。
+         * ii.如果是异步刷盘，在消息追加到内存后立刻返回给消息发送端。rocketmq 使用一个单独的线程按照某一个设定频率执行刷盘操作。通过在 broker 配置文件中
+         * 配置 flushDiskType 来设定刷盘方式，可选值为 ASYNC_FLUSH（异步刷盘）、SYNC_FLUSH（同步刷盘），默认为异步刷盘。
+         * 
+         * rocketmq 的刷盘相关的有两个线程：
+         * 1.flushCommitLogService，这个线程负责真正将 mappedByteBuffer 和 fileChannel 中的数据写入到磁盘中。如果是同步刷盘的
+         * 话，被初始化为 GroupCommitService，如果是异步刷盘则被初始化为 FlushRealTimeService。
+         * 
+         * 2.commitLogService ，值得注意的是如果开启了 transientStorePoolEnable，那么就会开启 commitLogService 线程。如果 transientStorePoolEnable
+         * 为 true 的话，往 CommitLog 写入数据时，是先写入到堆外内存 writeBuffer 中，而不是写入到 mappedByteBuffer 中。
+         * 所以这个线程的主要作用就是将 writeBuffer 中的数据写入到 fileChannel 中，然后再由 flushCommitLogService 线程进行真正的刷盘操作。
+         * 
+         * CommitLog 文件的刷盘机制，ConsumeQueue 文件的刷盘策略和 CommitLog 类似， 值得注意的是索引文件的刷盘并不是采取
+         * 定时刷盘机制，而是每更新一次索引文件就将上一次的改动刷写到磁盘。
+         */
+
+        /**
+         * 由于 RocketMQ 操作 CommitLog、ConsumeQueue 文件是基于内存映射机制并在启动的时候会加载 CommitLog、ConsumeQueue 目录下的所有文件，
+         * 为了避免内存与磁盘的浪费，不可能将消息永久存储在消息服务器上，所以需要引人一种机制来删除己过期的文件。RocketMQ 顺序写 Commitlog 文件，
+         * ConsumeQueue 文件，所有写操作全部落在最后一个 CommitLog 文件， ConsumeQueue 文件上，之前的文件在下一个文件创建后将不会再被更新。
+         * RocketMQ 清除过期文件的方法是 ：如果非当前写文件在一定时间间隔内没有再次被更新，则认为是过期文件，可以被删除， RocketMQ 不会关注这个文件上的消息是
+         * 否全部被消费。默认每个文件的过期时间为 72 小时，通过在 Broker 配置文件中设置 fileReservedTime 来改变过期时间，单位为小时
+         */
         public class ConsumeQueue {
             // CQ_STORE_UNIT_SIZE 表示在一个 ConsumeQueue 文件中，每个条目的大小固定为 20 字节
             public static final int CQ_STORE_UNIT_SIZE = 20;
             // 一个 ConsumeQueue 文件的大小
-            private final int mappedFileSize;
+            private final int mappedFileSize = 0;
 
             // 根据 startIndex 来获取消息消费队列的条目
             public SelectMappedBufferResult getIndexBuffer(final long startIndex) {
@@ -69,6 +102,51 @@ public class RocketmqMessageStoreAnalysisTwo{
                     }
                 }
                 return null;
+            }
+
+            private boolean putMessagePositionInfo(final long offset, final int size, final long tagsCode, final long cqOffset) {
+
+                if (offset <= this.maxPhysicOffset) {
+                    return true;
+                }
+    
+                // 依次将消息偏移量，消息长度，tag hashcode 写入到 ByteBuffer 中
+                this.byteBufferIndex.flip();
+                this.byteBufferIndex.limit(CQ_STORE_UNIT_SIZE);
+                this.byteBufferIndex.putLong(offset);
+                this.byteBufferIndex.putInt(size);
+                this.byteBufferIndex.putLong(tagsCode);
+    
+                final long expectLogicOffset = cqOffset * CQ_STORE_UNIT_SIZE;
+    
+                MappedFile mappedFile = this.mappedFileQueue.getLastMappedFile(expectLogicOffset);
+                if (mappedFile != null) {
+    
+                    if (mappedFile.isFirstCreateInQueue() && cqOffset != 0 && mappedFile.getWrotePosition() == 0) {
+                        this.minLogicOffset = expectLogicOffset;
+                        this.mappedFileQueue.setFlushedWhere(expectLogicOffset);
+                        this.mappedFileQueue.setCommittedWhere(expectLogicOffset);
+                        this.fillPreBlank(mappedFile, expectLogicOffset);
+                        log.info();
+                    }
+    
+                    if (cqOffset != 0) {
+                        long currentLogicOffset = mappedFile.getWrotePosition() + mappedFile.getFileFromOffset();
+    
+                        if (expectLogicOffset < currentLogicOffset) {
+                            log.warn();
+                            return true;
+                        }
+    
+                        if (expectLogicOffset != currentLogicOffset) {
+                            LOG_ERROR.warn();
+                        }
+                    }
+                    this.maxPhysicOffset = offset;
+                    // 将消息的内容追加到 ConsumeQueue 的内存映射文件中，但是并不刷盘，ConsumeQueue 的刷盘方式是固定为异步刷盘
+                    return mappedFile.appendMessage(this.byteBufferIndex.array());
+                }
+                return false;
             }
         }
 
@@ -296,6 +374,58 @@ public class RocketmqMessageStoreAnalysisTwo{
 
                     this.mappedFile.release();
                 }
+            }
+        }
+
+    public class IndexService{
+
+        public void buildIndex(DispatchRequest req) {
+            IndexFile indexFile = retryGetAndCreateIndexFile();
+            if (indexFile != null) {
+                // 获取或创建 IndexFile 文件并获取所有文件最大的物理偏移量。如果该消息的物理偏移量小于索引文件中的物理偏移，则说明是重复数据，忽略本次索引构建
+                long endPhyOffset = indexFile.getEndPhyOffset();
+                DispatchRequest msg = req;
+                String topic = msg.getTopic();
+                String keys = msg.getKeys();
+                if (msg.getCommitLogOffset() < endPhyOffset) {
+                    return;
+                }
+    
+                final int tranType = MessageSysFlag.getTransactionValue(msg.getSysFlag());
+                switch (tranType) {
+                    case MessageSysFlag.TRANSACTION_NOT_TYPE:
+                    case MessageSysFlag.TRANSACTION_PREPARED_TYPE:
+                    case MessageSysFlag.TRANSACTION_COMMIT_TYPE:
+                        break;
+                    case MessageSysFlag.TRANSACTION_ROLLBACK_TYPE:
+                        return;
+                }
+    
+                // 如果消息的唯一键不为空，则添加到 Hash 索引中，以便加速根据唯一键检索消息
+                if (req.getUniqKey() != null) {
+                    indexFile = putKey(indexFile, msg, buildKey(topic, req.getUniqKey()));
+                    if (indexFile == null) {
+                        log.error("putKey error commitlog {} uniqkey {}", req.getCommitLogOffset(), req.getUniqKey());
+                        return;
+                    }
+                }
+    
+                // 构建索引键，RocketMQ 支持为同一个消息建立多个索引，多个索引键空格分开。
+                if (keys != null && keys.length() > 0) {
+                    String[] keyset = keys.split(MessageConst.KEY_SEPARATOR);
+                    for (int i = 0; i < keyset.length; i++) {
+                        String key = keyset[i];
+                        if (key.length() > 0) {
+                            indexFile = putKey(indexFile, msg, buildKey(topic, key));
+                            if (indexFile == null) {
+                                log.error("putKey error commitlog {} uniqkey {}", req.getCommitLogOffset(), req.getUniqKey());
+                                return;
+                            }
+                        }
+                    }
+                }
+            } else {
+                log.error("build index error, stop building index");
             }
         }
 

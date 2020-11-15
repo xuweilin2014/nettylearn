@@ -29,6 +29,48 @@ public class RocketmqMessageStoreAnalysis{
         private final CleanConsumeQueueService cleanConsumeQueueService;
         // 索引文件实现类
         private final IndexService indexService;
+
+        public DefaultMessageStore(final MessageStoreConfig messageStoreConfig,
+                final BrokerStatsManager brokerStatsManager, final MessageArrivingListener messageArrivingListener,
+                final BrokerConfig brokerConfig) throws IOException {
+
+            this.messageArrivingListener = messageArrivingListener;
+            this.brokerConfig = brokerConfig;
+            this.messageStoreConfig = messageStoreConfig;
+            this.brokerStatsManager = brokerStatsManager;
+            this.allocateMappedFileService = new AllocateMappedFileService(this);
+            this.commitLog = new CommitLog(this);
+            this.consumeQueueTable = new ConcurrentHashMap<>(32);
+
+            this.flushConsumeQueueService = new FlushConsumeQueueService();
+            this.cleanCommitLogService = new CleanCommitLogService();
+            this.cleanConsumeQueueService = new CleanConsumeQueueService();
+            this.storeStatsService = new StoreStatsService();
+            this.indexService = new IndexService(this);
+            this.haService = new HAService(this);
+
+            this.reputMessageService = new ReputMessageService();
+
+            this.scheduleMessageService = new ScheduleMessageService(this);
+
+            this.transientStorePool = new TransientStorePool(messageStoreConfig);
+
+            if (messageStoreConfig.isTransientStorePoolEnable()) {
+                this.transientStorePool.init();
+            }
+
+            this.allocateMappedFileService.start();
+
+            this.indexService.start();
+
+            this.dispatcherList = new LinkedList<>();
+            this.dispatcherList.addLast(new CommitLogDispatcherBuildConsumeQueue());
+            this.dispatcherList.addLast(new CommitLogDispatcherBuildIndex());
+
+            File file = new File(StorePathConfigHelper.getLockFile(messageStoreConfig.getStorePathRootDir()));
+            MappedFile.ensureDirOK(file.getParent());
+            lockFile = new RandomAccessFile(file, "rw");
+        }
         
         public PutMessageResult putMessage(MessageExtBrokerInner msg) {
             // 判断当前 Broker 是否能够进行消息写入
@@ -58,12 +100,428 @@ public class RocketmqMessageStoreAnalysis{
             return result;
         }
 
+        public void start() throws Exception {
+
+            lock = lockFile.getChannel().tryLock(0, 1, false);
+            if (lock == null || lock.isShared() || !lock.isValid()) {
+                throw new RuntimeException("Lock failed,MQ already started");
+            }
+    
+            lockFile.getChannel().write(ByteBuffer.wrap("lock".getBytes()));
+            lockFile.getChannel().force(true);
+    
+            this.flushConsumeQueueService.start();
+            this.commitLog.start();
+            this.storeStatsService.start();
+    
+            if (this.scheduleMessageService != null && SLAVE != messageStoreConfig.getBrokerRole()) {
+                this.scheduleMessageService.start();
+            }
+    
+            // Broker 服务器在启动的时候会启动 ReputMessageService 线程，并且初始化一个非常关键的参数 reputFromOffset，
+            // 该参数的含义是 ReputMessageService 线程从哪个偏移量开始转发消息给 ConsumeQueue 和 IndexFile。如果允许重复转发，
+            // reputFromOffset 设置为 CommitLog 的提交指针。如果不允许重复转发，reputFromOffset 设置为 CommitLog 的内存中的最大偏移量
+            if (this.getMessageStoreConfig().isDuplicationEnable()) {
+                this.reputMessageService.setReputFromOffset(this.commitLog.getConfirmOffset());
+            } else {
+                this.reputMessageService.setReputFromOffset(this.commitLog.getMaxOffset());
+            }
+            this.reputMessageService.start();
+    
+            this.haService.start();
+    
+            this.createTempFile();
+            this.addScheduleTask();
+            this.shutdown = false;
+        }
+
+        public void doDispatch(DispatchRequest req) {
+            // CommitLogDispatcherBuildIndex 和 CommitLogDispatcherBuildConsumeQueue 这两个类对象在 DefaultMessageStore 的构造方法中被添加到
+            // dispatcherList 中去，在这里会被依次调用，将从 CommitLog 中读取到的消息添加到 ConsumeQueue 和 IndexFile 中去。
+            for (CommitLogDispatcher dispatcher : this.dispatcherList) {
+                dispatcher.dispatch(req);
+            }
+        }
+
+        public void putMessagePositionInfo(DispatchRequest dispatchRequest) {
+            // 根据消息主题 topic 和消息队列 id 从 consumeQueueTable 中获取到对应的 ConsumeQueue 
+            ConsumeQueue cq = this.findConsumeQueue(dispatchRequest.getTopic(), dispatchRequest.getQueueId());
+            cq.putMessagePositionInfoWrapper(dispatchRequest);
+        }
+
+        private void addScheduleTask() {
+            // rocketmq 会每隔 10s 调度一次 cleanFilesPeriodically 方法，检测是否需要清除过期文件，执行的
+            // 频率可以通过设置 cleanResourceInterval，默认为 10s
+            this.scheduledExecutorService.scheduleAtFixedRate(new Runnable() {
+                @Override
+                public void run() {
+                    DefaultMessageStore.this.cleanFilesPeriodically();
+                }
+            }, 1000 * 60, this.messageStoreConfig.getCleanResourceInterval(), TimeUnit.MILLISECONDS);
+
+            // ignore code
+        }
+
+        // 分别执行清除消息存储文件（CommitLog 文件）与消息消费队列文件（ConsumeQueue 文件）
+        private void cleanFilesPeriodically() {
+            this.cleanCommitLogService.run();
+            this.cleanConsumeQueueService.run();
+        }
+        
+
+    }
+
+    class CleanCommitLogService {
+
+        public void run() {
+            try {
+                this.deleteExpiredFiles();
+                this.redeleteHangedFile();
+            } catch (Throwable e) {
+                DefaultMessageStore.log.warn(this.getServiceName() + " service has exception. ", e);
+            }
+        }
+
+        private void deleteExpiredFiles() {
+            int deleteCount = 0;
+            // 文件保留时间，也就是从最后一次更新到现在的时间，如果超过了该时间，就说明是过期文件，可以被删除。
+            long fileReservedTime = DefaultMessageStore.this.getMessageStoreConfig().getFileReservedTime();
+            // 删除物理文件的时间间隔，因为在一次清除过程中，可能需要被删除的文件不止一个，该值指定了两次删除文件之间的时间间隔
+            int deletePhysicFilesInterval = DefaultMessageStore.this.getMessageStoreConfig().getDeleteCommitLogFilesInterval();
+            int destroyMapedFileIntervalForcibly = DefaultMessageStore.this.getMessageStoreConfig().getDestroyMapedFileIntervalForcibly();
+
+            // 指定删除文件的时间点， RocketMQ 通过 deleteWhen 设置一天的固定时间执行一次删除过期文件操作，默认为凌晨 4 点
+            boolean timeup = this.isTimeToDelete();
+            // 磁盘空间是否充足，如果磁盘空间不充足，则返回 true，表示应该触发过期文件删除机制，
+            boolean spacefull = this.isSpaceToDelete();
+            // 预留，手工触发，可以通过调用 excuteDeleteFilesManualy 方法手工触发过期文件删除，目前 RocketMQ 暂未封装手工触发文件删除的命令
+            boolean manualDelete = this.manualDeleteFileSeveralTimes > 0;
+
+            if (timeup || spacefull || manualDelete) {
+
+                if (manualDelete)
+                    this.manualDeleteFileSeveralTimes--;
+
+                boolean cleanAtOnce = DefaultMessageStore.this.getMessageStoreConfig().isCleanFileForciblyEnable() && this.cleanImmediately;
+
+                log.info("begin to delete before {} hours file. timeup: {} spacefull: {} manualDeleteFileSeveralTimes: {} cleanAtOnce: {}",
+                    fileReservedTime,
+                    timeup,
+                    spacefull,
+                    manualDeleteFileSeveralTimes,
+                    cleanAtOnce);
+
+                fileReservedTime *= 60 * 60 * 1000;
+
+                deleteCount = DefaultMessageStore.this.commitLog.deleteExpiredFile(fileReservedTime, deletePhysicFilesInterval,
+                    destroyMapedFileIntervalForcibly, cleanAtOnce);
+                if (deleteCount > 0) {
+                } else if (spacefull) {
+                    log.warn("disk space will be full soon, but delete file failed.");
+                }
+            }
+        }
+
+    }
+
+    class CommitRealTimeService extends FlushCommitLogService {
+
+        private long lastCommitTimestamp = 0;
+
+        @Override
+        public String getServiceName() {
+            return CommitRealTimeService.class.getSimpleName();
+        }
+
+        @Override
+        public void run() {
+            CommitLog.log.info(this.getServiceName() + " service started");
+            while (!this.isStopped()) {
+                // CommitRealTimeService 线程间隔时间，默认 200ms
+                int interval = CommitLog.this.defaultMessageStore.getMessageStoreConfig().getCommitIntervalCommitLog();
+                // commitDataLeastPages 一次提交任务至少包含页数， 如果待提交数据不足，小于该参数配置的值，将忽略本次提交任务，默认为 4 页
+                int commitDataLeastPages = CommitLog.this.defaultMessageStore.getMessageStoreConfig().getCommitCommitLogLeastPages();
+                // commitDataThoroughInterval 两次真实提交的最大间隔，默认为 200ms
+                int commitDataThoroughInterval = CommitLog.this.defaultMessageStore.getMessageStoreConfig().getCommitCommitLogThoroughInterval();
+
+                // 如果距上次提交间隔超过 commitDataThoroughInterval，则本次提交忽略 commitDataLeastPages 参数，也就是如果待提交数据小于指定页数，
+                // 也执行提交操作
+                long begin = System.currentTimeMillis();
+                if (begin >= (this.lastCommitTimestamp + commitDataThoroughInterval)) {
+                    this.lastCommitTimestamp = begin;
+                    commitDataLeastPages = 0;
+                }
+
+                try {
+                    boolean result = CommitLog.this.mappedFileQueue.commit(commitDataLeastPages);
+                    long end = System.currentTimeMillis();
+                    if (!result) {
+                        this.lastCommitTimestamp = end; // result = false means some data committed.
+                        // commit 操作执行完成后，CommitRealTimeService 唤醒 flushCommitLogService 线程执行 flush 操作
+                        flushCommitLogService.wakeup();
+                    }
+
+                    if (end - begin > 500) {
+                        log.info("Commit data to file costs {} ms", end - begin);
+                    }
+                    this.waitForRunning(interval);
+                } catch (Throwable e) {
+                    CommitLog.log.error(this.getServiceName() + " service has exception. ", e);
+                }
+            }
+
+            boolean result = false;
+            for (int i = 0; i < RETRY_TIMES_OVER && !result; i++) {
+                result = CommitLog.this.mappedFileQueue.commit(0);
+                CommitLog.log.info(this.getServiceName() + " service shutdown, retry " + (i + 1) + " times " + (result ? "OK" : "Not OK"));
+            }
+            CommitLog.log.info(this.getServiceName() + " service end");
+        }
+    }
+
+    class FlushRealTimeService extends FlushCommitLogService {
+        private long lastFlushTimestamp = 0;
+        private long printTimes = 0;
+
+        public void run() {
+            CommitLog.log.info(this.getServiceName() + " service started");
+
+            while (!this.isStopped()) {
+                // 默认为 false，表示 await 方法等待，如果为 true，表示使用 sleep 进行等待
+                boolean flushCommitLogTimed = CommitLog.this.defaultMessageStore.getMessageStoreConfig().isFlushCommitLogTimed();
+                // FlushRealTimeService 线程任务运行时间间隔
+                int interval = CommitLog.this.defaultMessageStore.getMessageStoreConfig().getFlushIntervalCommitLog();
+                // 一次刷写任务至少包含的页数，如果待刷写的数据不足，小于该参数配置的值，将忽略本次刷写任务，默认为 4 页
+                int flushPhysicQueueLeastPages = CommitLog.this.defaultMessageStore.getMessageStoreConfig().getFlushCommitLogLeastPages();
+                // 两次真实刷写任务最大间隔，默认为 10s
+                int flushPhysicQueueThoroughInterval = CommitLog.this.defaultMessageStore.getMessageStoreConfig().getFlushCommitLogThoroughInterval();
+
+                boolean printFlushProgress = false;
+
+                // Print flush progress
+                long currentTimeMillis = System.currentTimeMillis();
+                // 如果距上次提交间隔超过 flushPhysicQueueThoroughinterval，则本次刷盘任务将忽略 flushPhysicQueueLeastPages。
+                // 也就是如果待刷写数据小于指定页数也执行刷写磁盘操作
+                if (currentTimeMillis >= (this.lastFlushTimestamp + flushPhysicQueueThoroughInterval)) {
+                    this.lastFlushTimestamp = currentTimeMillis;
+                    flushPhysicQueueLeastPages = 0;
+                    printFlushProgress = (printTimes++ % 10) == 0;
+                }
+
+                try {
+                    // 执行一次刷盘任务前先等待指定的时间间隔，然后再执行刷盘任务
+                    if (flushCommitLogTimed) {
+                        Thread.sleep(interval);
+                    } else {
+                        this.waitForRunning(interval);
+                    }
+
+                    if (printFlushProgress) {
+                        this.printFlushProgress();
+                    }
+
+                    long begin = System.currentTimeMillis();
+                    CommitLog.this.mappedFileQueue.flush(flushPhysicQueueLeastPages);
+                    long storeTimestamp = CommitLog.this.mappedFileQueue.getStoreTimestamp();
+                    if (storeTimestamp > 0) {
+                        CommitLog.this.defaultMessageStore.getStoreCheckpoint().setPhysicMsgTimestamp(storeTimestamp);
+                    }
+                    long past = System.currentTimeMillis() - begin;
+                    if (past > 500) {
+                        log.info("Flush data to disk costs {} ms", past);
+                    }
+                } catch (Throwable e) {
+                    CommitLog.log.warn(this.getServiceName() + " service has exception. ", e);
+                    this.printFlushProgress();
+                }
+            }
+
+            // Normal shutdown, to ensure that all the flush before exit
+            boolean result = false;
+            for (int i = 0; i < RETRY_TIMES_OVER && !result; i++) {
+                result = CommitLog.this.mappedFileQueue.flush(0);
+                CommitLog.log.info(this.getServiceName() + " service shutdown, retry " + (i + 1) + " times " + (result ? "OK" : "Not OK"));
+            }
+
+            this.printFlushProgress();
+
+            CommitLog.log.info(this.getServiceName() + " service end");
+        }
+    }
+
+
+    class ReputMessageService extends ServiceThread {
+
+        private volatile long reputFromOffset = 0;
+
+        public long getReputFromOffset() {
+            return reputFromOffset;
+        }
+
+        public void setReputFromOffset(long reputFromOffset) {
+            this.reputFromOffset = reputFromOffset;
+        }
+
+        private void doReput() {
+            for (boolean doNext = true; this.isCommitLogAvailable() && doNext; ) {
+
+                if (DefaultMessageStore.this.getMessageStoreConfig().isDuplicationEnable()
+                    && this.reputFromOffset >= DefaultMessageStore.this.getConfirmOffset()) {
+                    break;
+                }
+
+                // 返回 reputFromOffset 偏移量开始的全部有效数据(CommitLog 文件)，然后循环读取每一条消息
+                SelectMappedBufferResult result = DefaultMessageStore.this.commitLog.getData(reputFromOffset);
+                if (result != null) {
+                    try {
+                        this.reputFromOffset = result.getStartOffset();
+
+                        for (int readSize = 0; readSize < result.getSize() && doNext; ) {
+                            // 从 result 中返回的 ByteBuffer 中循环读取消息，一次读取一条，并且创建 DispatchResult 对象
+                            DispatchRequest dispatchRequest = DefaultMessageStore.this.commitLog.checkMessageAndReturnSize(result.getByteBuffer(), false, false);
+                            int size = dispatchRequest.getMsgSize();
+
+                            if (dispatchRequest.isSuccess()) {
+                                // 如果消息的长度大于 0，则调用 doDisptach 方法，最终会分别调用 CommitLogDispatcherBuildConsumeQueue（构建消息消费队列文件）
+                                // 和 CommitLogDispatcherBuildIndex（构建消息索引文件）
+                                if (size > 0) {
+                                    DefaultMessageStore.this.doDispatch(dispatchRequest);
+
+                                    if (BrokerRole.SLAVE != DefaultMessageStore.this.getMessageStoreConfig().getBrokerRole()
+                                        && DefaultMessageStore.this.brokerConfig.isLongPollingEnable()) {
+                                        DefaultMessageStore.this.messageArrivingListener.arriving(dispatchRequest.getTopic(),
+                                            dispatchRequest.getQueueId(), dispatchRequest.getConsumeQueueOffset() + 1,
+                                            dispatchRequest.getTagsCode(), dispatchRequest.getStoreTimestamp(),
+                                            dispatchRequest.getBitMap(), dispatchRequest.getPropertiesMap());
+                                    }
+
+                                    this.reputFromOffset += size;
+                                    readSize += size;
+                                    if (DefaultMessageStore.this.getMessageStoreConfig().getBrokerRole() == BrokerRole.SLAVE) {
+                                        DefaultMessageStore.this.storeStatsService
+                                            .getSinglePutMessageTopicTimesTotal(dispatchRequest.getTopic()).incrementAndGet();
+                                        DefaultMessageStore.this.storeStatsService
+                                            .getSinglePutMessageTopicSizeTotal(dispatchRequest.getTopic())
+                                            .addAndGet(dispatchRequest.getMsgSize());
+                                    }
+                                } else if (size == 0) {
+                                    this.reputFromOffset = DefaultMessageStore.this.commitLog.rollNextFile(this.reputFromOffset);
+                                    readSize = result.getSize();
+                                }
+                            } else if (!dispatchRequest.isSuccess()) {
+
+                                if (size > 0) {
+                                    log.error("[BUG]read total count not equals msg total size. reputFromOffset={}", reputFromOffset);
+                                    this.reputFromOffset += size;
+                                } else {
+                                    doNext = false;
+                                    if (DefaultMessageStore.this.brokerConfig.getBrokerId() == MixAll.MASTER_ID) {
+                                        log.error("[BUG]the master dispatch message to consume queue error, COMMITLOG OFFSET: {}",
+                                            this.reputFromOffset);
+
+                                        this.reputFromOffset += result.getSize() - readSize;
+                                    }
+                                }
+                            }
+                        }
+                    } finally {
+                        result.release();
+                    }
+                } else {
+                    doNext = false;
+                }
+            }
+        }
+
+        @Override
+        public void run() {
+            DefaultMessageStore.log.info(this.getServiceName() + " service started");
+
+            while (!this.isStopped()) {
+                try {
+                    // ReputMessageService 线程每执行一次任务推送就休息 1 毫秒就继续尝试推送消息到消息消费队列 ConsumeQueue 文件
+                    // 和索引文件 IndexFile，消息消费转发的核心实现在 doReput 方法中实现
+                    Thread.sleep(1);
+                    this.doReput();
+                } catch (Exception e) {
+                    DefaultMessageStore.log.warn(this.getServiceName() + " service has exception. ", e);
+                }
+            }
+
+            DefaultMessageStore.log.info(this.getServiceName() + " service end");
+        }
+
+        @Override
+        public String getServiceName() {
+            return ReputMessageService.class.getSimpleName();
+        }
+
+    }
+
+    class CommitLogDispatcherBuildConsumeQueue implements CommitLogDispatcher {
+
+        @Override
+        public void dispatch(DispatchRequest request) {
+            final int tranType = MessageSysFlag.getTransactionValue(request.getSysFlag());
+            switch (tranType) {
+                case MessageSysFlag.TRANSACTION_NOT_TYPE:
+                case MessageSysFlag.TRANSACTION_COMMIT_TYPE:
+                    // 将消息保存到消息队列 ConsumeQueue 中
+                    DefaultMessageStore.this.putMessagePositionInfo(request);
+                    break;
+                case MessageSysFlag.TRANSACTION_PREPARED_TYPE:
+                case MessageSysFlag.TRANSACTION_ROLLBACK_TYPE:
+                    break;
+            }
+        }
+    }
+
+    class CommitLogDispatcherBuildIndex implements CommitLogDispatcher {
+        @Override
+        public void dispatch(DispatchRequest request) {
+            if (DefaultMessageStore.this.messageStoreConfig.isMessageIndexEnable()) {
+                // 根据消息，更新消息索引文件
+                DefaultMessageStore.this.indexService.buildIndex(request);
+            }
+        }
     }
 
     public static class CommitLog {
         
         // topic-queueId -> offset
         private HashMap<String, Long> topicQueueTable = new HashMap<String, Long>(1024);
+
+        public CommitLog(final DefaultMessageStore defaultMessageStore) {
+            this.mappedFileQueue = new MappedFileQueue(defaultMessageStore.getMessageStoreConfig().getStorePathCommitLog(),
+                defaultMessageStore.getMessageStoreConfig().getMapedFileSizeCommitLog(), defaultMessageStore.getAllocateMappedFileService());
+            this.defaultMessageStore = defaultMessageStore;
+    
+            // 如果是同步刷盘策略，那么 flushCommitLogService 就初始化为 GroupCommitService
+            if (FlushDiskType.SYNC_FLUSH == defaultMessageStore.getMessageStoreConfig().getFlushDiskType()) {
+                this.flushCommitLogService = new GroupCommitService();
+            // 如果是异步刷盘策略，flushCommitLogService 初始化为 FlushRealTimeService
+            } else {
+                this.flushCommitLogService = new FlushRealTimeService();
+            }
+    
+            this.commitLogService = new CommitRealTimeService();
+    
+            this.appendMessageCallback = new DefaultAppendMessageCallback(defaultMessageStore.getMessageStoreConfig().getMaxMessageSize());
+            batchEncoderThreadLocal = new ThreadLocal<MessageExtBatchEncoder>() {
+                @Override
+                protected MessageExtBatchEncoder initialValue() {
+                    return new MessageExtBatchEncoder(defaultMessageStore.getMessageStoreConfig().getMaxMessageSize());
+                }
+            };
+            this.putMessageLock = defaultMessageStore.getMessageStoreConfig().isUseReentrantLockWhenPutMessage() ? new PutMessageReentrantLock() : new PutMessageSpinLock();
+        }
+
+        public void start() {
+            this.flushCommitLogService.start();
+            if (defaultMessageStore.getMessageStoreConfig().isTransientStorePoolEnable()) {
+                this.commitLogService.start();
+            }
+        }
 
         class DefaultAppendMessageCallback implements AppendMessageCallback {
 
@@ -279,9 +737,10 @@ public class RocketmqMessageStoreAnalysis{
                 // 设置消息的存储时间
                 msg.setStoreTimestamp(beginLockTimestamp);
 
-                // 如果 mappedFile 为空，表明 ${ROCKET_HOME}/store/commitlog 目录下不存在任何文件
-                // 也就是说明本次消息是第一次消息发送，用偏移量 0 创建第一个 commitlog 文件，文件名为 0000 0000 0000 0000 0000，
+                // 1.如果 mappedFile 为空，说明本次消息是第一次消息发送，用偏移量 0 创建第一个 commitlog 文件，文件名为 0000 0000 0000 0000 0000，
                 // 如果创建文件失败，抛出 CREATE_MAPEDFILE_FAILED 异常，可能是权限不够或者磁盘空间不足
+                // 2.如果 mappedFile 已经满了的话，创建一个新的 mappedFile，这个新 mappedFile 的 createOffset 也就是初始偏移量是 
+                // mappedFileLast.getFileFromOffset() + this.mappedFileSize
                 if (null == mappedFile || mappedFile.isFull()) {
                     mappedFile = this.mappedFileQueue.getLastMappedFile(0); // Mark: NewFile may be cause noise
                 }
@@ -299,7 +758,7 @@ public class RocketmqMessageStoreAnalysis{
                 case END_OF_FILE:
                     unlockMappedFile = mappedFile;
                     // Create a new file, re-write the message
-                    // 上一个 commitlog 已经满了，所以会去创建一个新的 commitlog
+                    // 上一个 MappedFile 已经满了，创建一个新的 MappedFile，并且将消息重新 append 到新的 MappedFile
                     mappedFile = this.mappedFileQueue.getLastMappedFile(0);
                     if (null == mappedFile) {
                         log.error("create mapped file2 error, topic: " + msg.getTopic() + " clientAddr: " + msg.getBornHostString());
@@ -350,6 +809,41 @@ public class RocketmqMessageStoreAnalysis{
             return putMessageResult;
         }
 
+        // 同步刷盘和异步刷盘
+        public void handleDiskFlush(AppendMessageResult result, PutMessageResult putMessageResult, MessageExt messageExt) {
+            // Synchronization flush
+            // 同步刷盘，是指在消息追加到内存映射文件的内存之后，立即将数据刷写到磁盘
+            // 同步刷盘的实现方式类似于 MappedFile 创建，即构造刷盘请求 GroupCommitRequest 写入请求队列，由异步线程 GroupCommitService 消费请求
+            if (FlushDiskType.SYNC_FLUSH == this.defaultMessageStore.getMessageStoreConfig().getFlushDiskType()) {
+                final GroupCommitService service = (GroupCommitService) this.flushCommitLogService;
+                if (messageExt.isWaitStoreMsgOK()) {
+                    // 1.构建 GroupCommitRequest 同步任务并提交到 GroupCommitService
+                    GroupCommitRequest request = new GroupCommitRequest(result.getWroteOffset() + result.getWroteBytes());
+                    service.putRequest(request);
+                    // 2.waitForFlush 会阻塞直到刷盘任务完成，如果超时则返回刷盘错误， 刷盘成功后正常返回给调用方
+                    boolean flushOK = request.waitForFlush(this.defaultMessageStore.getMessageStoreConfig().getSyncFlushTimeout());
+                    if (!flushOK) {
+                        log.error("do groupcommit, wait for flush failed, topic: " + messageExt.getTopic() + " tags: " + messageExt.getTags()
+                            + " client address: " + messageExt.getBornHostString());
+                        putMessageResult.setPutMessageStatus(PutMessageStatus.FLUSH_DISK_TIMEOUT);
+                    }
+                } else {
+                    service.wakeup();
+                }
+            }
+            // Asynchronous flush
+            // 异步刷盘
+            else {
+                if (!this.defaultMessageStore.getMessageStoreConfig().isTransientStorePoolEnable()) {
+                    flushCommitLogService.wakeup();
+                // 如果 isTransientStorePoolEnable 为 true，唤醒 CommitRealTimeService 线程将 writeBuffer 中的数据 commit 至 fileChannel
+                // 虽然这里没有唤醒 flushCommitLogService，但是在 commitLogService 线程中，将 writeBuffer 中的数据提交后会自行唤醒 flushCommitLogService
+                } else {
+                    commitLogService.wakeup();
+                }
+            }
+        }
+
         // 获取当前 commitlog 目录的最小偏移量，首先获取目录下的第一个文件，如果该文件可用，那么返回该文件的起始偏移量，
         // 否则返回下一个文件的起始偏移量
         public long getMinOffset() {
@@ -378,6 +872,126 @@ public class RocketmqMessageStoreAnalysis{
             return null;
         }
 
+    }
+
+    public static class GroupCommitRequest {
+        // 刷盘点偏移量
+        private final long nextOffset;
+        private final CountDownLatch countDownLatch = new CountDownLatch(1);
+        // 刷盘结果，初始状态为 false
+        private volatile boolean flushOK = false;
+
+        // GroupCommitService 线程处理 GroupCommitRequest 对象后将调用 wakeupCustomer 法将消费发送线程唤醒，并将刷盘的结果告知 GroupCommitRequest
+        // 也就是将 flushOK 的结果保存到 GroupCommitRequest 中去
+        public void wakeupCustomer(final boolean flushOK) {
+            this.flushOK = flushOK;
+            this.countDownLatch.countDown();
+        }
+
+        // 消费发送线程将消息追加到内存映射文件后，将同步任务 GroupCommitRequest 提交到 GroupCommitService 线程，然后调用阻塞等待刷盘结果，
+        // 超时时间默认 5s
+        public boolean waitForFlush(long timeout) {
+            try {
+                this.countDownLatch.await(timeout, TimeUnit.MILLISECONDS);
+                return this.flushOK;
+            } catch (InterruptedException e) {
+                log.error("Interrupted", e);
+                return false;
+            }
+        }
+    }
+
+    // 为了避免刷盘请求 GroupCommitRequest 的锁竞争，GroupCommitService 线程维护了 GroupCommitRequest 
+    // 读队列 requestsRead 和写队列 requestsWrite，GroupCommitRequest 的提交和消费互不阻塞。当 GroupCommitService 
+    // 线程消费完 requestsRead 队列后，清空 requestsRead，交换 requestsRead 和 requestsWrite
+    class GroupCommitService extends FlushCommitLogService {
+        // 同步刷盘任务暂存器
+        private volatile List<GroupCommitRequest> requestsWrite = new ArrayList<GroupCommitRequest>();
+        // GroupCommitService 线程每次处理的 request 容器，这是一个设计亮点，避免了任务提交与任务执行的锁冲突
+        // 在 putRequest 将创建的任务提交到 GroupCommitService 中时，是存入到 requestsWrite 列表中，但是在 doCommit 中
+        // 真正是从 requestsRead 列表中读取任务进行刷盘操作，这样就避免了刷盘任务提交与刷盘任务具体执行的冲突
+        private volatile List<GroupCommitRequest> requestsRead = new ArrayList<GroupCommitRequest>();
+
+        public synchronized void putRequest(final GroupCommitRequest request) {
+            synchronized (this.requestsWrite) {
+                this.requestsWrite.add(request);
+            }
+            if (hasNotified.compareAndSet(false, true)) {
+                // 如果线程处于等待状态，则将其唤醒
+                waitPoint.countDown(); // notify
+            }
+        }
+
+        // 由于避免同步刷盘消费任务与其他消息生产者提交任务直接的锁竞争，GroupCommitrvice 提供读容器与写容器，这两个容器每执行完一次任务后，
+        // 交互，继续消费
+        private void swapRequests() {
+            List<GroupCommitRequest> tmp = this.requestsWrite;
+            this.requestsWrite = this.requestsRead;
+            this.requestsRead = tmp;
+        }
+
+        private void doCommit() {
+            synchronized (this.requestsRead) {
+                if (!this.requestsRead.isEmpty()) {
+                    // 1.遍历同步刷盘任务列表，根据加入顺序逐一执行刷盘逻辑
+                    for (GroupCommitRequest req : this.requestsRead) {
+                        // There may be a message in the next file, so a maximum of two times the flush
+                        boolean flushOK = false;
+                        // 2.调用 mappedFileQueue#flush 方法执行刷盘操作，最终会调用 MappedByteBuffer#force 方法。
+                        // 如果已刷盘指针大于等于提交的刷盘点，表示刷盘成功，每执行一次刷盘操作后，立即调用 GroupCommitRequest#wakeupCustomer
+                        // 唤醒消息发送线程并通知刷盘结果
+                        for (int i = 0; i < 2 && !flushOK; i++) {
+                            flushOK = CommitLog.this.mappedFileQueue.getFlushedWhere() >= req.getNextOffset();
+                            if (!flushOK) {
+                                CommitLog.this.mappedFileQueue.flush(0);
+                            }
+                        }
+                        req.wakeupCustomer(flushOK);
+                    }
+
+                    long storeTimestamp = CommitLog.this.mappedFileQueue.getStoreTimestamp();
+                    // 3.处理完所有的同步刷盘任务之后，更新刷盘检测点 StoreCheckpoint 中的 physicMsgTimestamp，
+                    // 但并没有执行检测点的刷盘操作，刷盘检测点的刷盘操作将在写消息队列文件时触发
+                    if (storeTimestamp > 0) {
+                        CommitLog.this.defaultMessageStore.getStoreCheckpoint().setPhysicMsgTimestamp(storeTimestamp);
+                    }
+
+                    this.requestsRead.clear();
+                } else {
+                    // Because of individual messages is set to not sync flush, it will come to this process
+                    CommitLog.this.mappedFileQueue.flush(0);
+                }
+            }
+        }
+
+        public void run() {
+            CommitLog.log.info(this.getServiceName() + " service started");
+
+            // GroupCommitService 每处理一批同步刷盘请求（也就是 requestsRead 容器中的刷盘请求）后"休息" 0ms，然后继续处理下一批，
+            // 其任务的核心实现为 doCommit 方法
+            while (!this.isStopped()) {
+                try {
+                    this.waitForRunning(10);
+                    this.doCommit();
+                } catch (Exception e) {
+                    CommitLog.log.warn(this.getServiceName() + " service has exception. ", e);
+                }
+            }
+
+            try {
+                Thread.sleep(10);
+            } catch (InterruptedException e) {
+                CommitLog.log.warn("GroupCommitService Exception, ", e);
+            }
+
+            synchronized (this) {
+                this.swapRequests();
+            }
+
+            this.doCommit();
+
+            CommitLog.log.info(this.getServiceName() + " service end");
+        }
     }
 
     public class MappedFile extends ReferenceResource{
@@ -800,6 +1414,210 @@ public class RocketmqMessageStoreAnalysis{
             }
             return 0;
         }
+
+        public MappedFile getLastMappedFile(final long startOffset) {
+            return getLastMappedFile(startOffset, true);
+        }
+
+        public MappedFile getLastMappedFile(final long startOffset, boolean needCreate) {
+            long createOffset = -1;
+            MappedFile mappedFileLast = getLastMappedFile();
+    
+            // 1.mappedFileLast == null 则说明此时不存在任何 mappedFile 文件或者历史的 mappedFile 文件已经被清理了
+            // 此时的 createOffset 按照如下的方式进行计算
+            if (mappedFileLast == null) {
+                createOffset = startOffset - (startOffset % this.mappedFileSize);
+            }
+    
+            // 2.mappedFileLast != null && mappedFileLast.isFull() 说明最后一个 mappedFile 的空间已满，此时 createOffset
+            // 应该按照下面的方式进行计算，createOffset 也就是新的 mappedFile 的偏移量以及文件名（这两个是相等的）
+            if (mappedFileLast != null && mappedFileLast.isFull()) {
+                createOffset = mappedFileLast.getFileFromOffset() + this.mappedFileSize;
+            }
+    
+            if (createOffset != -1 && needCreate) {
+                String nextFilePath = this.storePath + File.separator + UtilAll.offset2FileName(createOffset);
+                String nextNextFilePath = this.storePath + File.separator + UtilAll.offset2FileName(createOffset + this.mappedFileSize);
+                MappedFile mappedFile = null;
+    
+                if (this.allocateMappedFileService != null) {
+                    // 基于 createOffset 构建两个连续的 AllocateRequest 并插入 AllocateMappedFileService 线程维护的 requestQueue
+                    // 这两个 AllocateRequest 也就是创建两个 mappedFile 文件，一个文件的初始偏移量为 createOffset，另外一个为 createOffset + mappedFileSize
+                    // AllocateMappedFileService 线程读取 requestQueue 中的 AllocateRequest 异步创建对应的 MappedFile。在创建过程中，
+                    // 消息处理线程通过 CountDownLatch 同步等待 MappedFile 完成创建
+                    mappedFile = this.allocateMappedFileService.putRequestAndReturnMappedFile(nextFilePath, nextNextFilePath, this.mappedFileSize);
+                } else {
+                    try {
+                        mappedFile = new MappedFile(nextFilePath, this.mappedFileSize);
+                    } catch (IOException e) {
+                        log.error("create mappedFile exception", e);
+                    }
+                }
+    
+                if (mappedFile != null) {
+                    if (this.mappedFiles.isEmpty()) {
+                        mappedFile.setFirstCreateInQueue(true);
+                    }
+                    this.mappedFiles.add(mappedFile);
+                }
+    
+                return mappedFile;
+            }
+    
+            return mappedFileLast;
+        }
+    }
+
+    public class AllocateMappedFileService extends ServiceThread {
+
+        public MappedFile putRequestAndReturnMappedFile(String nextFilePath, String nextNextFilePath, int fileSize) {
+            int canSubmitRequests = 2;
+            if (this.messageStore.getMessageStoreConfig().isTransientStorePoolEnable()) {
+                if (this.messageStore.getMessageStoreConfig().isFastFailIfNoBufferInStorePool()
+                        && BrokerRole.SLAVE != this.messageStore.getMessageStoreConfig().getBrokerRole()) { 
+                    canSubmitRequests = this.messageStore.getTransientStorePool().remainBufferNumbs()
+                            - this.requestQueue.size();
+                }
+            }
+
+            // 创建一个 AllocateRequest 请求，创建初始偏移量为 nextFilePath 的 mappedFile 
+            AllocateRequest nextReq = new AllocateRequest(nextFilePath, fileSize);
+            // 将创建的 AllocateRequest 放入到 requestTable 中
+            boolean nextPutOK = this.requestTable.putIfAbsent(nextFilePath, nextReq) == null;
+
+            if (nextPutOK) {
+                if (canSubmitRequests <= 0) {
+                    log.warn("[NOTIFYME]TransientStorePool is not enough, so create mapped file error, ");
+                    this.requestTable.remove(nextFilePath);
+                    return null;
+                }
+                // 将创建的 AllocateRequest 放入到 requestQueue 中
+                boolean offerOK = this.requestQueue.offer(nextReq);
+                if (!offerOK) {
+                    log.warn("never expected here, add a request to preallocate queue failed");
+                }
+                canSubmitRequests--;
+            }
+
+            // 创建一个 AllocateRequest 请求，创建初始偏移量为 nextNextFilePath（等于 nextFilePath + mappedFileSize） 的 mappedFile 
+            AllocateRequest nextNextReq = new AllocateRequest(nextNextFilePath, fileSize);
+            boolean nextNextPutOK = this.requestTable.putIfAbsent(nextNextFilePath, nextNextReq) == null;
+            if (nextNextPutOK) {
+                if (canSubmitRequests <= 0) {
+                    log.warn("[NOTIFYME]TransientStorePool is not enough, so skip preallocate mapped file, ";
+                    this.requestTable.remove(nextNextFilePath);
+                } else {
+                    boolean offerOK = this.requestQueue.offer(nextNextReq);
+                    if (!offerOK) {
+                        log.warn("never expected here, add a request to preallocate queue failed");
+                    }
+                }
+            }
+
+            if (hasException) {
+                log.warn(this.getServiceName() + " service has exception. so return null");
+                return null;
+            }
+
+            // 获取创建第一个 mappedFile 的请求
+            AllocateRequest result = this.requestTable.get(nextFilePath);
+            try {
+                if (result != null) {
+                    // 阻塞等待创建第一个 mappedFile 完成
+                    // AllocateMappedFileService 线程循环从 requestQueue 获取 AllocateRequest，AllocateRequest 实现了 Comparable 接口，
+                    // 依据文件名从小到大排序。当需要创建 MappedFile 时，同时构建两个 AllocateRequest，消息处理线程通过下面的 CountDownLatch 将 
+                    // AllocateMappedFileService 线程异步创建第一个 MappedFile 文件转化为同步操作，而第二个 MappedFile 文件的仍然创建交由 
+                    // AllocateMappedFileService 线程异步创建。当消息处理线程需要再次创建 MappedFile 时，此时可以直接获取已创建的 MappedFile。
+                    boolean waitOK = result.getCountDownLatch().await(waitTimeOut, TimeUnit.MILLISECONDS);
+                    if (!waitOK) {
+                        log.warn("create mmap timeout " + result.getFilePath() + " " + result.getFileSize());
+                        return null;
+                    } else {
+                        this.requestTable.remove(nextFilePath);
+                        // 返回创建好的第一个 mappedFile 对象
+                        return result.getMappedFile();
+                    }
+                } else {
+                    log.error("find preallocate mmap failed, this never happen");
+                }
+            } catch (InterruptedException e) {
+                log.warn(this.getServiceName() + " service has exception. ", e);
+            }
+
+            return null;
+        }
+
+        public void run() {
+            log.info(this.getServiceName() + " service started");
+            while (!this.isStopped() && this.mmapOperation()) {
+            }
+            log.info(this.getServiceName() + " service end");
+        }
+
+        private boolean mmapOperation() {
+            boolean isSuccess = false;
+            AllocateRequest req = null;
+            try {
+                req = this.requestQueue.take();
+                AllocateRequest expectedRequest = this.requestTable.get(req.getFilePath());
+                if (null == expectedRequest) {
+                    log.warn("this mmap request expired, maybe cause timeout");
+                    return true;
+                }
+                if (expectedRequest != req) {
+                    log.warn("never expected here,  maybe cause timeout");
+                    return true;
+                }
+    
+                if (req.getMappedFile() == null) {
+                    long beginTime = System.currentTimeMillis();
+    
+                    // 在下面开始正式进行 mappedFile 的创建工作
+                    // 如果 isTransientStorePoolEnable 为 true，MappedFile 会将 TransientStorePool 申请的堆外内存（Direct Byte Buffer）空间作为 
+                    // writeBuffer，写入消息时先将消息写入 writeBuffer，然后将消息提交至 fileChannel 再 flush；否则，直接创建 MappedFile 内存映射
+                    // 文件字节缓冲区 mappedByteBuffer，将消息写入 mappedByteBuffer 再 flush。完成消息写入后，更新 wrotePosition（此时还未 flush 至磁盘）
+                    MappedFile mappedFile;
+                    if (messageStore.getMessageStoreConfig().isTransientStorePoolEnable()) {
+                        try {
+                            mappedFile = ServiceLoader.load(MappedFile.class).iterator().next();
+                            mappedFile.init(req.getFilePath(), req.getFileSize(), messageStore.getTransientStorePool());
+                        } catch (RuntimeException e) {
+                            log.warn("Use default implementation.");
+                            mappedFile = new MappedFile(req.getFilePath(), req.getFileSize(), messageStore.getTransientStorePool());
+                        }
+                    } else {
+                        mappedFile = new MappedFile(req.getFilePath(), req.getFileSize());
+                    }
+    
+                    long eclipseTime = UtilAll.computeEclipseTimeMilliseconds(beginTime);
+                    if (eclipseTime > 10) {
+                        int queueSize = this.requestQueue.size();
+                        log.warn("create mappedFile spent time(ms)");
+                    }
+    
+                    // pre write mappedFile
+                    if (mappedFile.getFileSize() >= this.messageStore.getMessageStoreConfig()
+                        .getMapedFileSizeCommitLog() &&
+                        this.messageStore.getMessageStoreConfig().isWarmMapedFileEnable()) {
+                        mappedFile.warmMappedFile(this.messageStore.getMessageStoreConfig().getFlushDiskType(),
+                            this.messageStore.getMessageStoreConfig().getFlushLeastPagesWhenWarmMapedFile());
+                    }
+    
+                    req.setMappedFile(mappedFile);
+                    this.hasException = false;
+                    isSuccess = true;
+                }
+            } catch (InterruptedException e) {
+                // ignore code
+            } catch (IOException e) {
+                // ignore code
+            } finally {
+                if (req != null && isSuccess)
+                    req.getCountDownLatch().countDown();
+            }
+            return true;
+        }
+
     }
 
     /**
