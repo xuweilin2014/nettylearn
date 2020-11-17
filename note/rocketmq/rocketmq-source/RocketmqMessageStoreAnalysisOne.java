@@ -14,12 +14,41 @@ public class RocketmqMessageStoreAnalysis{
      * MappedFileQueue 是 MappedFile 的管理容器，MappedFileQueue 是对存储目录的封装，例如 CommitLog 文件的存储路径 ${ROCKET_HOME}/store/commitlog/，
      * 该目录下会存在多个内存映射文件（MappedFile）
      */
+
+    /**
+     * IndexFile 属性，IndexFile 主要分为 3 部分，也就是 IndexHeader，hash 槽，index 条目，因此其属性也主要和这三个部分有关：
+     * hashSlotNum：hash 槽的个数
+     * indexNum：index 条目的个数
+     * indexHeader：IndexHeader 对象
+     * 
+     * ConsumeQueue 属性：
+     * queueId：这个 ConsumeQueue 文件属于的消息队列的 id
+     * topic：这个 ConsumeQueue 文件属于的消息主题 topic
+     * mappedFileSize：这个 ConsumeQueue 文件的大小，30000 * 20 byte
+     * CQ_STORE_UNIT_SIZE：ConsumeQueue 文件中每一个条目的大小，20 byte
+     * 
+     * MappedFile 属性：
+     * OS_PAGE_SIZE：操作系统中一页的大小，也就是 4kb
+     * wrotePosition：消息已经写入的位置
+     * flushedPosition：消息已经刷盘的位置
+     * commitedPosition：已经提交的消息的位置，这里我们要注意分两种情况：当 transientPoolEnable 为 true 的话，消息的写入分为 3 个阶段，第一个阶段是
+     * 写入到 writeBuffer 中，然后在 CommitLog 类中开启的线程 CommitRealTimeService，会将 writeBuffer 中的数据写入到 fileChannel 中，然后再同步刷盘
+     * 或者异步刷盘的时候写入到磁盘里面。当 transientPoolEnable 为 false 的时候，消息写入只有两个阶段，一个是将消息写入到 mappedByteBuffer 中，
+     * 然后再进行刷盘。所以 committedPosition 只有在 transientPool 开启的时候才有用
+     * 
+     * MappedFileQueue 属性：
+     * flushedWhere：消息已经刷新到哪儿了
+     * committedWhere：消息已经提交到哪儿了
+     * allocateMappedFileService：用来真正的分配 MappedFile
+     * 
+     */
+
     public class DefaultMessageStore implements MessageStore {
         // 消息存储配置属性
         private final MessageStoreConfig messageStoreConfig;
         // CommitLog 文件的存储实现类
         private final CommitLog commitLog;
-        // 消息队列缓存，按照消息主题进行分组
+        // 消息队列缓存
         private final ConcurrentMap<String/* topic */, ConcurrentMap<Integer/* queueId */, ConsumeQueue>> consumeQueueTable;
         // 消息队列文件 ConsumeQueue 刷盘服务，或者叫线程
         private final FlushConsumeQueueService flushConsumeQueueService;
@@ -29,6 +58,12 @@ public class RocketmqMessageStoreAnalysis{
         private final CleanConsumeQueueService cleanConsumeQueueService;
         // 索引文件实现类
         private final IndexService indexService;
+        // 真正分配 MappedFile 文件内存的服务类
+        private final AllocateMappedFileService allocateMappedFileService;
+        // 这个服务用于根据 CommitLog 文件中的消息构建 ConsumeQueue 文件和 IndexFile 索引文件
+        private final ReputMessageService reputMessageService;
+
+        private final MessageArrivingListener messageArrivingListener;
 
         public DefaultMessageStore(final MessageStoreConfig messageStoreConfig,
                 final BrokerStatsManager brokerStatsManager, final MessageArrivingListener messageArrivingListener,
@@ -387,6 +422,7 @@ public class RocketmqMessageStoreAnalysis{
                                 if (size > 0) {
                                     DefaultMessageStore.this.doDispatch(dispatchRequest);
 
+                                    // 如果开启了长轮询机制，那么就会通知阻塞的线程有新的消息到达
                                     if (BrokerRole.SLAVE != DefaultMessageStore.this.getMessageStoreConfig().getBrokerRole()
                                         && DefaultMessageStore.this.brokerConfig.isLongPollingEnable()) {
                                         DefaultMessageStore.this.messageArrivingListener.arriving(dispatchRequest.getTopic(),
@@ -521,6 +557,12 @@ public class RocketmqMessageStoreAnalysis{
             if (defaultMessageStore.getMessageStoreConfig().isTransientStorePoolEnable()) {
                 this.commitLogService.start();
             }
+        }
+
+        public boolean load() {
+            boolean result = this.mappedFileQueue.load();
+            log.info("load commit log " + (result ? "OK" : "Failed"));
+            return result;
         }
 
         class DefaultAppendMessageCallback implements AppendMessageCallback {
@@ -872,6 +914,87 @@ public class RocketmqMessageStoreAnalysis{
             return null;
         }
 
+        public DispatchRequest checkMessageAndReturnSize(java.nio.ByteBuffer byteBuffer, final boolean checkCRC, final boolean readBody) {
+            try {
+                // 1 TOTAL SIZE 先从 ByteBuffer 中获取到这条消息的总长度
+                int totalSize = byteBuffer.getInt();
+                // 2 MAGIC CODE
+                int magicCode = byteBuffer.getInt();
+                switch (magicCode) {
+                case MESSAGE_MAGIC_CODE:
+                    break;
+                case BLANK_MAGIC_CODE:
+                    return new DispatchRequest(0, true /* success */);
+                default:
+                    log.warn("found a illegal magic code 0x" + Integer.toHexString(magicCode));
+                    return new DispatchRequest(-1, false /* success */);
+                }
+
+                byte[] bytesContent = new byte[totalSize];
+
+                // 从 byteBuffer 中读出存储的 msg 的各个属性
+                int bodyCRC = byteBuffer.getInt();
+                int queueId = byteBuffer.getInt();
+                int flag = byteBuffer.getInt();
+                long queueOffset = byteBuffer.getLong();
+                long physicOffset = byteBuffer.getLong();
+                int sysFlag = byteBuffer.getInt();
+                long bornTimeStamp = byteBuffer.getLong();
+                ByteBuffer byteBuffer1 = byteBuffer.get(bytesContent, 0, 8);
+                long storeTimestamp = byteBuffer.getLong();
+                ByteBuffer byteBuffer2 = byteBuffer.get(bytesContent, 0, 8);
+                int reconsumeTimes = byteBuffer.getInt();
+                long preparedTransactionOffset = byteBuffer.getLong();
+                int bodyLen = byteBuffer.getInt();
+
+                if (bodyLen > 0) {
+                    if (readBody) {
+                        byteBuffer.get(bytesContent, 0, bodyLen);
+                        if (checkCRC) {
+                            int crc = UtilAll.crc32(bytesContent, 0, bodyLen);
+                            if (crc != bodyCRC) {
+                                log.warn("CRC check failed. bodyCRC={}, currentCRC={}", crc, bodyCRC);
+                                return new DispatchRequest(-1, false/* success */);
+                            }
+                        }
+                    } else {
+                        byteBuffer.position(byteBuffer.position() + bodyLen);
+                    }
+                }
+
+                byte topicLen = byteBuffer.get();
+                byteBuffer.get(bytesContent, 0, topicLen);
+                String topic = new String(bytesContent, 0, topicLen, MessageDecoder.CHARSET_UTF8);
+
+                long tagsCode = 0;
+                String keys = "";
+                String uniqKey = null;
+
+                short propertiesLength = byteBuffer.getShort();
+                Map<String, String> propertiesMap = null;
+                if (propertiesLength > 0) {
+                    // ignore code
+                }
+
+                int readLength = calMsgLength(bodyLen, topicLen, propertiesLength);
+                if (totalSize != readLength) {
+                    doNothingForDeadCode(reconsumeTimes);
+                    doNothingForDeadCode(flag);
+                    doNothingForDeadCode(bornTimeStamp);
+                    doNothingForDeadCode(byteBuffer1);
+                    doNothingForDeadCode(byteBuffer2);
+                    log.error("[BUG]read total count not equals msg total size");
+                    return new DispatchRequest(totalSize, false/* success */);
+                }
+
+                return new DispatchRequest(topic, queueId, physicOffset, totalSize, tagsCode, storeTimestamp,
+                        queueOffset, keys, uniqKey, sysFlag, preparedTransactionOffset, propertiesMap);
+            } catch (Exception e) {
+            }
+
+            return new DispatchRequest(-1, false /* success */);
+        }
+
     }
 
     public static class GroupCommitRequest {
@@ -1210,6 +1333,9 @@ public class RocketmqMessageStoreAnalysis{
                     try {
                         // We only append data to fileChannel or mappedByteBuffer, never both.
                         // 刷写磁盘，直接调用 mappedByteBuffer 或者 fileChannel 的 force 方法将内存中数据持久化到磁盘
+                        // 这里的刷盘分为两种情况，一种就是 trasientPoolEnable 为 true 的话，这种情况下，消息是先写入到 writeBuffer 中，随后再提交到
+                        // fileChannel 中，所以 if 判断这两个地方是否有数据。第二种情况是 trasientPoolEnable 为 false 的情况，在这种情况下，会直接使用
+                        // mappedByteBuffer，而不会使用 fileChannel
                         if (writeBuffer != null || this.fileChannel.position() != 0) {
                             this.fileChannel.force(false);
                         } else {
@@ -1420,18 +1546,24 @@ public class RocketmqMessageStoreAnalysis{
         }
 
         public MappedFile getLastMappedFile(final long startOffset, boolean needCreate) {
+            // 创建映射问价的起始偏移量
             long createOffset = -1;
+            // 获取最后一个映射文件，如果为null或者写满则会执行创建逻辑
             MappedFile mappedFileLast = getLastMappedFile();
     
             // 1.mappedFileLast == null 则说明此时不存在任何 mappedFile 文件或者历史的 mappedFile 文件已经被清理了
             // 此时的 createOffset 按照如下的方式进行计算
             if (mappedFileLast == null) {
+                // 计算将要创建的映射文件的起始偏移量
+    	        // 如果startOffset<=mappedFileSize则起始偏移量为0
+    	        // 如果startOffset>mappedFileSize则起始偏移量为是mappedFileSize的倍数
                 createOffset = startOffset - (startOffset % this.mappedFileSize);
             }
     
             // 2.mappedFileLast != null && mappedFileLast.isFull() 说明最后一个 mappedFile 的空间已满，此时 createOffset
             // 应该按照下面的方式进行计算，createOffset 也就是新的 mappedFile 的偏移量以及文件名（这两个是相等的）
             if (mappedFileLast != null && mappedFileLast.isFull()) {
+                // 创建的映射文件的偏移量等于最后一个映射文件的起始偏移量  + 映射文件的大小（commitlog文件大小）
                 createOffset = mappedFileLast.getFileFromOffset() + this.mappedFileSize;
             }
     
@@ -1441,6 +1573,7 @@ public class RocketmqMessageStoreAnalysis{
                 MappedFile mappedFile = null;
     
                 if (this.allocateMappedFileService != null) {
+                    // 预分配内存
                     // 基于 createOffset 构建两个连续的 AllocateRequest 并插入 AllocateMappedFileService 线程维护的 requestQueue
                     // 这两个 AllocateRequest 也就是创建两个 mappedFile 文件，一个文件的初始偏移量为 createOffset，另外一个为 createOffset + mappedFileSize
                     // AllocateMappedFileService 线程读取 requestQueue 中的 AllocateRequest 异步创建对应的 MappedFile。在创建过程中，
@@ -1471,6 +1604,7 @@ public class RocketmqMessageStoreAnalysis{
     public class AllocateMappedFileService extends ServiceThread {
 
         public MappedFile putRequestAndReturnMappedFile(String nextFilePath, String nextNextFilePath, int fileSize) {
+            // 默认提交两个请求
             int canSubmitRequests = 2;
             if (this.messageStore.getMessageStoreConfig().isTransientStorePoolEnable()) {
                 if (this.messageStore.getMessageStoreConfig().isFastFailIfNoBufferInStorePool()
@@ -1482,9 +1616,10 @@ public class RocketmqMessageStoreAnalysis{
 
             // 创建一个 AllocateRequest 请求，创建初始偏移量为 nextFilePath 的 mappedFile 
             AllocateRequest nextReq = new AllocateRequest(nextFilePath, fileSize);
-            // 将创建的 AllocateRequest 放入到 requestTable 中
+            // 判断 requestTable 中是否存在该路径的分配请求，如果存在则说明该请求已经在排队中
             boolean nextPutOK = this.requestTable.putIfAbsent(nextFilePath, nextReq) == null;
 
+            // 该路径没有在排队
             if (nextPutOK) {
                 if (canSubmitRequests <= 0) {
                     log.warn("[NOTIFYME]TransientStorePool is not enough, so create mapped file error, ");
