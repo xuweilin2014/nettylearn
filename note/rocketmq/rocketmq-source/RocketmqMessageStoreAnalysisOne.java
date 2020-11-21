@@ -107,31 +107,61 @@ public class RocketmqMessageStoreAnalysis{
             lockFile = new RandomAccessFile(file, "rw");
         }
         
+        // DefaultMessageStore#putMessage
         public PutMessageResult putMessage(MessageExtBrokerInner msg) {
             // 判断当前 Broker 是否能够进行消息写入
+            
             // 1.如果当前 Broker 停止工作，不支持写入
+            if (this.shutdown) {
+                log.warn("message store has shutdown, so putMessage is forbidden");
+                return new PutMessageResult(PutMessageStatus.SERVICE_NOT_AVAILABLE, null);
+            }
             // 2.如果当前 Broker 是 SLAVE 的话，那么也不支持写入
+            if (BrokerRole.SLAVE == this.messageStoreConfig.getBrokerRole()) {
+                long value = this.printTimes.getAndIncrement();
+                if ((value % 50000) == 0) {
+                    log.warn("message store is slave mode, so putMessage is forbidden ");
+                }
+                return new PutMessageResult(PutMessageStatus.SERVICE_NOT_AVAILABLE, null);
+            }
             // 3.如果当前 Broker 不支持消息写入，则拒绝消息写入
+            if (!this.runningFlags.isWriteable()) {
+                long value = this.printTimes.getAndIncrement();
+                if ((value % 50000) == 0) {
+                    log.warn("message store is not writeable, so putMessage is forbidden " + this.runningFlags.getFlagBits());
+                }
+                return new PutMessageResult(PutMessageStatus.SERVICE_NOT_AVAILABLE, null);
+            } else {
+                this.printTimes.set(0);
+            }
             // 4.如果消息主题的长度大于 256 个字符，则拒绝消息写入
+            if (msg.getTopic().length() > Byte.MAX_VALUE) {
+                log.warn("putMessage message topic length too long " + msg.getTopic().length());
+                return new PutMessageResult(PutMessageStatus.MESSAGE_ILLEGAL, null);
+            }
             // 5.如果消息属性的长度超过 65536 个字符，则拒绝消息写入
-    
+            if (msg.getPropertiesString() != null && msg.getPropertiesString().length() > Short.MAX_VALUE) {
+                log.warn("putMessage message properties length too long " + msg.getPropertiesString().length());
+                return new PutMessageResult(PutMessageStatus.PROPERTIES_SIZE_EXCEEDED, null);
+            }
+
             if (this.isOSPageCacheBusy()) {
                 return new PutMessageResult(PutMessageStatus.OS_PAGECACHE_BUSY, null);
             }
-    
+
             long beginTime = this.getSystemClock().now();
             PutMessageResult result = this.commitLog.putMessage(msg);
-    
+
             long eclipseTime = this.getSystemClock().now() - beginTime;
             if (eclipseTime > 500) {
                 log.warn("putMessage not in lock eclipse time(ms)={}, bodyLength={}", eclipseTime, msg.getBody().length);
             }
             this.storeStatsService.setPutMessageEntireTimeMax(eclipseTime);
-    
+
             if (null == result || !result.isOk()) {
                 this.storeStatsService.getPutMessageFailedTimes().incrementAndGet();
             }
-    
+
             return result;
         }
 
@@ -397,6 +427,7 @@ public class RocketmqMessageStoreAnalysis{
             this.reputFromOffset = reputFromOffset;
         }
 
+        // ReputMessageService#doReput
         private void doReput() {
             for (boolean doNext = true; this.isCommitLogAvailable() && doNext; ) {
 
@@ -469,6 +500,7 @@ public class RocketmqMessageStoreAnalysis{
             }
         }
 
+        // ReputMessageService#run
         @Override
         public void run() {
             DefaultMessageStore.log.info(this.getServiceName() + " service started");
@@ -527,11 +559,12 @@ public class RocketmqMessageStoreAnalysis{
         // topic-queueId -> offset
         private HashMap<String, Long> topicQueueTable = new HashMap<String, Long>(1024);
 
+        // CommitLog#CommitLog
         public CommitLog(final DefaultMessageStore defaultMessageStore) {
             this.mappedFileQueue = new MappedFileQueue(defaultMessageStore.getMessageStoreConfig().getStorePathCommitLog(),
                 defaultMessageStore.getMessageStoreConfig().getMapedFileSizeCommitLog(), defaultMessageStore.getAllocateMappedFileService());
             this.defaultMessageStore = defaultMessageStore;
-    
+
             // 如果是同步刷盘策略，那么 flushCommitLogService 就初始化为 GroupCommitService
             if (FlushDiskType.SYNC_FLUSH == defaultMessageStore.getMessageStoreConfig().getFlushDiskType()) {
                 this.flushCommitLogService = new GroupCommitService();
@@ -539,9 +572,9 @@ public class RocketmqMessageStoreAnalysis{
             } else {
                 this.flushCommitLogService = new FlushRealTimeService();
             }
-    
+
             this.commitLogService = new CommitRealTimeService();
-    
+
             this.appendMessageCallback = new DefaultAppendMessageCallback(defaultMessageStore.getMessageStoreConfig().getMaxMessageSize());
             batchEncoderThreadLocal = new ThreadLocal<MessageExtBatchEncoder>() {
                 @Override
@@ -549,9 +582,11 @@ public class RocketmqMessageStoreAnalysis{
                     return new MessageExtBatchEncoder(defaultMessageStore.getMessageStoreConfig().getMaxMessageSize());
                 }
             };
-            this.putMessageLock = defaultMessageStore.getMessageStoreConfig().isUseReentrantLockWhenPutMessage() ? new PutMessageReentrantLock() : new PutMessageSpinLock();
+            this.putMessageLock = defaultMessageStore.getMessageStoreConfig().isUseReentrantLockWhenPutMessage() ? 
+                new PutMessageReentrantLock() : new PutMessageSpinLock();
         }
 
+        // CommitLog#start
         public void start() {
             this.flushCommitLogService.start();
             if (defaultMessageStore.getMessageStoreConfig().isTransientStorePoolEnable()) {
@@ -563,6 +598,13 @@ public class RocketmqMessageStoreAnalysis{
             boolean result = this.mappedFileQueue.load();
             log.info("load commit log " + (result ? "OK" : "Failed"));
             return result;
+        }
+
+        // CommitLog#doDispatch
+        public void doDispatch(DispatchRequest req) {
+            for (CommitLogDispatcher dispatcher : this.dispatcherList) {
+                dispatcher.dispatch(req);
+            }
         }
 
         class DefaultAppendMessageCallback implements AppendMessageCallback {
@@ -578,6 +620,7 @@ public class RocketmqMessageStoreAnalysis{
             // 用来保存消息的实际内容
             private final ByteBuffer msgStoreItemMemory;
 
+            // DefaultAppendMessageCallback#doAppend
             public AppendMessageResult doAppend(final long fileFromOffset, final ByteBuffer byteBuffer, final int maxBlank, 
                         final MessageExtBrokerInner msgInner) {
                 // 写入消息的偏移量 wroteOffset 为：这个 MappedFile 最开始的偏移量 + position
@@ -601,6 +644,7 @@ public class RocketmqMessageStoreAnalysis{
                 if (null == queueOffset) {
                     queueOffset = 0L;
                     // 如果没找到对应主题的消息在消息队列的偏移量，就说明是一个新的消息队列，所以 queueOffset 为 0
+                    // 这里的偏移量 queueOffset 是一个逻辑偏移量，表示 ConsumeQueue 中消息的个数
                     CommitLog.this.topicQueueTable.put(key, queueOffset);
                 }
 
@@ -696,7 +740,19 @@ public class RocketmqMessageStoreAnalysis{
                 AppendMessageResult result = new AppendMessageResult(AppendMessageStatus.PUT_OK, wroteOffset, msgLen, msgId, msgInner.getStoreTimestamp(), 
                         queueOffset, CommitLog.this.defaultMessageStore.now() - beginTimeMills);
 
-                // 省略代码...
+                switch (tranType) {
+                case MessageSysFlag.TRANSACTION_PREPARED_TYPE:
+                case MessageSysFlag.TRANSACTION_ROLLBACK_TYPE:
+                    break;
+                case MessageSysFlag.TRANSACTION_NOT_TYPE:
+                case MessageSysFlag.TRANSACTION_COMMIT_TYPE:
+                    // The next update ConsumeQueue information
+                    // 将对应 topic 和 queueId 的消息队列的 queueOfffset 的数目加 1
+                    CommitLog.this.topicQueueTable.put(key, ++queueOffset);
+                    break;
+                default:
+                    break;
+                }
                 
                 return result;
             }
@@ -876,6 +932,7 @@ public class RocketmqMessageStoreAnalysis{
             // Asynchronous flush
             // 异步刷盘
             else {
+                // 如果 isTransientStorePoolEnable 为 false1，唤醒 FlushCommitLogService 线程直接将 mappedByteBuffer 中的内容提交
                 if (!this.defaultMessageStore.getMessageStoreConfig().isTransientStorePoolEnable()) {
                     flushCommitLogService.wakeup();
                 // 如果 isTransientStorePoolEnable 为 true，唤醒 CommitRealTimeService 线程将 writeBuffer 中的数据 commit 至 fileChannel
@@ -973,7 +1030,34 @@ public class RocketmqMessageStoreAnalysis{
                 short propertiesLength = byteBuffer.getShort();
                 Map<String, String> propertiesMap = null;
                 if (propertiesLength > 0) {
-                    // ignore code
+                    byteBuffer.get(bytesContent, 0, propertiesLength);
+                    String properties = new String(bytesContent, 0, propertiesLength, MessageDecoder.CHARSET_UTF8);
+                    propertiesMap = MessageDecoder.string2messageProperties(properties);
+
+                    keys = propertiesMap.get(MessageConst.PROPERTY_KEYS);
+                    uniqKey = propertiesMap.get(MessageConst.PROPERTY_UNIQ_CLIENT_MESSAGE_ID_KEYIDX);
+
+                    String tags = propertiesMap.get(MessageConst.PROPERTY_TAGS);
+                    if (tags != null && tags.length() > 0) {
+                        // 从消息的 properties 属性中获取到消息的标签 tags 的 hashcode，其实就是返回 tags.hashcode() 的值
+                        tagsCode = MessageExtBrokerInner.tagsString2tagsCode(MessageExt.parseTopicFilterType(sysFlag), tags);
+                    }
+
+                    // Timing message processing
+                    {
+                        String t = propertiesMap.get(MessageConst.PROPERTY_DELAY_TIME_LEVEL);
+                        if (ScheduleMessageService.SCHEDULE_TOPIC.equals(topic) && t != null) {
+                            int delayLevel = Integer.parseInt(t);
+
+                            if (delayLevel > this.defaultMessageStore.getScheduleMessageService().getMaxDelayLevel()) {
+                                delayLevel = this.defaultMessageStore.getScheduleMessageService().getMaxDelayLevel();
+                            }
+
+                            if (delayLevel > 0) {
+                                tagsCode = this.defaultMessageStore.getScheduleMessageService().computeDeliverTimestamp(delayLevel, storeTimestamp);
+                            }
+                        }
+                    }
                 }
 
                 int readLength = calMsgLength(bodyLen, topicLen, propertiesLength);
@@ -1151,18 +1235,22 @@ public class RocketmqMessageStoreAnalysis{
         // 是否是 MappedFileQueue 队列的第一个文件
         private boolean firstCreateInQueue = false;
 
+        // MappedFile#appendMessage
         public AppendMessageResult appendMessage(final MessageExtBrokerInner msg, final AppendMessageCallback cb) {
             return appendMessagesInner(msg, cb);
         }
 
         // 将消息追加到 MappedFile 中
+        // MappedFile#appendMessageInner
         public AppendMessageResult appendMessagesInner(final MessageExt messageExt, final AppendMessageCallback cb) {  
             // 先获取 MappedFile 当前的写指针  
             int currentPos = this.wrotePosition.get();
-    
+
             // 如果 currentPos 大于或者等于文件大小，则表明文件已经写满，会抛出 AppendMessageStatus.UNKNOWN_ERROR 异常
             if (currentPos < this.fileSize) {
                 // 如果 currentPos 小于文件大小，通过 slice() 方法创建一个与 MappedFile 的共享共存区，并设置 position 为当前指针
+                // 如果 writeBuffer 为 null，则表明 transientStorePoolEnable 为 false，数据直接写入到 mappedByteBuffer 中
+                // 否则的话。消息写入到 writeBuffer 中
                 ByteBuffer byteBuffer = writeBuffer != null ? writeBuffer.slice() : this.mappedByteBuffer.slice();
                 byteBuffer.position(currentPos);
                 AppendMessageResult result = null;
@@ -1243,6 +1331,77 @@ public class RocketmqMessageStoreAnalysis{
             }
         }
 
+        public void mlock() {
+            final long beginTime = System.currentTimeMillis();
+            final long address = ((DirectBuffer) (this.mappedByteBuffer)).address();
+            // pointer 指向 mappedByteBuffer 所代表的内存
+            Pointer pointer = new Pointer(address);
+
+            {
+                // 调用 mlock 方法将 mappedByteBuffer 所代表的内存区域进行锁定，防止 OS 将内存交换到 swap 空间上去
+                // 内存的 page input/page output 可能会耗费很多时间
+                int ret = LibC.INSTANCE.mlock(pointer, new NativeLong(this.fileSize));
+                log.info("mlock {} {} {} ret = {} time consuming = {}");
+            }
+
+            {
+                // 调用 madvise 方法，madvise会向内核提供一个针对于于地址区间的I/O的建议，内核可能会采纳这个建议，
+                // 会做一些预读的操作。RocketMQ采用的是MADV_WILLNEED模式，它的效果是，对所有当前不在内存中的数据进行页面调度
+                int ret = LibC.INSTANCE.madvise(pointer, new NativeLong(this.fileSize), LibC.MADV_WILLNEED);
+                log.info("madvise {} {} {} ret = {} time consuming = {}");
+            }
+        }
+
+        /**
+         * 1.对当前映射文件进行预热
+         * 第一步：对当前映射文件的每个内存页写入一个字节0.当刷盘策略为同步刷盘时，执行强制刷盘，并且是每修改pages(默认是16MB)个分页刷一次盘
+         * 第二步：将当前全部的地址空间锁定在物理存储中，防止其被交换到swap空间。再调用，传入 MADV_WILLNEED 策略，将刚刚锁住的内存预热，
+         * 其实就是告诉内核，我马上就要用（MADV_WILLNEED）这块内存，先做虚拟内存到物理内存的映射，防止正式使用时产生缺页中断。
+         * 
+         * 2.使用mmap()内存分配时，只是建立了进程虚拟地址空间，并没有分配虚拟内存对应的物理内存。当进程访问这些没有建立映射关系的虚拟内存时，
+         * 处理器自动触发一个缺页异常，进而进入内核空间分配物理内存、更新进程缓存表，最后返回用户空间，恢复进程运行。
+         * 写入假值0的意义在于实际分配物理内存，在消息写入时防止缺页异常。
+         */
+        public void warmMappedFile(FlushDiskType type, int pages) {
+            long beginTime = System.currentTimeMillis();
+            ByteBuffer byteBuffer = this.mappedByteBuffer.slice();
+            int flush = 0;
+            long time = System.currentTimeMillis();
+            for (int i = 0, j = 0; i < this.fileSize; i += MappedFile.OS_PAGE_SIZE, j++) {
+                byteBuffer.put(i, (byte) 0);
+                // force flush when flush disk type is sync
+                if (type == FlushDiskType.SYNC_FLUSH) {
+                    if ((i / OS_PAGE_SIZE) - (flush / OS_PAGE_SIZE) >= pages) {
+                        flush = i;
+                        mappedByteBuffer.force();
+                    }
+                }
+    
+                // prevent gc
+                if (j % 1000 == 0) {
+                    log.info("j={}, costTime={}", j, System.currentTimeMillis() - time);
+                    time = System.currentTimeMillis();
+                    try {
+                        Thread.sleep(0);
+                    } catch (InterruptedException e) {
+                        log.error("Interrupted", e);
+                    }
+                }
+            }
+    
+            // force flush when prepare load finished
+            if (type == FlushDiskType.SYNC_FLUSH) {
+                log.info("mapped file warm-up done, force to disk, mappedFile={}, costTime={}",
+                    this.getFileName(), System.currentTimeMillis() - beginTime);
+                mappedByteBuffer.force();
+            }
+            log.info("mapped file warm-up done. mappedFile={}, costTime={}", this.getFileName(),
+                System.currentTimeMillis() - beginTime);
+    
+            this.mlock();
+        }
+
+        // MappedFile#commit
         public int commit(final int commitLeastPages) {
             // 如果 writeBuffer 为空，说明是 transientStorePoolEnable 为 false，也就是说消息内容是直接写入到 mappedByteBuffer 中，
             // 所以不需要进行提交
@@ -1250,7 +1409,6 @@ public class RocketmqMessageStoreAnalysis{
                 // no need to commit data to file channel, so just regard wrotePosition as committedPosition.
                 return this.wrotePosition.get();
             }
-
             // commitLeastPages 为本次提交最小的页数，如果待提交数据不满 commitLeastPages ，则不执行本次提交操作，待下次提交
             if (this.isAbleToCommit(commitLeastPages)) {
                 if (this.hold()) {
@@ -1260,17 +1418,15 @@ public class RocketmqMessageStoreAnalysis{
                     log.warn("in commit, hold failed, commit offset = " + this.committedPosition.get());
                 }
             }
-
             // All dirty data has been committed to FileChannel.
-            if (writeBuffer != null && this.transientStorePool != null
-                    && this.fileSize == this.committedPosition.get()) {
+            if (writeBuffer != null && this.transientStorePool != null && this.fileSize == this.committedPosition.get()) {
                 this.transientStorePool.returnBuffer(writeBuffer);
                 this.writeBuffer = null;
             }
-
             return this.committedPosition.get();
         }
 
+        // MappedFile#commit0
         protected void commit0(final int commitLeastPages) {
             int writePos = this.wrotePosition.get();
             int lastCommittedPosition = this.committedPosition.get();
@@ -1541,37 +1697,39 @@ public class RocketmqMessageStoreAnalysis{
             return 0;
         }
 
+        // MappedFileQueue#getLastMappedFile
         public MappedFile getLastMappedFile(final long startOffset) {
             return getLastMappedFile(startOffset, true);
         }
 
+        // MappedFileQueue#getLastMappedFile
         public MappedFile getLastMappedFile(final long startOffset, boolean needCreate) {
             // 创建映射问价的起始偏移量
             long createOffset = -1;
             // 获取最后一个映射文件，如果为null或者写满则会执行创建逻辑
             MappedFile mappedFileLast = getLastMappedFile();
-    
+
             // 1.mappedFileLast == null 则说明此时不存在任何 mappedFile 文件或者历史的 mappedFile 文件已经被清理了
             // 此时的 createOffset 按照如下的方式进行计算
             if (mappedFileLast == null) {
                 // 计算将要创建的映射文件的起始偏移量
-    	        // 如果startOffset<=mappedFileSize则起始偏移量为0
-    	        // 如果startOffset>mappedFileSize则起始偏移量为是mappedFileSize的倍数
+                // 如果 startOffset < mappedFileSize 则起始偏移量为0
+                // 如果 startOffset >= mappedFileSize 则起始偏移量为是 mappedFileSize 的倍数
                 createOffset = startOffset - (startOffset % this.mappedFileSize);
             }
-    
+
             // 2.mappedFileLast != null && mappedFileLast.isFull() 说明最后一个 mappedFile 的空间已满，此时 createOffset
             // 应该按照下面的方式进行计算，createOffset 也就是新的 mappedFile 的偏移量以及文件名（这两个是相等的）
             if (mappedFileLast != null && mappedFileLast.isFull()) {
-                // 创建的映射文件的偏移量等于最后一个映射文件的起始偏移量  + 映射文件的大小（commitlog文件大小）
+                // 创建的映射文件的偏移量等于最后一个映射文件的起始偏移量 + 映射文件的大小（commitlog文件大小）
                 createOffset = mappedFileLast.getFileFromOffset() + this.mappedFileSize;
             }
-    
+
             if (createOffset != -1 && needCreate) {
                 String nextFilePath = this.storePath + File.separator + UtilAll.offset2FileName(createOffset);
                 String nextNextFilePath = this.storePath + File.separator + UtilAll.offset2FileName(createOffset + this.mappedFileSize);
                 MappedFile mappedFile = null;
-    
+
                 if (this.allocateMappedFileService != null) {
                     // 预分配内存
                     // 基于 createOffset 构建两个连续的 AllocateRequest 并插入 AllocateMappedFileService 线程维护的 requestQueue
@@ -1581,28 +1739,30 @@ public class RocketmqMessageStoreAnalysis{
                     mappedFile = this.allocateMappedFileService.putRequestAndReturnMappedFile(nextFilePath, nextNextFilePath, this.mappedFileSize);
                 } else {
                     try {
+                        // 直接 new 一个 MappedFile 对象，并且不使用 TransientStorePool
                         mappedFile = new MappedFile(nextFilePath, this.mappedFileSize);
                     } catch (IOException e) {
                         log.error("create mappedFile exception", e);
                     }
                 }
-    
+
                 if (mappedFile != null) {
                     if (this.mappedFiles.isEmpty()) {
                         mappedFile.setFirstCreateInQueue(true);
                     }
                     this.mappedFiles.add(mappedFile);
                 }
-    
+
                 return mappedFile;
             }
-    
+
             return mappedFileLast;
         }
     }
 
     public class AllocateMappedFileService extends ServiceThread {
 
+        // AllocateMappedFileService#putRequestAndReturnMappedFile
         public MappedFile putRequestAndReturnMappedFile(String nextFilePath, String nextNextFilePath, int fileSize) {
             // 默认提交两个请求
             int canSubmitRequests = 2;
@@ -1682,6 +1842,7 @@ public class RocketmqMessageStoreAnalysis{
             return null;
         }
 
+        // AllocateMappedFileService#run
         public void run() {
             log.info(this.getServiceName() + " service started");
             while (!this.isStopped() && this.mmapOperation()) {
@@ -1689,6 +1850,7 @@ public class RocketmqMessageStoreAnalysis{
             log.info(this.getServiceName() + " service end");
         }
 
+        // AllocateMappedFileService#mmapOperation
         private boolean mmapOperation() {
             boolean isSuccess = false;
             AllocateRequest req = null;
@@ -1703,10 +1865,10 @@ public class RocketmqMessageStoreAnalysis{
                     log.warn("never expected here,  maybe cause timeout");
                     return true;
                 }
-    
+
                 if (req.getMappedFile() == null) {
                     long beginTime = System.currentTimeMillis();
-    
+
                     // 在下面开始正式进行 mappedFile 的创建工作
                     // 如果 isTransientStorePoolEnable 为 true，MappedFile 会将 TransientStorePool 申请的堆外内存（Direct Byte Buffer）空间作为 
                     // writeBuffer，写入消息时先将消息写入 writeBuffer，然后将消息提交至 fileChannel 再 flush；否则，直接创建 MappedFile 内存映射
@@ -1723,21 +1885,17 @@ public class RocketmqMessageStoreAnalysis{
                     } else {
                         mappedFile = new MappedFile(req.getFilePath(), req.getFileSize());
                     }
-    
-                    long eclipseTime = UtilAll.computeEclipseTimeMilliseconds(beginTime);
-                    if (eclipseTime > 10) {
-                        int queueSize = this.requestQueue.size();
-                        log.warn("create mappedFile spent time(ms)");
-                    }
-    
+
+                    // 省略代码
+
                     // pre write mappedFile
-                    if (mappedFile.getFileSize() >= this.messageStore.getMessageStoreConfig()
-                        .getMapedFileSizeCommitLog() &&
+                    // 对 MappedFile 进行预热
+                    if (mappedFile.getFileSize() >= this.messageStore.getMessageStoreConfig().getMapedFileSizeCommitLog() &&
                         this.messageStore.getMessageStoreConfig().isWarmMapedFileEnable()) {
                         mappedFile.warmMappedFile(this.messageStore.getMessageStoreConfig().getFlushDiskType(),
                             this.messageStore.getMessageStoreConfig().getFlushLeastPagesWhenWarmMapedFile());
                     }
-    
+
                     req.setMappedFile(mappedFile);
                     this.hasException = false;
                     isSuccess = true;

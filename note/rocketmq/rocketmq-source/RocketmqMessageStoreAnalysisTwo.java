@@ -108,9 +108,11 @@ public class RocketmqMessageStoreAnalysisTwo {
             return null;
         }
 
-        private boolean putMessagePositionInfo(final long offset, final int size, final long tagsCode,
-                final long cqOffset) {
-
+        // ConsumeQueue#putMessagePositionInfo
+        // offset 表示的是消息在 CommitLog 文件中的偏移量
+        // cqOffset 表示是消息在 ConsumeQueue 文件中的偏移量，这是逻辑偏移量，比如 msgA 是 ConsumeQueue 中的第一个消息，那么它的逻辑偏移量为 0
+        // 如果是第二个消息，那么逻辑偏移量为 1，依次类推，所以 cqOffset 表示下次要插入消息的逻辑偏移量
+        private boolean putMessagePositionInfo(final long offset, final int size, final long tagsCode, final long cqOffset) {
             if (offset <= this.maxPhysicOffset) {
                 return true;
             }
@@ -121,10 +123,10 @@ public class RocketmqMessageStoreAnalysisTwo {
             this.byteBufferIndex.putLong(offset);
             this.byteBufferIndex.putInt(size);
             this.byteBufferIndex.putLong(tagsCode);
-
+            // exptectLogicOffset 表示要从此偏移量插入消息
             final long expectLogicOffset = cqOffset * CQ_STORE_UNIT_SIZE;
-
             MappedFile mappedFile = this.mappedFileQueue.getLastMappedFile(expectLogicOffset);
+
             if (mappedFile != null) {
 
                 if (mappedFile.isFirstCreateInQueue() && cqOffset != 0 && mappedFile.getWrotePosition() == 0) {
@@ -136,19 +138,25 @@ public class RocketmqMessageStoreAnalysisTwo {
                 }
 
                 if (cqOffset != 0) {
+                    // currentLogicOffset 表示该 ConsumeQueue 中已经写入消息的总偏移量
                     long currentLogicOffset = mappedFile.getWrotePosition() + mappedFile.getFileFromOffset();
 
+                    // 由于 exptectLogicOffset 表示要从此偏移量插入消息，所以 exptectLogicOffset 应该和 currentLogicOffset 相等
+                    // 比如 ConsumeQueue 中已经有 3 条消息，此 ConsumeQueue 的 fileFromOffset 为 0，那么现在要插入的消息的 cqOffset 为 3
+                    // （查看 CommitLog#DefaultAppendMessageCallback#doAppend 方法），那么 expectLogicOffset 和 currentLogicOffset
+                    // 都为 60，是相等的
                     if (expectLogicOffset < currentLogicOffset) {
-                        log.warn();
+                        log.warn("Build  consume queue repeatedly");
                         return true;
                     }
 
                     if (expectLogicOffset != currentLogicOffset) {
-                        LOG_ERROR.warn();
+                        LOG_ERROR.warn("[BUG]logic queue order maybe wrong");
                     }
                 }
                 this.maxPhysicOffset = offset;
-                // 将消息的内容追加到 ConsumeQueue 的内存映射文件中，但是并不刷盘，ConsumeQueue 的刷盘方式是固定为异步刷盘
+                // 将消息的内容追加到 ConsumeQueue 的内存映射文件 MappedFile 中，但是并不刷盘，ConsumeQueue 的刷盘方式是固定为异步刷盘
+                // 追加方式就是简单地写入到 MappedFile 中的 fileChannel 中
                 return mappedFile.appendMessage(this.byteBufferIndex.array());
             }
             return false;
@@ -255,22 +263,20 @@ public class RocketmqMessageStoreAnalysisTwo {
         }
 
         /**
-         * 
+         * IndexService#putKey
          * @param key            发送的消息中的 key 值
          * @param phyOffset      消息在 commitlog 中的物理偏移量
          * @param storeTimestamp
          * @return
          */
         public boolean putKey(final String key, final long phyOffset, final long storeTimestamp) {
-            // IndexHeader 对象中的 indexCount 表示已经使用的索引条目个数，如果大于 IndexFile 最多允许的索引条目个数，就直接返回
-            // false
+            // IndexHeader 对象中的 indexCount 表示已经使用的索引条目个数，如果大于 IndexFile 最多允许的索引条目个数，就直接返回 false
             if (this.indexHeader.getIndexCount() < this.indexNum) {
                 // 获取到 key 对应的 hashcode 值
                 int keyHash = indexKeyHashMethod(key);
                 // 根据 keyHash 取模得到对应的 hash 槽的下标
                 int slotPos = keyHash % this.hashSlotNum;
-                // 计算出这个新添加的条目在 hash 槽对应的偏移量，也就是：IndexHeader 头部（40 字节） + hash 槽的下标 * hash 槽的大小（4
-                // 字节）
+                // 计算出这个新添加的条目在 hash 槽对应的偏移量，也就是：IndexHeader 头部（40 字节） + hash 槽的下标 * hash 槽的大小（4 字节）
                 // hash 槽中存储的值为最新的 key 对应的 Index 条目在 Index 条目列表中的下标值
                 int absSlotPos = IndexHeader.INDEX_HEADER_SIZE + slotPos * hashSlotSize;
 
@@ -302,9 +308,8 @@ public class RocketmqMessageStoreAnalysisTwo {
                      */
 
                     // 计算这个新添加的条目在 Index 条目列表中的偏移量，用来往里面存储 Index 的条目值
-                    int absIndexPos = IndexHeader.INDEX_HEADER_SIZE + this.hashSlotNum * hashSlotSize
-                            + this.indexHeader.getIndexCount() * indexSize;
-                    // 依次将消息中 key 值计算出来的 hashcode，消息物理偏移量，时间差值，以及当前的 hash 槽的值存入 MappedByteBuffer 中
+                    int absIndexPos = IndexHeader.INDEX_HEADER_SIZE + this.hashSlotNum * hashSlotSize + this.indexHeader.getIndexCount() * indexSize;
+                    // 依次将消息中 key 值计算出来的 hashcode，消息在 CommitLog 文件中的偏移量，时间差值，以及当前的 hash 槽的值存入 MappedByteBuffer 中
                     this.mappedByteBuffer.putInt(absIndexPos, keyHash);
                     this.mappedByteBuffer.putLong(absIndexPos + 4, phyOffset);
                     this.mappedByteBuffer.putInt(absIndexPos + 4 + 8, (int) timeDiff);
@@ -319,6 +324,7 @@ public class RocketmqMessageStoreAnalysisTwo {
 
                     this.indexHeader.incHashSlotCount();
                     this.indexHeader.incIndexCount();
+                    //  更新最新的消息在 CommitLog 文件中的偏移量，其实也就是该 IndexFile 文件中消息在 CommitLog 文件中的最大偏移量
                     this.indexHeader.setEndPhyOffset(phyOffset);
                     this.indexHeader.setEndTimestamp(storeTimestamp);
 
@@ -433,11 +439,15 @@ public class RocketmqMessageStoreAnalysisTwo {
         public void buildIndex(DispatchRequest req) {
             IndexFile indexFile = retryGetAndCreateIndexFile();
             if (indexFile != null) {
-                // 获取或创建 IndexFile 文件并获取所有文件最大的物理偏移量。如果该消息的物理偏移量小于索引文件中的物理偏移，则说明是重复数据，忽略本次索引构建
+                // 获取或创建 IndexFile 文件，并获取 IndexFile 文件中保存的消息在 CommitLog 中最大的偏移量 endPhyOffset。
                 long endPhyOffset = indexFile.getEndPhyOffset();
                 DispatchRequest msg = req;
                 String topic = msg.getTopic();
                 String keys = msg.getKeys();
+
+                // 如果该消息在 CommitLog 文件中的偏移量小于 endPhyOffset，则说明是重复数据，忽略本次索引构建
+                // 这是因为 CommitLog 文件中消息是按顺序写入的，而 IndexFile 也是按顺序构建的，加入到 IndexFile 中的
+                // 新消息，其在 CommitLog 中的偏移量是逐步增大的
                 if (msg.getCommitLogOffset() < endPhyOffset) {
                     return;
                 }
@@ -462,11 +472,13 @@ public class RocketmqMessageStoreAnalysisTwo {
                 }
 
                 // 构建索引键，RocketMQ 支持为同一个消息建立多个索引，多个索引键空格分开。
+                // Producer 创建消息的时候需要指定 topic、tag、keys
                 if (keys != null && keys.length() > 0) {
                     String[] keyset = keys.split(MessageConst.KEY_SEPARATOR);
                     for (int i = 0; i < keyset.length; i++) {
                         String key = keyset[i];
                         if (key.length() > 0) {
+                            // buildkey: topic + # + key
                             indexFile = putKey(indexFile, msg, buildKey(topic, key));
                             if (indexFile == null) {
                                 log.error("putKey error commitlog {} uniqkey {}", req.getCommitLogOffset(), req.getUniqKey());
