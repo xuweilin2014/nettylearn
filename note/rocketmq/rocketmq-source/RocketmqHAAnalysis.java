@@ -72,6 +72,22 @@ public class RocketmqHAAnalysis{
             this.haClient.start();
         }
 
+        // HAService#notifyTransferSome
+        // 在 HAConnection$ReadSocketService#processReadEvents 方法中被调用，也就是接收到 slave 端发送过来的心跳包，
+        // 其中包含有 slave offset，就会调用 notifyTransferSome 方法来更新 push2SlaveMaxOffset 变量，以及唤醒 
+        // GroupTransferService 线程来继续通知阻塞的消息发送者线程。
+        public void notifyTransferSome(final long offset) {
+            for (long value = this.push2SlaveMaxOffset.get(); offset > value; ) {
+                boolean ok = this.push2SlaveMaxOffset.compareAndSet(value, offset);
+                if (ok) {
+                    this.groupTransferService.notifyTransferSome();
+                    break;
+                } else {
+                    value = this.push2SlaveMaxOffset.get();
+                }
+            }
+        }
+
     }
 
     public class CommitLog{
@@ -79,6 +95,7 @@ public class RocketmqHAAnalysis{
         // GroupTransferService 主从同步阻塞实现，如果是同步主从模式，消息发送者将消息刷写到磁盘后，需要继续等待新数据被传输到从服务器，
         // 从服务器数据的复制是在另外一个线程 HAConnection 中去拉取，所以消息发送者在这里需要等待数据传输的结果
         // 下面的 SYNC_MASTER 表明 Master-Slave 之间使用的是同步复制，ASYNC_MASTER 表明的是异步复制
+        // CommitLog#handleHA
         public void handleHA(AppendMessageResult result, PutMessageResult putMessageResult, MessageExt messageExt) {
             if (BrokerRole.SYNC_MASTER == this.defaultMessageStore.getMessageStoreConfig().getBrokerRole()) {
                 HAService service = this.defaultMessageStore.getHaService();
@@ -103,7 +120,6 @@ public class RocketmqHAAnalysis{
                     }
                 }
             }
-    
         }
 
     }
@@ -131,9 +147,8 @@ public class RocketmqHAAnalysis{
          * Master 在接收到 Slave 的连接请求后，创建 SocketChannel，封装成一个 HAConnection，同时启动 writeSocketService 
          * 和 readSocketService 服务。但 Master 启动时是不会主动传输数据的，因为其不知道 Slave 的 CommitLog的maxPhyOffset，
          * 也就是不知道从哪个位置开始同步，需要 Slave 先上报当前 CommitLog的maxPhyOffset。
-         * @return
-         * @throws ClosedChannelException
          */
+        // HAClient#connectMaster
         private boolean connectMaster() throws ClosedChannelException {
             if (null == socketChannel) {
                 String addr = this.masterAddress.get();
@@ -157,6 +172,7 @@ public class RocketmqHAAnalysis{
             return this.socketChannel != null;
         }
 
+        // HAClient#isTimeToReportOffset
         // 判断是否需要向 Master 反馈当前待拉取的偏移量，Master 与 Slave 的 HA 心跳发送间隔默认为 5s，
         // 可以通过配置 haSendHeartbeatInterval 来改变心跳间隔
         private boolean isTimeToReportOffset() {
@@ -170,9 +186,8 @@ public class RocketmqHAAnalysis{
          * 既可以认为是 Slave 本次请求拉取的消息偏移量，也可以理解为 Slave 的消息同步 ACK 确认消息
          * 
          * 上报进度,传递进度的时候仅传递一个 Long 类型的 Offset, 8 个字节,没有其他数据
-         * @param maxOffset
-         * @return
          */
+        // HAClient#reportSlaveMaxOffset
         private boolean reportSlaveMaxOffset(final long maxOffset) {
             this.reportOffset.position(0);
             this.reportOffset.limit(8);
@@ -206,6 +221,7 @@ public class RocketmqHAAnalysis{
          * 
          * HA Client 线程反复执行上述 3 个步骤完成主从同步复制功能
          */
+        // HAClient#processReadEvent
         private boolean processReadEvent() {
             int readSizeZeroTimes = 0;
 
@@ -241,6 +257,7 @@ public class RocketmqHAAnalysis{
         // 该方法需要解决以下两个问题：
         // 1.如果判断 byteBufferRead 中是否包含一条完整的消息
         // 2.如果不包含一条完整的消息，应该如何处理
+        // HAClient#dispatchReadRequest
         private boolean dispatchReadRequest() {
             // msgHeaderSize 头部长度，大小为12个字节，8 个字节的物理偏移量，4 个字节的消息长度，包括消息的物理偏移量与消息的长度，
             // 长度字节必须首先探测，否则无法判断byteBufferRead缓存区中是否包含一条完整的消息
@@ -305,6 +322,7 @@ public class RocketmqHAAnalysis{
             return true;
         }
 
+        // HAClient#run
         @Override
         public void run() {
             log.info(this.getServiceName() + " service started");
@@ -383,6 +401,7 @@ public class RocketmqHAAnalysis{
             this.serverSocketChannel.register(this.selector, SelectionKey.OP_ACCEPT);
         }
 
+        // AcceptSocketService#run
         @Override
         public void run() {
             log.info(this.getServiceName() + " service started");
@@ -462,27 +481,28 @@ public class RocketmqHAAnalysis{
         // 下一条消息的起始偏移，如果是则表示主从同步复制已经完成，唤醒消息发送线程，否则等待 ls 再次判断，每一个
         // 任务在一批任务中循环判断 5 次。消息发送者返回有两种情况： 等待超过 5s或者  GroupTransferService 通知主从复制完成，
         // 可以通过 syncFlushTimeout 来设置发送线程等待超时时间。
-        private void doWaitTransfer() {
-            synchronized (this.requestsRead) {
-                if (!this.requestsRead.isEmpty()) {
-                    for (CommitLog.GroupCommitRequest req : this.requestsRead) {
-                        // 判断 Slave 中已成功复制的最大偏移量是否大于等于消息生产者发送消息后消息服务端返回下一条消息的起始偏移
-                        boolean transferOK = HAService.this.push2SlaveMaxOffset.get() >= req.getNextOffset();
-                        // 最多等待 5s
-                        for (int i = 0; !transferOK && i < 5; i++) {
-                            this.notifyTransferObject.waitForRunning(1000);
-                            transferOK = HAService.this.push2SlaveMaxOffset.get() >= req.getNextOffset();
-                        }
-
-                        if (!transferOK) {
-                            log.warn("transfer messsage to slave timeout, " + req.getNextOffset());
-                        }
-                        req.wakeupCustomer(transferOK);
-                    }
-                    this.requestsRead.clear();
+// HAService$GroupTransferService#doWaitTransfer
+private void doWaitTransfer() {
+    synchronized (this.requestsRead) {
+        if (!this.requestsRead.isEmpty()) {
+            for (CommitLog.GroupCommitRequest req : this.requestsRead) {
+                // 判断 Slave 中已成功复制的最大偏移量是否大于等于消息生产者发送消息后消息服务端返回下一条消息的起始偏移
+                boolean transferOK = HAService.this.push2SlaveMaxOffset.get() >= req.getNextOffset();
+                // 最多等待 5s
+                for (int i = 0; !transferOK && i < 5; i++) {
+                    this.notifyTransferObject.waitForRunning(1000);
+                    transferOK = HAService.this.push2SlaveMaxOffset.get() >= req.getNextOffset();
                 }
+
+                if (!transferOK) {
+                    log.warn("transfer messsage to slave timeout, " + req.getNextOffset());
+                }
+                req.wakeupCustomer(transferOK);
             }
+            this.requestsRead.clear();
         }
+    }
+}
 
         public void run() {
             log.info(this.getServiceName() + " service started");
@@ -528,6 +548,7 @@ public class RocketmqHAAnalysis{
             this.haService.getConnectionCount().incrementAndGet();
         }
 
+        // HAConnection#start
         public void start() {
             // 启动 readSocketService 读取 Slave 传过来的数据
             this.readSocketService.start();
@@ -559,6 +580,7 @@ public class RocketmqHAAnalysis{
             this.thread.setDaemon(true);
         }
 
+        // ReadSocketService#run
         @Override
         public void run() {
             HAConnection.log.info(this.getServiceName() + " service started");
@@ -689,6 +711,7 @@ public class RocketmqHAAnalysis{
             this.thread.setDaemon(true);
         }
 
+        // WriteSocketService#run
         @Override
         public void run() {
             HAConnection.log.info(this.getServiceName() + " service started");
@@ -764,7 +787,6 @@ public class RocketmqHAAnalysis{
 
                         long thisOffset = this.nextTransferFromWhere;
                         this.nextTransferFromWhere += size;
-
                         selectResult.getByteBuffer().limit(size);
                         this.selectMappedBufferResult = selectResult;
 
@@ -783,7 +805,6 @@ public class RocketmqHAAnalysis{
                         HAConnection.this.haService.getWaitNotifyObject().allWaitForRunning(100);
                     }
                 } catch (Exception e) {
-
                     HAConnection.log.error(this.getServiceName() + " service has exception.", e);
                     break;
                 }
@@ -812,6 +833,7 @@ public class RocketmqHAAnalysis{
             HAConnection.log.info(this.getServiceName() + " service end");
         }
 
+        // WriteSocketService#transferData
         private boolean transferData() throws Exception {
             int writeSizeZeroTimes = 0;
 
@@ -878,37 +900,10 @@ public class RocketmqHAAnalysis{
 
     public class PullAPIWrapper{
 
-        // 首先从 pullFromWhichNodeTable 缓存表中获取该消息消费队列的 brokerId，如果找到，则返回，否则返回 brokerName 的主节点。
-        // 由此可以看出 pullFromWhichNodeTable 中存放的是消息队列建议从从哪个 Broker 服务器拉取消息的缓存表，
-        // 其存储结构：MessageQueue：AtomicLong，那该信息从何而来呢？
-        //
-        // 原来消息消费拉取线程 PullMessageService 根据 PullRequest 请求从主服务器拉取消息后会返回下一次建议拉取的 brokerId，
-        // 消息消费者线程在收到消息后，会根据主服务器的建议拉取 brokerId 来更新 pullFromWhichNodeTable
-        public long recalculatePullFromWhichNode(final MessageQueue mq) {
-            if (this.isConnectBrokerByUser()) {
-                return this.defaultBrokerId;
-            }
-    
-            AtomicLong suggest = this.pullFromWhichNodeTable.get(mq);
-            if (suggest != null) {
-                return suggest.get();
-            }
-    
-            return MixAll.MASTER_ID;
-        }
-
-        public void updatePullFromWhichNode(final MessageQueue mq, final long brokerId) {
-            AtomicLong suggest = this.pullFromWhichNodeTable.get(mq);
-            if (null == suggest) {
-                this.pullFromWhichNodeTable.put(mq, new AtomicLong(brokerId));
-            } else {
-                suggest.set(brokerId);
-            }
-        }
-
         // RocketMQ 根据 MessageQueue 查找 Broker 地址的唯一依据便是 brokerName，从 RocketMQ 的 Broker 组织实现来看，同一组 Broker(M-S) 服务器，
-        // 其 brokerName 相同，主服务器的 brokerId 为0，从服务器的 brokerId 大于 0，RocketMQ 提供了 MQClientFactory.findBrokerAddressInSubscribe 
+        // 其 brokerName 相同，主服务器的 brokerId 为 0，从服务器的 brokerId 大于 0，RocketMQ 提供了 MQClientFactory.findBrokerAddressInSubscribe 
         // 来实现根据 brokerName、brokerId 查找 Broker 地址
+        // PullAPIWrapper#pullKernelImpl
         public PullResult pullKernelImpl(final MessageQueue mq, final String subExpression, final String expressionType,
                 final long subVersion, final long offset, final int maxNums, final int sysFlag, final long commitOffset,
                 final long brokerSuspendMaxTimeMillis, final long timeoutMillis,
@@ -919,58 +914,55 @@ public class RocketmqHAAnalysis{
                     this.recalculatePullFromWhichNode(mq), false);
             if (null == findBrokerResult) {
                 this.mQClientFactory.updateTopicRouteInfoFromNameServer(mq.getTopic());
-                findBrokerResult = this.mQClientFactory.findBrokerAddressInSubscribe(mq.getBrokerName(),
-                        this.recalculatePullFromWhichNode(mq), false);
+                findBrokerResult = this.mQClientFactory.findBrokerAddressInSubscribe(mq.getBrokerName(), this.recalculatePullFromWhichNode(mq), false);
             }
 
-            if (findBrokerResult != null) {
-                {
-                    // check version
-                    if (!ExpressionType.isTagType(expressionType)
-                            && findBrokerResult.getBrokerVersion() < MQVersion.Version.V4_1_0_SNAPSHOT.ordinal()) {
-                        throw new MQClientException(
-                                "The broker[" + mq.getBrokerName() + ", " + findBrokerResult.getBrokerVersion()
-                                        + "] does not upgrade to support for filter message by " + expressionType,
-                                null);
-                    }
-                }
-                int sysFlagInner = sysFlag;
+            // ignore code
+        }
 
-                if (findBrokerResult.isSlave()) {
-                    sysFlagInner = PullSysFlag.clearCommitOffsetFlag(sysFlagInner);
-                }
-
-                PullMessageRequestHeader requestHeader = new PullMessageRequestHeader();
-                requestHeader.setConsumerGroup(this.consumerGroup);
-                requestHeader.setTopic(mq.getTopic());
-                requestHeader.setQueueId(mq.getQueueId());
-                requestHeader.setQueueOffset(offset);
-                requestHeader.setMaxMsgNums(maxNums);
-                requestHeader.setSysFlag(sysFlagInner);
-                requestHeader.setCommitOffset(commitOffset);
-                requestHeader.setSuspendTimeoutMillis(brokerSuspendMaxTimeMillis);
-                requestHeader.setSubscription(subExpression);
-                requestHeader.setSubVersion(subVersion);
-                requestHeader.setExpressionType(expressionType);
-
-                String brokerAddr = findBrokerResult.getBrokerAddr();
-                if (PullSysFlag.hasClassFilterFlag(sysFlagInner)) {
-                    brokerAddr = computPullFromWhichFilterServer(mq.getTopic(), brokerAddr);
-                }
-
-                PullResult pullResult = this.mQClientFactory.getMQClientAPIImpl().pullMessage(brokerAddr, requestHeader,
-                        timeoutMillis, communicationMode, pullCallback);
-
-                return pullResult;
+        // 首先从 pullFromWhichNodeTable 缓存表中获取该消息消费队列的 brokerId，如果找到，则返回，否则返回 brokerName 的主节点。
+        // 由此可以看出 pullFromWhichNodeTable 中存放的是消息队列建议从从哪个 Broker 服务器拉取消息的缓存表，
+        // 其存储结构：MessageQueue：AtomicLong，那该信息从何而来呢？
+        //
+        // 原来消息消费拉取线程 PullMessageService 根据 PullRequest 请求从主服务器拉取消息后会返回下一次建议拉取的 brokerId，
+        // 消息消费者线程在收到消息后，会根据主服务器的建议拉取 brokerId 来更新 pullFromWhichNodeTable
+        // PullAPIWrapper#recalculatePullFromWhichNode
+        public long recalculatePullFromWhichNode(final MessageQueue mq) {
+            if (this.isConnectBrokerByUser()) {
+                return this.defaultBrokerId;
             }
 
-            throw new MQClientException("The broker[" + mq.getBrokerName() + "] not exist", null);
+            AtomicLong suggest = this.pullFromWhichNodeTable.get(mq);
+            if (suggest != null) {
+                return suggest.get();
+            }
+
+            return MixAll.MASTER_ID;
+        }
+
+        // PullAPIWrapper#processPullResult
+        public PullResult processPullResult(final MessageQueue mq, final PullResult pullResult, final SubscriptionData subscriptionData) {
+            PullResultExt pullResultExt = (PullResultExt) pullResult;
+            this.updatePullFromWhichNode(mq, pullResultExt.getSuggestWhichBrokerId());
+
+            // ignore code
+        }
+
+        // PullAPIWrapper#updatePullFromWhichNode
+        public void updatePullFromWhichNode(final MessageQueue mq, final long brokerId) {
+            AtomicLong suggest = this.pullFromWhichNodeTable.get(mq);
+            if (null == suggest) {
+                this.pullFromWhichNodeTable.put(mq, new AtomicLong(brokerId));
+            } else {
+                suggest.set(brokerId);
+            }
         }
 
     }
 
     public class MQClientInstance{
 
+        // MQClientInstance#findBrokerAddressInSubscribe
         public FindBrokerResult findBrokerAddressInSubscribe(final String brokerName, final long brokerId,
                 final boolean onlyThisBroker) {
 
@@ -987,7 +979,7 @@ public class RocketmqHAAnalysis{
                 slave = brokerId != MixAll.MASTER_ID;
                 found = brokerAddr != null;
 
-                // onlyThisBroker 表明是否必须返回此 BrokerId 的 Broker，如果不是则返回任意一个 SLAVE 节点
+                // onlyThisBroker 表明是否必须返回此 BrokerId 的 Broker，如果不是则返回任意一个节点
                 if (!found && !onlyThisBroker) {
                     Entry<Long, String> entry = map.entrySet().iterator().next();
                     brokerAddr = entry.getValue();
