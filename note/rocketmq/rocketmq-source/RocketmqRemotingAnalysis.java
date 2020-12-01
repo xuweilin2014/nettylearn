@@ -14,6 +14,24 @@ public class RocketmqRemotingAnalysis{
      * 并且都继承了 NettyRemotingAbstract 类。
      */
 
+    /**
+     * rocketmq 消息协议设计与编码
+     * 
+     * 消息分为 4 个部分：
+     * 1.消息长度(总长度, 四个字节存储, 占用一个int类型)
+     * 2.序列化类型&消息头长度(同样占用一个int类型, 第一个字节表示序列化类型, 后面三个字节表示消息头长度)
+     * 3.消息头数据
+     * 4.消息主体数据
+     */
+
+    /**
+     * 通信方式和通信流程
+     * 
+     * RocketMQ支持三种方式的通信：同步、异步和单向（OneWay）
+     * 
+     * Rocketmq 同步通信的流程为：
+     */
+
     public interface RemotingService {
         void start();
     
@@ -60,6 +78,10 @@ public class RocketmqRemotingAnalysis{
 
         private transient byte[] body;
 
+        private static AtomicInteger requestId = new AtomicInteger(0);
+
+        private int opaque = requestId.getAndIncrement();
+        
         public ByteBuffer encode() {
             // 1> header length size
             // length 代表的是消息的总长度，这里的 4 表示的是第二部分的长度，占用一个 int 类型
@@ -127,7 +149,7 @@ public class RocketmqRemotingAnalysis{
             return decode(byteBuffer);
         }
 
-        // 对 byteBuffer 进行解码，这里的 byteBuffer 是前面所说的消息的第 2,3,4 部分，不包括第 1 部分，也就是消息的总长度
+        // 对 byteBuffer 进行解码，这里的 byteBuffer 是前面所说的消息的第 2,3,4 部分，不包括第 1 部分（也就是消息的总长度）
         public static RemotingCommand decode(final ByteBuffer byteBuffer) {
             int length = byteBuffer.limit();
             // 获取第 2 部分，4 个字节，表示消息头的长度（3 个字节）以及消息的序列化类型（1 个字节）
@@ -178,6 +200,438 @@ public class RocketmqRemotingAnalysis{
             return null;
         }
 
+        // 组装 RemotingCommand 传输指令
+        public static RemotingCommand createRequestCommand(int code, CommandCustomHeader customHeader) {
+            RemotingCommand cmd = new RemotingCommand();
+            cmd.setCode(code);
+            cmd.customHeader = customHeader;
+            setCmdVersion(cmd);
+            return cmd;
+        }
+
     }
+
+    public class NettyRemotingClient extends NettyRemotingAbstract implements RemotingClient {
+
+        public NettyRemotingClient(final NettyClientConfig nettyClientConfig) {
+            this(nettyClientConfig, null);
+        }
+
+        public NettyRemotingClient(final NettyClientConfig nettyClientConfig, final ChannelEventListener channelEventListener) {
+            // 调用父类的构造函数，主要设置单向调用和异步调用两种模式下的最大并发数
+            super(nettyClientConfig.getClientOnewaySemaphoreValue(), nettyClientConfig.getClientAsyncSemaphoreValue());
+            this.nettyClientConfig = nettyClientConfig;
+            this.channelEventListener = channelEventListener;
+
+            // 执行用户回调函数的线程数
+            int publicThreadNums = nettyClientConfig.getClientCallbackExecutorThreads();
+            if (publicThreadNums <= 0) {
+                publicThreadNums = 4;
+            }
+
+            // 执行用户回调函数的线程池
+            this.publicExecutor = Executors.newFixedThreadPool(publicThreadNums, new ThreadFactory() {
+                private AtomicInteger threadIndex = new AtomicInteger(0);
+
+                @Override
+                public Thread newThread(Runnable r) {
+                    return new Thread(r, "NettyClientPublicExecutor_" + this.threadIndex.incrementAndGet());
+                }
+            });
+
+            // netty eventLoopGroupWorker
+            this.eventLoopGroupWorker = new NioEventLoopGroup(1, new ThreadFactory() {
+                private AtomicInteger threadIndex = new AtomicInteger(0);
+
+                @Override
+                public Thread newThread(Runnable r) {
+                    return new Thread(r, String.format("NettyClientSelector_%d", this.threadIndex.incrementAndGet()));
+                }
+            });
+
+            if (nettyClientConfig.isUseTLS()) {
+                try {
+                    sslContext = TlsHelper.buildSslContext(true);
+                    log.info("SSL enabled for client");
+                } catch (IOException e) {
+                    log.error("Failed to create SSLContext", e);
+                } catch (CertificateException e) {
+                    log.error("Failed to create SSLContext", e);
+                    throw new RuntimeException("Failed to create SSLContext", e);
+                }
+            }
+        }
+
+        public void start() {
+            // 构建一个 DefaultEventExecutorGroup，使用里面的线程来处理我们注册的 ChannelHandler
+            // 一个 ChannelHandler 都和一个 DefaultEventExecutorGroup 中的一个 EventExecutor 相联系，并且使用
+            // 这个 EventExecutor 来处理 ChannelHandler 中自定义的业务逻辑
+            this.defaultEventExecutorGroup = new DefaultEventExecutorGroup(
+                nettyClientConfig.getClientWorkerThreads(),
+                new ThreadFactory() {
+                    private AtomicInteger threadIndex = new AtomicInteger(0);
+                    @Override
+                    public Thread newThread(Runnable r) {
+                        return new Thread(r, "NettyClientWorkerThread_" + this.threadIndex.incrementAndGet());
+                }
+            });
+    
+            Bootstrap handler = this.bootstrap.group(this.eventLoopGroupWorker).channel(NioSocketChannel.class)
+                .option(ChannelOption.TCP_NODELAY, true)
+                .option(ChannelOption.SO_KEEPALIVE, false)
+                .option(ChannelOption.CONNECT_TIMEOUT_MILLIS, nettyClientConfig.getConnectTimeoutMillis())
+                .option(ChannelOption.SO_SNDBUF, nettyClientConfig.getClientSocketSndBufSize())
+                .option(ChannelOption.SO_RCVBUF, nettyClientConfig.getClientSocketRcvBufSize())
+                .handler(new ChannelInitializer<SocketChannel>() {
+                    @Override
+                    public void initChannel(SocketChannel ch) throws Exception {
+                        ChannelPipeline pipeline = ch.pipeline();
+                        if (nettyClientConfig.isUseTLS()) {
+                            if (null != sslContext) {
+                                pipeline.addFirst(defaultEventExecutorGroup, "sslHandler", sslContext.newHandler(ch.alloc()));
+                                log.info("Prepend SSL handler");
+                            } else {
+                                log.warn("Connections are insecure as SSLContext is null!");
+                            }
+                        }
+                        pipeline.addLast(
+                            defaultEventExecutorGroup,
+                            // 编码 handler
+                            new NettyEncoder(),
+                            // 解码 handler
+                            new NettyDecoder(),
+                            // 心跳检测
+                            new IdleStateHandler(0, 0, nettyClientConfig.getClientChannelMaxIdleTimeSeconds()),
+                            // 连接管理 handler，处理 connect、disconnect、close 等事件，每当对应的事件发生时，比如 CONNECT、CLOSE 等事件，
+                            // 就会将其加入到 NettyEventExecutor 的阻塞队列中，让 ChannelEventListener 对象来具体进行处理
+                            new NettyConnectManageHandler(),
+                            // 处理接收到的 RemotingCommand 消息后的事件, 收到服务器端响应后的相关操作
+                            new NettyClientHandler());
+                    }
+                });
+    
+            // 定时扫描 responseTable，获取返回结果，并且处理超时
+            this.timer.scheduleAtFixedRate(new TimerTask() {
+                @Override
+                public void run() {
+                    try {
+                        NettyRemotingClient.this.scanResponseTable();
+                    } catch (Throwable e) {
+                        log.error("scanResponseTable exception", e);
+                    }
+                }
+            }, 1000 * 3, 1000);
+    
+            if (this.channelEventListener != null) {
+                // nettyConnectManageHandler 将发生的 channel 事件（CONNECT、CLOSE 等）加入到 NettyEventExecutor 的
+                // 事件队列中，然后由 ChannelEventListener 对象不断从队列中读取出来进行对应处理
+                this.nettyEventExecutor.start();
+            }
+        }
+
+        @Override
+        public RemotingCommand invokeSync(String addr, final RemotingCommand request, long timeoutMillis)
+                throws InterruptedException, RemotingConnectException, RemotingSendRequestException,
+                RemotingTimeoutException {
+
+            final Channel channel = this.getAndCreateChannel(addr);
+            // 如果 channel 不为 null，并且这个 channel 依然有效
+            if (channel != null && channel.isActive()) {
+                try {
+                    if (this.rpcHook != null) {
+                        this.rpcHook.doBeforeRequest(addr, request);
+                    }
+                    // 真正执行同步调用，并且阻塞直到返回结果，或者抛出异常
+                    RemotingCommand response = this.invokeSyncImpl(channel, request, timeoutMillis);
+                    if (this.rpcHook != null) {
+                        this.rpcHook.doAfterResponse(RemotingHelper.parseChannelRemoteAddr(channel), request, response);
+                    }
+                    return response;
+                } catch (RemotingSendRequestException e) {
+                    log.warn("invokeSync: send request exception, so close the channel[{}]", addr);
+                    this.closeChannel(addr, channel);
+                    throw e;
+                } catch (RemotingTimeoutException e) {
+                    if (nettyClientConfig.isClientCloseSocketIfTimeout()) {
+                        this.closeChannel(addr, channel);
+                        log.warn("invokeSync: close socket because of timeout, {}ms, {}", timeoutMillis, addr);
+                    }
+                    log.warn("invokeSync: wait response timeout exception, the channel[{}]", addr);
+                    throw e;
+                }
+            } else {
+                this.closeChannel(addr, channel);
+                throw new RemotingConnectException(addr);
+            }
+        }
+
+    }
+
+    class NettyConnectManageHandler extends ChannelDuplexHandler {
+        // 将 CONNECT 事件加入到 NettyEventExecutor 的事件队列中
+        @Override
+        public void connect(ChannelHandlerContext ctx, SocketAddress remoteAddress, SocketAddress localAddress, ChannelPromise promise) throws Exception {
+            final String local = localAddress == null ? "UNKNOWN" : RemotingHelper.parseSocketAddressAddr(localAddress);
+            final String remote = remoteAddress == null ? "UNKNOWN" : RemotingHelper.parseSocketAddressAddr(remoteAddress);
+            log.info("NETTY CLIENT PIPELINE: CONNECT  {} => {}", local, remote);
+
+            super.connect(ctx, remoteAddress, localAddress, promise);
+
+            if (NettyRemotingClient.this.channelEventListener != null) {
+                NettyRemotingClient.this.putNettyEvent(new NettyEvent(NettyEventType.CONNECT, remote, ctx.channel()));
+            }
+        }
+
+        // 将 CLOSE 事件加入到 NettyEventExecutor 的事件队列中
+        @Override
+        public void disconnect(ChannelHandlerContext ctx, ChannelPromise promise) throws Exception {
+            final String remoteAddress = RemotingHelper.parseChannelRemoteAddr(ctx.channel());
+            log.info("NETTY CLIENT PIPELINE: DISCONNECT {}", remoteAddress);
+            closeChannel(ctx.channel());
+            super.disconnect(ctx, promise);
+
+            if (NettyRemotingClient.this.channelEventListener != null) {
+                NettyRemotingClient.this.putNettyEvent(new NettyEvent(NettyEventType.CLOSE, remoteAddress, ctx.channel()));
+            }
+        }
+
+        // 将 CLOSE 事件加入到 NettyEventExecutor 的事件队列中
+        @Override
+        public void close(ChannelHandlerContext ctx, ChannelPromise promise) throws Exception {
+            final String remoteAddress = RemotingHelper.parseChannelRemoteAddr(ctx.channel());
+            log.info("NETTY CLIENT PIPELINE: CLOSE {}", remoteAddress);
+            closeChannel(ctx.channel());
+            super.close(ctx, promise);
+
+            if (NettyRemotingClient.this.channelEventListener != null) {
+                NettyRemotingClient.this.putNettyEvent(new NettyEvent(NettyEventType.CLOSE, remoteAddress, ctx.channel()));
+            }
+        }
+
+        // 将 IDLE 事件加入到 NettyEventExecutor 的事件队列中
+        @Override
+        public void userEventTriggered(ChannelHandlerContext ctx, Object evt) throws Exception {
+            if (evt instanceof IdleStateEvent) {
+                IdleStateEvent event = (IdleStateEvent) evt;
+                if (event.state().equals(IdleState.ALL_IDLE)) {
+                    final String remoteAddress = RemotingHelper.parseChannelRemoteAddr(ctx.channel());
+                    log.warn("NETTY CLIENT PIPELINE: IDLE exception [{}]", remoteAddress);
+                    closeChannel(ctx.channel());
+                    if (NettyRemotingClient.this.channelEventListener != null) {
+                        NettyRemotingClient.this.putNettyEvent(new NettyEvent(NettyEventType.IDLE, remoteAddress, ctx.channel()));
+                    }
+                }
+            }
+
+            ctx.fireUserEventTriggered(evt);
+        }
+
+        // 将 EXCEPTION 事件加入到 NettyEventExecutor 的事件队列中
+        @Override
+        public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) throws Exception {
+            final String remoteAddress = RemotingHelper.parseChannelRemoteAddr(ctx.channel());
+            log.warn("NETTY CLIENT PIPELINE: exceptionCaught {}", remoteAddress);
+            log.warn("NETTY CLIENT PIPELINE: exceptionCaught exception.", cause);
+            closeChannel(ctx.channel());
+            if (NettyRemotingClient.this.channelEventListener != null) {
+                NettyRemotingClient.this.putNettyEvent(new NettyEvent(NettyEventType.EXCEPTION, remoteAddress, ctx.channel()));
+            }
+        }
+    }
+
+    public abstract class NettyRemotingAbstract {
+
+        // This map caches all on-going requests.
+        // responseTable 中保存的 ResponseFuture 代表依然没有收到回复的 request 对应的请求
+        protected final ConcurrentMap<Integer /* opaque */, ResponseFuture> responseTable = new ConcurrentHashMap<Integer, ResponseFuture>(256);
+
+        public void putNettyEvent(final NettyEvent event) {
+            this.nettyEventExecutor.putNettyEvent(event);
+        }
+
+        public RemotingCommand invokeSyncImpl(final Channel channel, final RemotingCommand request, final long timeoutMillis)
+                throws InterruptedException, RemotingSendRequestException, RemotingTimeoutException {
+
+            // opaque 可以看成是 requestId
+            final int opaque = request.getOpaque();
+
+            try {
+                // 创建  ResponseFuture 对象
+                final ResponseFuture responseFuture = new ResponseFuture(opaque, timeoutMillis, null, null);
+                // 根据 opaque 保存 responseFuture，opaque 即 requestId，也就是在 responseTable 中，
+                // 一个 requestId 和一个 responseFuture 一一对应
+                this.responseTable.put(opaque, responseFuture);
+                final SocketAddress addr = channel.remoteAddress();
+
+                // 调用 netty 的 channel 发送请求，并且利用监听回写 response 结果
+                channel.writeAndFlush(request).addListener(new ChannelFutureListener() {
+                    @Override
+                    public void operationComplete(ChannelFuture f) throws Exception {
+                        // 如果请求发送成功，那么就将 responseFuture 的 sendRequest 变量设置为 true，
+                        // 表明发送成功，然后返回
+                        if (f.isSuccess()) {
+                            responseFuture.setSendRequestOK(true);
+                            return;
+                        // 如果请求发送失败，那么就将 responseFuture 的 sendRequest 变量设置为 false，
+                        // 表明数据发送失败。然后继续执行下面的代码，将此 responseFuture 移除掉并且设置发送失败的原因
+                        } else {
+                            responseFuture.setSendRequestOK(false);
+                        }
+
+                        // 将此 responseFuture 从 responseTable 中移除掉
+                        responseTable.remove(opaque);
+                        // 设置发送失败的原因
+                        responseFuture.setCause(f.cause());
+                        // 将 responseFuture 中的 responseCommand 设置为 null，也就是表明没有返回结果
+                        // 然后唤醒正在阻塞等待返回结果的线程
+                        responseFuture.putResponse(null);
+                        log.warn("send a request command to channel <" + addr + "> failed.");
+                    }
+                });
+
+                // 等待 responseFuture 的返回结果
+                RemotingCommand responseCommand = responseFuture.waitResponse(timeoutMillis);
+                // 根据
+                if (null == responseCommand) {
+                    if (responseFuture.isSendRequestOK()) {
+                        throw new RemotingTimeoutException();
+                    } else {
+                        throw new RemotingSendRequestException();
+                    }
+                }
+
+                return responseCommand;
+            } finally {
+                // 根据 responseFuture 对应的 opaque，从 responseTable 中删除这个 responseFuture 对象
+                this.responseTable.remove(opaque);
+            }
+        }
+
+    }
+
+    class NettyEventExecutor extends ServiceThread {
+
+        private final LinkedBlockingQueue<NettyEvent> eventQueue = new LinkedBlockingQueue<NettyEvent>();
+        private final int maxSize = 10000;
+
+        // 将 Channel 发生的事件加入到队列 eventQueue 中
+        public void putNettyEvent(final NettyEvent event) {
+            if (this.eventQueue.size() <= maxSize) {
+                this.eventQueue.add(event);
+            } else {
+                log.warn("event queue size[{}] enough, so drop this event {}", this.eventQueue.size(), event.toString());
+            }
+        }
+
+        @Override
+        public void run() {
+            log.info(this.getServiceName() + " service started");
+
+            final ChannelEventListener listener = NettyRemotingAbstract.this.getChannelEventListener();
+
+            // 不断循环从 eventQueue 中获取事件，然后根据事件来进行处理
+            while (!this.isStopped()) {
+                try {
+                    NettyEvent event = this.eventQueue.poll(3000, TimeUnit.MILLISECONDS);
+                    if (event != null && listener != null) {
+                        switch (event.getType()) {
+                            case IDLE:
+                                listener.onChannelIdle(event.getRemoteAddr(), event.getChannel());
+                                break;
+                            case CLOSE:
+                                listener.onChannelClose(event.getRemoteAddr(), event.getChannel());
+                                break;
+                            case CONNECT:
+                                listener.onChannelConnect(event.getRemoteAddr(), event.getChannel());
+                                break;
+                            case EXCEPTION:
+                                listener.onChannelException(event.getRemoteAddr(), event.getChannel());
+                                break;
+                            default:
+                                break;
+
+                        }
+                    }
+                } catch (Exception e) {
+                    log.warn(this.getServiceName() + " service has exception. ", e);
+                }
+            }
+
+            log.info(this.getServiceName() + " service end");
+        }
+    }
+
+    public class MQClientAPIImpl {
+
+        public MQClientAPIImpl(final NettyClientConfig nettyClientConfig, final ClientRemotingProcessor clientRemotingProcessor, RPCHook rpcHook,
+                final ClientConfig clientConfig) {
+
+            this.clientConfig = clientConfig;
+            topAddressing = new TopAddressing(MixAll.getWSAddr(), clientConfig.getUnitName());
+            this.remotingClient = new NettyRemotingClient(nettyClientConfig, null);
+            this.clientRemotingProcessor = clientRemotingProcessor;
+
+            this.remotingClient.registerRPCHook(rpcHook);
+            this.remotingClient.registerProcessor(RequestCode.CHECK_TRANSACTION_STATE, this.clientRemotingProcessor, null);
+            this.remotingClient.registerProcessor(RequestCode.NOTIFY_CONSUMER_IDS_CHANGED, this.clientRemotingProcessor, null);
+            this.remotingClient.registerProcessor(RequestCode.RESET_CONSUMER_CLIENT_OFFSET, this.clientRemotingProcessor, null);
+            this.remotingClient.registerProcessor(RequestCode.GET_CONSUMER_STATUS_FROM_CLIENT, this.clientRemotingProcessor, null);
+            this.remotingClient.registerProcessor(RequestCode.GET_CONSUMER_RUNNING_INFO, this.clientRemotingProcessor, null);
+            this.remotingClient.registerProcessor(RequestCode.CONSUME_MESSAGE_DIRECTLY, this.clientRemotingProcessor, null);
+        }
+
+        public TopicRouteData getTopicRouteInfoFromNameServer(final String topic, final long timeoutMillis,
+                boolean allowTopicNotExist) throws MQClientException, InterruptedException, RemotingTimeoutException,
+                RemotingSendRequestException, RemotingConnectException {
+            // 创建一个命令特有的消息头对象
+            GetRouteInfoRequestHeader requestHeader = new GetRouteInfoRequestHeader();
+            requestHeader.setTopic(topic);
+            // 组装 RemotingCommand 传输指令，其实也就是将创建好的 customHeader（这里是 GetRouteInfoRequestHeader）
+            // 以及 code（这里是 RequestCode.GET_ROUTEINTO_BY_TOPIC）设置到 RemotingCommand 中。
+            RemotingCommand request = RemotingCommand.createRequestCommand(RequestCode.GET_ROUTEINTO_BY_TOPIC, requestHeader);
+
+            // 调用 invokeSync
+            RemotingCommand response = this.remotingClient.invokeSync(null, request, timeoutMillis);
+            assert response != null;
+            switch (response.getCode()) {
+            case ResponseCode.TOPIC_NOT_EXIST: {
+                if (allowTopicNotExist && !topic.equals(MixAll.DEFAULT_TOPIC)) {
+                    log.warn("get Topic [{}] RouteInfoFromNameServer is not exist value", topic);
+                }
+                break;
+            }
+            case ResponseCode.SUCCESS: {
+                byte[] body = response.getBody();
+                if (body != null) {
+                    return TopicRouteData.decode(body, TopicRouteData.class);
+                }
+            }
+            default:
+                break;
+            }
+
+            throw new MQClientException(response.getCode(), response.getRemark());
+        }
+
+    }
+
+    public class GetRouteInfoRequestHeader implements CommandCustomHeader {
+        @CFNotNull
+        private String topic;
+    
+        @Override
+        public void checkFields() throws RemotingCommandException {
+        }
+    
+        public String getTopic() {
+            return topic;
+        }
+    
+        public void setTopic(String topic) {
+            this.topic = topic;
+        }
+    }
+
+    
 
 }
