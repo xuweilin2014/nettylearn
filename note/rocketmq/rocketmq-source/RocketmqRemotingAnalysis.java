@@ -125,6 +125,44 @@ public class RocketmqRemotingAnalysis{
             return result;
         }
 
+        public ByteBuffer encodeHeader() {
+            return encodeHeader(this.body != null ? this.body.length : 0);
+        }
+    
+        public ByteBuffer encodeHeader(final int bodyLength) {
+            // 1> header length size
+            // length 代表的是消息的总长度，这里的 4 表示的是第二部分的长度，占用一个 int 类型
+            int length = 4;
+    
+            // 2> header data length
+            // length 加上了消息头具体数据的长度，也就是第 3 部分的长度
+            byte[] headerData;
+            headerData = this.headerEncode();
+            length += headerData.length;
+    
+            // 3> body data length
+            // length 加上了消息体中具体数据的长度，也就是第 4 部分的长度，到这里 length 等于第 2,3,4 部分的长度之和
+            length += bodyLength;
+            // 分配的长度目前包括: 总长度域(4) + 消息头长度域(4) + 消息头内容
+            ByteBuffer result = ByteBuffer.allocate(4 + length - bodyLength);
+    
+            // length
+            // 保存总长度
+            result.putInt(length);
+    
+            // header length
+            // 放入第 2 部分，4 个字节，第 1 个字节表示序列化类型，后面 3 个字节表示消息头的长度
+            result.put(markProtocolType(headerData.length, serializeTypeCurrentRPC));
+    
+            // header data
+            // 保存消息头数据
+            result.put(headerData);
+    
+            result.flip();
+    
+            return result;
+        }
+
         public static byte[] markProtocolType(int source, SerializeType type) {
             byte[] result = new byte[4];
     
@@ -209,6 +247,178 @@ public class RocketmqRemotingAnalysis{
             return cmd;
         }
 
+    }
+
+    public class NettyEncoder extends MessageToByteEncoder<RemotingCommand> {
+        private static final Logger log = LoggerFactory.getLogger(RemotingHelper.ROCKETMQ_REMOTING);
+    
+        @Override
+        public void encode(ChannelHandlerContext ctx, RemotingCommand remotingCommand, ByteBuf out)
+            throws Exception {
+            try {
+                ByteBuffer header = remotingCommand.encodeHeader();
+                out.writeBytes(header);
+                byte[] body = remotingCommand.getBody();
+                if (body != null) {
+                    out.writeBytes(body);
+                }
+            } catch (Exception e) {
+                log.error("encode exception, " + RemotingHelper.parseChannelRemoteAddr(ctx.channel()), e);
+                if (remotingCommand != null) {
+                    log.error(remotingCommand.toString());
+                }
+                RemotingUtil.closeChannel(ctx.channel());
+            }
+        }
+    }
+
+    public class NettyRemotingServer extends NettyRemotingAbstract implements RemotingServer {
+
+        public NettyRemotingServer(final NettyServerConfig nettyServerConfig) {
+            this(nettyServerConfig, null);
+        }
+
+        public NettyRemotingServer(final NettyServerConfig nettyServerConfig, final ChannelEventListener channelEventListener) {
+            
+            super(nettyServerConfig.getServerOnewaySemaphoreValue(), nettyServerConfig.getServerAsyncSemaphoreValue());
+            this.serverBootstrap = new ServerBootstrap();
+            this.nettyServerConfig = nettyServerConfig;
+            this.channelEventListener = channelEventListener;
+
+            int publicThreadNums = nettyServerConfig.getServerCallbackExecutorThreads();
+            if (publicThreadNums <= 0) {
+                publicThreadNums = 4;
+            }
+
+            this.publicExecutor = Executors.newFixedThreadPool(publicThreadNums, new ThreadFactory() {
+                private AtomicInteger threadIndex = new AtomicInteger(0);
+                @Override
+                public Thread newThread(Runnable r) {
+                    return new Thread(r, "NettyServerPublicExecutor_" + this.threadIndex.incrementAndGet());
+                }
+            });
+
+            this.eventLoopGroupBoss = new NioEventLoopGroup(1, new ThreadFactory() {
+                private AtomicInteger threadIndex = new AtomicInteger(0);
+                @Override
+                public Thread newThread(Runnable r) {
+                    return new Thread(r, String.format("NettyBoss_%d", this.threadIndex.incrementAndGet()));
+                }
+            });
+
+            if (useEpoll()) {
+                // bossGroup
+                this.eventLoopGroupSelector = new EpollEventLoopGroup(nettyServerConfig.getServerSelectorThreads(),
+                        new ThreadFactory() {
+                            private AtomicInteger threadIndex = new AtomicInteger(0);
+                            private int threadTotal = nettyServerConfig.getServerSelectorThreads();
+                            @Override
+                            public Thread newThread(Runnable r) {
+                                return new Thread(r, String.format("NettyServerEPOLLSelector_%d_%d", threadTotal, this.threadIndex.incrementAndGet()));
+                            }});
+            } else {
+                // workerGroup
+                this.eventLoopGroupSelector = new NioEventLoopGroup(nettyServerConfig.getServerSelectorThreads(),
+                        new ThreadFactory() {
+                            private AtomicInteger threadIndex = new AtomicInteger(0);
+                            private int threadTotal = nettyServerConfig.getServerSelectorThreads();
+
+                            @Override
+                            public Thread newThread(Runnable r) {
+                                return new Thread(r, String.format("NettyServerNIOSelector_%d_%d", threadTotal, this.threadIndex.incrementAndGet()));
+                            }
+                        });
+            }
+
+            // 省略代码
+        }
+
+        @Override
+        public void start() {
+
+            this.defaultEventExecutorGroup = new DefaultEventExecutorGroup(nettyServerConfig.getServerWorkerThreads(),
+                    new ThreadFactory() {
+                        private AtomicInteger threadIndex = new AtomicInteger(0);
+                        @Override
+                        public Thread newThread(Runnable r) {
+                            return new Thread(r, "NettyServerCodecThread_" + this.threadIndex.incrementAndGet());
+                        }
+                });
+
+            ServerBootstrap childHandler = this.serverBootstrap
+                    .group(this.eventLoopGroupBoss, this.eventLoopGroupSelector)
+                    .channel(useEpoll() ? EpollServerSocketChannel.class : NioServerSocketChannel.class)
+                    .option(ChannelOption.SO_BACKLOG, 1024).option(ChannelOption.SO_REUSEADDR, true)
+                    .option(ChannelOption.SO_KEEPALIVE, false).childOption(ChannelOption.TCP_NODELAY, true)
+                    .childOption(ChannelOption.SO_SNDBUF, nettyServerConfig.getServerSocketSndBufSize())
+                    .childOption(ChannelOption.SO_RCVBUF, nettyServerConfig.getServerSocketRcvBufSize())
+                    .localAddress(new InetSocketAddress(this.nettyServerConfig.getListenPort()))
+                    .childHandler(new ChannelInitializer<SocketChannel>() {
+                        @Override
+                        public void initChannel(SocketChannel ch) throws Exception {
+                            ch.pipeline().addLast(defaultEventExecutorGroup, HANDSHAKE_HANDLER_NAME, new HandshakeHandler(TlsSystemConfig.tlsMode))
+                                         .addLast(defaultEventExecutorGroup, new NettyEncoder(), new NettyDecoder(),
+                                            new IdleStateHandler(0, 0, nettyServerConfig.getServerChannelMaxIdleTimeSeconds()),
+                                            new NettyConnectManageHandler(), new NettyServerHandler());
+                        }
+                    });
+
+            if (nettyServerConfig.isServerPooledByteBufAllocatorEnable()) {
+                childHandler.childOption(ChannelOption.ALLOCATOR, PooledByteBufAllocator.DEFAULT);
+            }
+
+            try {
+                ChannelFuture sync = this.serverBootstrap.bind().sync();
+                InetSocketAddress addr = (InetSocketAddress) sync.channel().localAddress();
+                this.port = addr.getPort();
+            } catch (InterruptedException e1) {
+                throw new RuntimeException("this.serverBootstrap.bind().sync() InterruptedException", e1);
+            }
+
+            if (this.channelEventListener != null) {
+                this.nettyEventExecutor.start();
+            }
+
+            this.timer.scheduleAtFixedRate(new TimerTask() {
+                @Override
+                public void run() {
+                    try {
+                        NettyRemotingServer.this.scanResponseTable();
+                    } catch (Throwable e) {
+                        log.error("scanResponseTable exception", e);
+                    }
+                }
+            }, 1000 * 3, 1000);
+        }
+
+        @Override
+        public RemotingCommand invokeSync(final Channel channel, final RemotingCommand request, final long timeoutMillis)
+                throws InterruptedException, RemotingSendRequestException, RemotingTimeoutException {
+            // 调用 NettyRemotingAbstract 中的 invokeSyncImpl 方法
+            return this.invokeSyncImpl(channel, request, timeoutMillis);
+        }
+
+        @Override
+        public void invokeAsync(Channel channel, RemotingCommand request, long timeoutMillis,
+                InvokeCallback invokeCallback) throws InterruptedException, RemotingTooMuchRequestException,
+                RemotingTimeoutException, RemotingSendRequestException {
+            this.invokeAsyncImpl(channel, request, timeoutMillis, invokeCallback);
+        }
+
+    }
+
+    class NettyServerHandler extends SimpleChannelInboundHandler<RemotingCommand> {
+        @Override
+        protected void channelRead0(ChannelHandlerContext ctx, RemotingCommand msg) throws Exception {
+            processMessageReceived(ctx, msg);
+        }
+    }
+
+    class NettyClientHandler extends SimpleChannelInboundHandler<RemotingCommand> {
+        @Override
+        protected void channelRead0(ChannelHandlerContext ctx, RemotingCommand msg) throws Exception {
+            processMessageReceived(ctx, msg);
+        }
     }
 
     public class NettyRemotingClient extends NettyRemotingAbstract implements RemotingClient {
@@ -331,8 +541,7 @@ public class RocketmqRemotingAnalysis{
 
         @Override
         public RemotingCommand invokeSync(String addr, final RemotingCommand request, long timeoutMillis)
-                throws InterruptedException, RemotingConnectException, RemotingSendRequestException,
-                RemotingTimeoutException {
+                throws InterruptedException, RemotingConnectException, RemotingSendRequestException, RemotingTimeoutException {
 
             final Channel channel = this.getAndCreateChannel(addr);
             // 如果 channel 不为 null，并且这个 channel 依然有效
@@ -348,16 +557,9 @@ public class RocketmqRemotingAnalysis{
                     }
                     return response;
                 } catch (RemotingSendRequestException e) {
-                    log.warn("invokeSync: send request exception, so close the channel[{}]", addr);
-                    this.closeChannel(addr, channel);
-                    throw e;
+                    // 省略代码
                 } catch (RemotingTimeoutException e) {
-                    if (nettyClientConfig.isClientCloseSocketIfTimeout()) {
-                        this.closeChannel(addr, channel);
-                        log.warn("invokeSync: close socket because of timeout, {}ms, {}", timeoutMillis, addr);
-                    }
-                    log.warn("invokeSync: wait response timeout exception, the channel[{}]", addr);
-                    throw e;
+                    // 省略代码
                 }
             } else {
                 this.closeChannel(addr, channel);
@@ -365,6 +567,27 @@ public class RocketmqRemotingAnalysis{
             }
         }
 
+        @Override
+        public void invokeAsync(String addr, RemotingCommand request, long timeoutMillis, InvokeCallback invokeCallback)
+                throws InterruptedException, RemotingConnectException, RemotingTooMuchRequestException,
+                RemotingTimeoutException, RemotingSendRequestException {
+            final Channel channel = this.getAndCreateChannel(addr);
+            if (channel != null && channel.isActive()) {
+                try {
+                    if (this.rpcHook != null) {
+                        this.rpcHook.doBeforeRequest(addr, request);
+                    }
+                    this.invokeAsyncImpl(channel, request, timeoutMillis, invokeCallback);
+                } catch (RemotingSendRequestException e) {
+                    log.warn("invokeAsync: send request exception, so close the channel[{}]", addr);
+                    this.closeChannel(addr, channel);
+                    throw e;
+                }
+            } else {
+                this.closeChannel(addr, channel);
+                throw new RemotingConnectException(addr);
+            }
+        }
     }
 
     class NettyConnectManageHandler extends ChannelDuplexHandler {
@@ -449,6 +672,112 @@ public class RocketmqRemotingAnalysis{
             this.nettyEventExecutor.putNettyEvent(event);
         }
 
+        public void processMessageReceived(ChannelHandlerContext ctx, RemotingCommand msg) throws Exception {
+            final RemotingCommand cmd = msg;
+            if (cmd != null) {
+                switch (cmd.getType()) {
+                    case REQUEST_COMMAND:
+                        processRequestCommand(ctx, cmd);
+                        break;
+                    case RESPONSE_COMMAND:
+                        processResponseCommand(ctx, cmd);
+                        break;
+                    default:
+                        break;
+                }
+            }
+        }
+
+        public void processResponseCommand(ChannelHandlerContext ctx, RemotingCommand cmd) {
+            // 获取到 response 中的 opaque，这个 opaque 其实就是 request 中的 requestId
+            final int opaque = cmd.getOpaque();
+            // 根据这个 opaque 从 responseTable 中取出 responseFuture
+            final ResponseFuture responseFuture = responseTable.get(opaque);
+            if (responseFuture != null) {
+                responseFuture.setResponseCommand(cmd);
+                responseTable.remove(opaque);
+                // 如果 responseFuture 对象中有回调，那么就会执行回调函数，回调一般在异步调用中使用
+                if (responseFuture.getInvokeCallback() != null) {
+                    executeInvokeCallback(responseFuture);
+                } else {
+                    // 唤醒阻塞等待请求响应结果的线程
+                    responseFuture.putResponse(cmd);
+                    responseFuture.release();
+                }
+            } else {
+                log.warn("receive response, but not matched any request, " + RemotingHelper.parseChannelRemoteAddr(ctx.channel()));
+                log.warn(cmd.toString());
+            }
+        }
+
+        public void processRequestCommand(final ChannelHandlerContext ctx, final RemotingCommand cmd) {
+            // 根据 RemotingCommand 中的 code 获取到 processor 和 executorService
+            final Pair<NettyRequestProcessor, ExecutorService> matched = this.processorTable.get(cmd.getCode());
+            final Pair<NettyRequestProcessor, ExecutorService> pair = null == matched ? this.defaultRequestProcessor : matched;
+            final int opaque = cmd.getOpaque();
+    
+            if (pair != null) {
+                Runnable run = new Runnable() {
+                    @Override
+                    public void run() {
+                        try {
+                            RPCHook rpcHook = NettyRemotingAbstract.this.getRPCHook();
+                            if (rpcHook != null) {
+                                rpcHook.doBeforeRequest(RemotingHelper.parseChannelRemoteAddr(ctx.channel()), cmd);
+                            }
+                            // 使用 processor 来处理这个 RemotingCommand 请求
+                            final RemotingCommand response = pair.getObject1().processRequest(ctx, cmd);
+                            if (rpcHook != null) {
+                                rpcHook.doAfterResponse(RemotingHelper.parseChannelRemoteAddr(ctx.channel()), cmd, response);
+                            }
+    
+                            if (!cmd.isOnewayRPC()) {
+                                if (response != null) {
+                                    response.setOpaque(opaque);
+                                    response.markResponseType();
+                                    try {
+                                        // 将 response 对象发送回客户端
+                                        ctx.writeAndFlush(response);
+                                    } catch (Throwable e) {
+                                        log.error("process request over, but response failed", e);
+                                        log.error(cmd.toString());
+                                        log.error(response.toString());
+                                    }
+                                } else {
+                                }
+                            }
+                        } catch (Throwable e) {
+                            // 省略代码
+                        }
+                    }
+                };
+    
+                if (pair.getObject1().rejectRequest()) {
+                    final RemotingCommand response = RemotingCommand.createResponseCommand(RemotingSysResponseCode.SYSTEM_BUSY,
+                        "[REJECTREQUEST]system busy, start flow control for a while");
+                    response.setOpaque(opaque);
+                    ctx.writeAndFlush(response);
+                    return;
+                }
+    
+                try {
+                    // 将上面的 run 任务（实现了 Runnable 接口）封装成一个 task 提交到线程池中去执行，并且这个线程池和这个 processor 是成对的
+                    final RequestTask requestTask = new RequestTask(run, ctx.channel(), cmd);
+                    pair.getObject2().submit(requestTask);
+                } catch (RejectedExecutionException e) {
+                    // 省略代码
+                }
+            } else {
+                String error = " request type " + cmd.getCode() + " not supported";
+                final RemotingCommand response =
+                    RemotingCommand.createResponseCommand(RemotingSysResponseCode.REQUEST_CODE_NOT_SUPPORTED, error);
+                response.setOpaque(opaque);
+                ctx.writeAndFlush(response);
+                log.error(RemotingHelper.parseChannelRemoteAddr(ctx.channel()) + error);
+            }
+        }
+
+        // 同步转异步，同步调用模式依然是采用异步方式完成的
         public RemotingCommand invokeSyncImpl(final Channel channel, final RemotingCommand request, final long timeoutMillis)
                 throws InterruptedException, RemotingSendRequestException, RemotingTimeoutException {
 
@@ -491,10 +820,12 @@ public class RocketmqRemotingAnalysis{
 
                 // 等待 responseFuture 的返回结果
                 RemotingCommand responseCommand = responseFuture.waitResponse(timeoutMillis);
-                // 根据
+                // 如果 responseCommand 为 null，表明没有接收到服务器端的返回值
                 if (null == responseCommand) {
+                    // 为 true，表明请求发送成功，但是等待服务端响应超时
                     if (responseFuture.isSendRequestOK()) {
                         throw new RemotingTimeoutException();
+                    // 为 false，表明是发送请求失败
                     } else {
                         throw new RemotingSendRequestException();
                     }
@@ -504,6 +835,100 @@ public class RocketmqRemotingAnalysis{
             } finally {
                 // 根据 responseFuture 对应的 opaque，从 responseTable 中删除这个 responseFuture 对象
                 this.responseTable.remove(opaque);
+            }
+        }
+
+        public void invokeAsyncImpl(final Channel channel, final RemotingCommand request, final long timeoutMillis,
+                final InvokeCallback invokeCallback) throws InterruptedException, RemotingTooMuchRequestException,
+                RemotingTimeoutException, RemotingSendRequestException {
+            final int opaque = request.getOpaque();
+            boolean acquired = this.semaphoreAsync.tryAcquire(timeoutMillis, TimeUnit.MILLISECONDS);
+            if (acquired) {
+                final SemaphoreReleaseOnlyOnce once = new SemaphoreReleaseOnlyOnce(this.semaphoreAsync);
+
+                final ResponseFuture responseFuture = new ResponseFuture(opaque, timeoutMillis, invokeCallback, once);
+                this.responseTable.put(opaque, responseFuture);
+                try {
+                    channel.writeAndFlush(request).addListener(new ChannelFutureListener() {
+                        @Override
+                        public void operationComplete(ChannelFuture f) throws Exception {
+                            if (f.isSuccess()) {
+                                responseFuture.setSendRequestOK(true);
+                                return;
+                            } else {
+                                responseFuture.setSendRequestOK(false);
+                            }
+
+                            responseFuture.putResponse(null);
+                            responseTable.remove(opaque);
+                            try {
+                                executeInvokeCallback(responseFuture);
+                            } catch (Throwable e) {
+                                log.warn("excute callback in writeAndFlush addListener, and callback throw", e);
+                            } finally {
+                                responseFuture.release();
+                            }
+
+                            log.warn("send a request command to channel <{}> failed.",
+                                    RemotingHelper.parseChannelRemoteAddr(channel));
+                        }
+                    });
+                } catch (Exception e) {
+                    responseFuture.release();
+                    log.warn("send a request command to channel <" + RemotingHelper.parseChannelRemoteAddr(channel)
+                            + "> Exception", e);
+                    throw new RemotingSendRequestException(RemotingHelper.parseChannelRemoteAddr(channel), e);
+                }
+            } else {
+                if (timeoutMillis <= 0) {
+                    throw new RemotingTooMuchRequestException("invokeAsyncImpl invoke too fast");
+                } else {
+                    String info = String.format(
+                            "invokeAsyncImpl tryAcquire semaphore timeout, %dms, waiting thread nums: %d semaphoreAsyncValue: %d",
+                            timeoutMillis, this.semaphoreAsync.getQueueLength(),
+                            this.semaphoreAsync.availablePermits());
+                    log.warn(info);
+                    throw new RemotingTimeoutException(info);
+                }
+            }
+        }
+
+        /**
+         * Execute callback in callback executor. If callback executor is null, run directly in current thread
+         */
+        private void executeInvokeCallback(final ResponseFuture responseFuture) {
+            boolean runInThisThread = false;
+            ExecutorService executor = this.getCallbackExecutor();
+            if (executor != null) {
+                try {
+                    executor.submit(new Runnable() {
+                        @Override
+                        public void run() {
+                            try {
+                                responseFuture.executeInvokeCallback();
+                            } catch (Throwable e) {
+                                log.warn("execute callback in executor exception, and callback throw", e);
+                            } finally {
+                                responseFuture.release();
+                            }
+                        }
+                    });
+                } catch (Exception e) {
+                    runInThisThread = true;
+                    log.warn("execute callback in executor exception, maybe executor busy", e);
+                }
+            } else {
+                runInThisThread = true;
+            }
+    
+            if (runInThisThread) {
+                try {
+                    responseFuture.executeInvokeCallback();
+                } catch (Throwable e) {
+                    log.warn("executeInvokeCallback Exception", e);
+                } finally {
+                    responseFuture.release();
+                }
             }
         }
 
@@ -629,6 +1054,34 @@ public class RocketmqRemotingAnalysis{
     
         public void setTopic(String topic) {
             this.topic = topic;
+        }
+    }
+
+    public class ResponseFuture {
+
+        public ResponseFuture(int opaque, long timeoutMillis, InvokeCallback invokeCallback, SemaphoreReleaseOnlyOnce once) {
+            this.opaque = opaque;
+            this.timeoutMillis = timeoutMillis;
+            this.invokeCallback = invokeCallback;
+            this.once = once;
+        }
+
+        public RemotingCommand waitResponse(final long timeoutMillis) throws InterruptedException {
+            this.countDownLatch.await(timeoutMillis, TimeUnit.MILLISECONDS);
+            return this.responseCommand;
+        }
+    
+        public void putResponse(final RemotingCommand responseCommand) {
+            this.responseCommand = responseCommand;
+            this.countDownLatch.countDown();
+        }
+
+        public void executeInvokeCallback() {
+            if (invokeCallback != null) {
+                if (this.executeCallbackOnlyOnce.compareAndSet(false, true)) {
+                    invokeCallback.operationComplete(this);
+                }
+            }
         }
     }
 
