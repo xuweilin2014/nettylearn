@@ -34,9 +34,9 @@ public class RocketmqRemotingAnalysis{
 
     public interface RemotingService {
         void start();
-    
+
         void shutdown();
-    
+
         void registerRPCHook(RPCHook rpcHook);
     }
 
@@ -77,10 +77,25 @@ public class RocketmqRemotingAnalysis{
     public static class RemotingCommand {
 
         private transient byte[] body;
-
+        // 对于 request 而言，是请求操作码，应答方根据不同的请求码进行不同的业务处理
+        // 对于 response 而言，是应答响应码。0 表示成功，非 0 则表示各种错误
+        private int code;
+        // 对于 request 而言，是请求方实现的语言
+        // 对于 response 而言，是应答方实现的语言
+        private LanguageCode language = LanguageCode.JAVA;
+        // 对于 request 而言，是请求方程序的版本
+        // 对于 response 而言，是应答方程序的版本
+        private int version = 0;
         private static AtomicInteger requestId = new AtomicInteger(0);
-
+        // 对于 request 而言，相当于 reqeustId，在同一个连接上的不同请求标识码，与响应消息中的相对应
+        // 对于 response 而言，应答不做修改直接返回
         private int opaque = requestId.getAndIncrement();
+        // 对于 request 和 response 来说都是区分是普通的 rpc 还是 oneway rpc 的标志
+        private int flag = 0;
+        // 传输自定义文本信息
+        private String remark;
+        // 请求自定义扩展信息
+        private HashMap<String, String> extFields;
         
         public ByteBuffer encode() {
             // 1> header length size
@@ -157,7 +172,6 @@ public class RocketmqRemotingAnalysis{
             // header data
             // 保存消息头数据
             result.put(headerData);
-    
             result.flip();
     
             return result;
@@ -249,6 +263,41 @@ public class RocketmqRemotingAnalysis{
 
     }
 
+    public class NettyDecoder extends LengthFieldBasedFrameDecoder {
+
+        private static final Logger log = LoggerFactory.getLogger(RemotingHelper.ROCKETMQ_REMOTING);
+    
+        private static final int FRAME_MAX_LENGTH =
+            Integer.parseInt(System.getProperty("com.rocketmq.remoting.frameMaxLength", "16777216"));
+    
+        public NettyDecoder() {
+            super(FRAME_MAX_LENGTH, 0, 4, 0, 4);
+        }
+    
+        @Override
+        public Object decode(ChannelHandlerContext ctx, ByteBuf in) throws Exception {
+            ByteBuf frame = null;
+            try {
+                frame = (ByteBuf) super.decode(ctx, in);
+                if (null == frame) {
+                    return null;
+                }
+    
+                ByteBuffer byteBuffer = frame.nioBuffer();
+                return RemotingCommand.decode(byteBuffer);
+            } catch (Exception e) {
+                log.error("decode exception, " + RemotingHelper.parseChannelRemoteAddr(ctx.channel()), e);
+                RemotingUtil.closeChannel(ctx.channel());
+            } finally {
+                if (null != frame) {
+                    frame.release();
+                }
+            }
+    
+            return null;
+        }
+    }
+
     public class NettyEncoder extends MessageToByteEncoder<RemotingCommand> {
         private static final Logger log = LoggerFactory.getLogger(RemotingHelper.ROCKETMQ_REMOTING);
     
@@ -256,8 +305,11 @@ public class RocketmqRemotingAnalysis{
         public void encode(ChannelHandlerContext ctx, RemotingCommand remotingCommand, ByteBuf out)
             throws Exception {
             try {
+                // 对消息的第 1,2,3 部分进行编码，也就是：消息总长度域、消息头长度&序列化方式域、消息头数据
+                // 其实就是将这三部分编码成字节流，写入到 ByteBuffer 中，然后在写入到 Channel 中
                 ByteBuffer header = remotingCommand.encodeHeader();
                 out.writeBytes(header);
+                // 由于在 RemotingCommand 中消息体本身就是字节数组形式，所以直接获取，然后写入
                 byte[] body = remotingCommand.getBody();
                 if (body != null) {
                     out.writeBytes(body);
@@ -672,6 +724,7 @@ public class RocketmqRemotingAnalysis{
             this.nettyEventExecutor.putNettyEvent(event);
         }
 
+        // NettyRemotingAbstract#processMessageReceived
         public void processMessageReceived(ChannelHandlerContext ctx, RemotingCommand msg) throws Exception {
             final RemotingCommand cmd = msg;
             if (cmd != null) {
@@ -780,7 +833,6 @@ public class RocketmqRemotingAnalysis{
         // 同步转异步，同步调用模式依然是采用异步方式完成的
         public RemotingCommand invokeSyncImpl(final Channel channel, final RemotingCommand request, final long timeoutMillis)
                 throws InterruptedException, RemotingSendRequestException, RemotingTimeoutException {
-
             // opaque 可以看成是 requestId
             final int opaque = request.getOpaque();
 
@@ -792,7 +844,7 @@ public class RocketmqRemotingAnalysis{
                 this.responseTable.put(opaque, responseFuture);
                 final SocketAddress addr = channel.remoteAddress();
 
-                // 调用 netty 的 channel 发送请求，并且利用监听回写 response 结果
+                // 调用 channel#writeAndFlush 将前面组装好的 RemotingCommand 请求发送出去，并且利用监听回写 response 结果
                 channel.writeAndFlush(request).addListener(new ChannelFutureListener() {
                     @Override
                     public void operationComplete(ChannelFuture f) throws Exception {
@@ -811,8 +863,7 @@ public class RocketmqRemotingAnalysis{
                         responseTable.remove(opaque);
                         // 设置发送失败的原因
                         responseFuture.setCause(f.cause());
-                        // 将 responseFuture 中的 responseCommand 设置为 null，也就是表明没有返回结果
-                        // 然后唤醒正在阻塞等待返回结果的线程
+                        // 将 responseFuture 中的 responseCommand 设置为 null，也就是表明没有返回结果，然后唤醒正在阻塞等待返回结果的线程
                         responseFuture.putResponse(null);
                         log.warn("send a request command to channel <" + addr + "> failed.");
                     }
@@ -1005,6 +1056,7 @@ public class RocketmqRemotingAnalysis{
             this.remotingClient.registerProcessor(RequestCode.CONSUME_MESSAGE_DIRECTLY, this.clientRemotingProcessor, null);
         }
 
+        // MQClientAPIImpl#getTopicRouteInfoFromNameServer
         public TopicRouteData getTopicRouteInfoFromNameServer(final String topic, final long timeoutMillis,
                 boolean allowTopicNotExist) throws MQClientException, InterruptedException, RemotingTimeoutException,
                 RemotingSendRequestException, RemotingConnectException {
@@ -1018,16 +1070,21 @@ public class RocketmqRemotingAnalysis{
             // 调用 invokeSync
             RemotingCommand response = this.remotingClient.invokeSync(null, request, timeoutMillis);
             assert response != null;
+            // 在 request 中，code 表示的是请求的类型，server 会根据相应的请求类型来调用 processor 进行处理
+            // 在 response 中，code 表示的请求在 server 端处理的结果
             switch (response.getCode()) {
+            // 如果路由信息不存在
             case ResponseCode.TOPIC_NOT_EXIST: {
                 if (allowTopicNotExist && !topic.equals(MixAll.DEFAULT_TOPIC)) {
                     log.warn("get Topic [{}] RouteInfoFromNameServer is not exist value", topic);
                 }
                 break;
             }
+            // 如果获取路由信息成功
             case ResponseCode.SUCCESS: {
                 byte[] body = response.getBody();
                 if (body != null) {
+                    // 将 response 中的 body 字节流解码
                     return TopicRouteData.decode(body, TopicRouteData.class);
                 }
             }
