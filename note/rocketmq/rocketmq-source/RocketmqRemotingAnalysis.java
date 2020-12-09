@@ -741,6 +741,7 @@ public class RocketmqRemotingAnalysis{
             }
         }
 
+        // NettyRemotingAbstract#processResponseCommand
         public void processResponseCommand(ChannelHandlerContext ctx, RemotingCommand cmd) {
             // 获取到 response 中的 opaque，这个 opaque 其实就是 request 中的 requestId
             final int opaque = cmd.getOpaque();
@@ -1056,6 +1057,10 @@ public class RocketmqRemotingAnalysis{
             this.remotingClient.registerProcessor(RequestCode.CONSUME_MESSAGE_DIRECTLY, this.clientRemotingProcessor, null);
         }
 
+        public TopicRouteData getTopicRouteInfoFromNameServer(final String topic, final long timeoutMillis) throws Exception {
+            return getTopicRouteInfoFromNameServer(topic, timeoutMillis, true);
+        }
+
         // MQClientAPIImpl#getTopicRouteInfoFromNameServer
         public TopicRouteData getTopicRouteInfoFromNameServer(final String topic, final long timeoutMillis,
                 boolean allowTopicNotExist) throws MQClientException, InterruptedException, RemotingTimeoutException,
@@ -1093,6 +1098,55 @@ public class RocketmqRemotingAnalysis{
             }
 
             throw new MQClientException(response.getCode(), response.getRemark());
+        }
+
+        // rocketmq 客户端进行消息发送的入口是 MQClientAPIImpl#sendMessage。请求命令是 RequestCode.SEND_MESSAGE
+        public SendResult sendMessage(final String addr, final String brokerName, final Message msg,
+                final SendMessageRequestHeader requestHeader, final long timeoutMillis,
+                final CommunicationMode communicationMode, final SendCallback sendCallback,
+                final TopicPublishInfo topicPublishInfo, final MQClientInstance instance,
+                final int retryTimesWhenSendFailed, final SendMessageContext context,
+                final DefaultMQProducerImpl producer)
+                throws RemotingException, MQBrokerException, InterruptedException {
+
+            RemotingCommand request = null;
+            if (sendSmartMsg || msg instanceof MessageBatch) {
+                SendMessageRequestHeaderV2 requestHeaderV2 = SendMessageRequestHeaderV2.createSendMessageRequestHeaderV2(requestHeader);
+                request = RemotingCommand.createRequestCommand(
+                        msg instanceof MessageBatch ? RequestCode.SEND_BATCH_MESSAGE : RequestCode.SEND_MESSAGE_V2,
+                        requestHeaderV2);
+            } else {
+                request = RemotingCommand.createRequestCommand(RequestCode.SEND_MESSAGE, requestHeader);
+            }
+
+            request.setBody(msg.getBody());
+
+            switch (communicationMode) {
+
+            // 单向发送是指消息生产者调用消息发送的 API ，无须等待消息服务器返回本次消息发送结果，并且无须提供回调函数，
+            // 表示消息发送压根就不关心本次消息发送是否成功，其实现原理与异步消息发送相同，只是消息发送客户端在收到响应结果后什么都不做而已，
+            // 并且没有重试机制
+            case ONEWAY:
+                this.remotingClient.invokeOneway(addr, request, timeoutMillis);
+                return null;
+
+            // 消息异步发送是指消息生产者调用发送的 API 后，无须阻塞等待消息服务器返回本次消息发送结果，只需要提供一个回调函数，
+            // 供消息发送客户端在收到响应结果回调。异步方式相比同步方式，消息发送端的发送性能会显著提高，但为了保护消息服务器的负载压力，
+            // RocketMQ 对消息发送的异步消息进行了井发控制，通过参数 clientAsyncSemaphoreValue 来控制，默认为 65535
+            case ASYNC:
+                final AtomicInteger times = new AtomicInteger();
+                this.sendMessageAsync(addr, brokerName, msg, timeoutMillis, request, sendCallback, topicPublishInfo,
+                        instance, retryTimesWhenSendFailed, times, context, producer);
+                return null;
+                
+            case SYNC:
+                return this.sendMessageSync(addr, brokerName, msg, timeoutMillis, request);
+            default:
+                assert false;
+                break;
+            }
+
+            return null;
         }
 
     }

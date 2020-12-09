@@ -1360,12 +1360,13 @@ public class NameServerAnalysis{
     }
 
     public class TopicRouteData extends RemotingSerializable {
-
         private String orderTopicConf;
+        // topic 分布的队列的元数据
         private List<QueueData> queueDatas;
+        // topic 分布的 Broker 的元数据
         private List<BrokerData> brokerDatas;
+        // broker 上的过滤服务器的列表
         private HashMap<String/* brokerAddr */, List<String>/* Filter Server */> filterServerTable;
-
     }
 
     // 当 NameServer 和 Broker 的长连接断掉之后，onChannelDestroy 函数会被调用，把这个 Broker 的信息清理出去
