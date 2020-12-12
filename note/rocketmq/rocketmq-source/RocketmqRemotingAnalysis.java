@@ -1149,6 +1149,59 @@ public class RocketmqRemotingAnalysis{
             return null;
         }
 
+        public SendResult sendMessage(final String addr, final String brokerName, final Message msg,
+                final SendMessageRequestHeader requestHeader, final long timeoutMillis,
+                final CommunicationMode communicationMode, final SendMessageContext context,
+                final DefaultMQProducerImpl producer) throws RemotingException, MQBrokerException, InterruptedException {
+            return sendMessage(addr, brokerName, msg, requestHeader, timeoutMillis, communicationMode, null, null, null, 0, context, producer);
+        }
+
+        public SendResult sendMessage(final String addr, final String brokerName, final Message msg,
+                final SendMessageRequestHeader requestHeader, final long timeoutMillis,
+                final CommunicationMode communicationMode, final SendCallback sendCallback,
+                final TopicPublishInfo topicPublishInfo, final MQClientInstance instance,
+                final int retryTimesWhenSendFailed, final SendMessageContext context,
+                final DefaultMQProducerImpl producer) throws RemotingException, MQBrokerException, InterruptedException {
+
+            RemotingCommand request = null;
+            if (sendSmartMsg || msg instanceof MessageBatch) {
+                SendMessageRequestHeaderV2 requestHeaderV2 = SendMessageRequestHeaderV2.createSendMessageRequestHeaderV2(requestHeader);
+                request = RemotingCommand.createRequestCommand(
+                    msg instanceof MessageBatch ? RequestCode.SEND_BATCH_MESSAGE : RequestCode.SEND_MESSAGE_V2, requestHeaderV2);
+            } else {
+                // 请求的命令是 RequestCode.SEND_MESSAGE，该类型的命令由 SendMessageProcessor 进行处理
+                request = RemotingCommand.createRequestCommand(RequestCode.SEND_MESSAGE, requestHeader);
+            }
+
+            request.setBody(msg.getBody());
+
+            // 根据消息发送方式，同步、异步、单向方式进行网络传输
+            switch (communicationMode) {
+            case ONEWAY:
+                this.remotingClient.invokeOneway(addr, request, timeoutMillis);
+                return null;
+            case ASYNC:
+                final AtomicInteger times = new AtomicInteger();
+                this.sendMessageAsync(addr, brokerName, msg, timeoutMillis, request, sendCallback, topicPublishInfo,
+                        instance, retryTimesWhenSendFailed, times, context, producer);
+                return null;
+            case SYNC:
+                return this.sendMessageSync(addr, brokerName, msg, timeoutMillis, request);
+            default:
+                assert false;
+                break;
+            }
+
+            return null;
+        }
+
+        private SendResult sendMessageSync(final String addr, final String brokerName, final Message msg,
+                final long timeoutMillis, final RemotingCommand request) throws RemotingException, MQBrokerException, InterruptedException {
+            RemotingCommand response = this.remotingClient.invokeSync(addr, request, timeoutMillis);
+            assert response != null;
+            return this.processSendResponse(brokerName, msg, response);
+        }
+
     }
 
     public class GetRouteInfoRequestHeader implements CommandCustomHeader {

@@ -152,6 +152,16 @@ public class RocketmqProducer{
         // 允许发送的最大消息长度，默认为 4M ，该值最大值为 2^32-1
         private int maxMessageSize = 1024 * 1024 * 4; // 4M
 
+        public DefaultMQProducer() {
+            this(MixAll.DEFAULT_PRODUCER_GROUP, null);
+        }
+
+        public DefaultMQProducer(final String producerGroup, RPCHook rpcHook) {
+            this.producerGroup = producerGroup;
+            // DefaultMQProducer 中包装了 DefaultMQProducerImpl
+            defaultMQProducerImpl = new DefaultMQProducerImpl(this, rpcHook);
+        }
+
         // 查找该 topic 下的所有消息队列
         @Override
         public List<MessageQueue> fetchPublishMessageQueues(String topic) throws MQClientException {
@@ -259,7 +269,13 @@ public class RocketmqProducer{
 
         private final ConcurrentMap<String/* topic */, TopicPublishInfo> topicPublishInfoTable = new ConcurrentHashMap<String, TopicPublishInfo>();
 
+        public DefaultMQProducerImpl(final DefaultMQProducer defaultMQProducer, RPCHook rpcHook) {
+            this.defaultMQProducer = defaultMQProducer;
+            this.rpcHook = rpcHook;
+        }
+
         // 以同步状态发送消息，默认的超时时间为 3s
+        // DefaultMQProducerImpl#send
         public SendResult send(Message msg, long timeout) throws MQClientException, RemotingException, MQBrokerException, InterruptedException {
             return this.sendDefaultImpl(msg, CommunicationMode.SYNC, null, timeout);
         }
@@ -271,7 +287,9 @@ public class RocketmqProducer{
          * 2.查找路由
          * 3.消息发送（包含异常发送机制）
          */
-        private SendResult sendDefaultImpl(Message msg, final CommunicationMode communicationMode, final SendCallback sendCallback, final long timeout) throws MQClientException{
+        // MQClientInstance#sendDefaultImpl
+        private SendResult sendDefaultImpl(Message msg, final CommunicationMode communicationMode, final SendCallback sendCallback, final long timeout) 
+                                    throws MQClientException{
             // 消息发送之前，首先确保生产者处于运行状态
             this.makeSureStateOK();
             // 对消息进行验证，具体就是检查消息的主题，消息对象不能为 null，消息体的长度不能等于 0，且不能大于消息的最大长度 4MB
@@ -328,46 +346,26 @@ public class RocketmqProducer{
                                 default:
                                     break;
                             }
-                         
+                            
                         // 消息发送的过程中出现异常的话，更新 faultItemTable，也就是更新当前 Broker 的故障状态
                         } catch (RemotingException e) {
                             endTimestamp = System.currentTimeMillis();
                             this.updateFaultItem(mq.getBrokerName(), endTimestamp - beginTimestampPrev, true);
-                            log.warn(msg.toString());
-                            exception = e;
+                            // 省略代码
                             continue;
                         } catch (MQClientException e) {
                             endTimestamp = System.currentTimeMillis();
                             this.updateFaultItem(mq.getBrokerName(), endTimestamp - beginTimestampPrev, true);
-                            log.warn(msg.toString());
-                            exception = e;
+                            // 省略代码
                             continue;
                         } catch (MQBrokerException e) {
                             endTimestamp = System.currentTimeMillis();
                             this.updateFaultItem(mq.getBrokerName(), endTimestamp - beginTimestampPrev, true);
-                            log.warn(msg.toString());
-                            exception = e;
-                            switch (e.getResponseCode()) {
-                            case ResponseCode.TOPIC_NOT_EXIST:
-                            case ResponseCode.SERVICE_NOT_AVAILABLE:
-                            case ResponseCode.SYSTEM_ERROR:
-                            case ResponseCode.NO_PERMISSION:
-                            case ResponseCode.NO_BUYER_ID:
-                            case ResponseCode.NOT_IN_CURRENT_UNIT:
-                                continue;
-                            default:
-                                if (sendResult != null) {
-                                    return sendResult;
-                                }
-
-                                throw e;
-                            }
+                            // 省略代码
                         } catch (InterruptedException e) {
                             endTimestamp = System.currentTimeMillis();
                             this.updateFaultItem(mq.getBrokerName(), endTimestamp - beginTimestampPrev, false);
-                            log.warn(msg.toString());
-                            log.warn("sendKernelImpl exception", e);
-                            log.warn(msg.toString());
+                            // 省略代码
                             throw e;
                         }
                     } else {
@@ -408,6 +406,16 @@ public class RocketmqProducer{
             throw new MQClientException().setResponseCode(ClientErrorCode.NOT_FOUND_TOPIC_EXCEPTION);
         }
 
+        /**
+         * 
+         * @param msg 待发送的消息
+         * @param mq 消息将发送到该队列上
+         * @param communicationMode 消息发送模式，SYNC、ASYNC、ONEWAY
+         * @param sendCallback 异步消息回调函数
+         * @param topicPublishInfo 主题路由信息
+         * @param timeout 消息发送超时时间
+         */
+        // DefaultMQProducerImpl#sendKernelImpl 方法
         private SendResult sendKernelImpl(final Message msg, final MessageQueue mq, final CommunicationMode communicationMode, final SendCallback sendCallback,
                 final TopicPublishInfo topicPublishInfo, final long timeout)
                 throws MQClientException, RemotingException, MQBrokerException, InterruptedException {
@@ -488,6 +496,8 @@ public class RocketmqProducer{
                     }
 
                     SendResult sendResult = null;
+
+                    // 根据消息发送方式，同步、异步、单向方式进行网络传输
                     switch (communicationMode) {
                         case ASYNC:
                             sendResult = this.mQClientFactory.getMQClientAPIImpl().sendMessage(brokerAddr,
@@ -529,6 +539,7 @@ public class RocketmqProducer{
          * DefaultMQProducerImpl#createTopicKey，也就是 "TBW102" 去查询，这个时候如果 BrokerConfig#autoCreateTopicEnable 为 true 时，
          * NameServer 将返回路由信息，如果 autoCreateTopicEnab 为 false 时，将抛出无法找到 topic 路由异常
          */
+        // DefaultMQProducerImpl#tryToFindTopicPublishInfo
         private TopicPublishInfo tryToFindTopicPublishInfo(final String topic) {
             TopicPublishInfo topicPublishInfo = this.topicPublishInfoTable.get(topic);
             // 如果没有缓存路由信息
@@ -538,7 +549,7 @@ public class RocketmqProducer{
                 this.mQClientFactory.updateTopicRouteInfoFromNameServer(topic);
                 topicPublishInfo = this.topicPublishInfoTable.get(topic);
             }
-    
+
             // 如果生产者中缓存了 topic 的路由信息，或者向 NameServer 发送请求查询到了路由信息的话，则直接返回该路由信息。
             if (topicPublishInfo.isHaveTopicRouterInfo() || topicPublishInfo.ok()) {
                 return topicPublishInfo;
@@ -650,6 +661,7 @@ public class RocketmqProducer{
          * 1) sendLatencyFaultEnable=false，默认不启用 Broker 故障延迟机制
          * 2) sendLatencyFaultEnable=true，启用 Broker 故障延迟机制
          */
+        // MQFaultStrategy#selectOneMessageQueue
         public MessageQueue selectOneMessageQueue(final TopicPublishInfo tpInfo, final String lastBrokerName) {
             // 启动 Broker 的故障延迟机制
             if (this.sendLatencyFaultEnable) {
@@ -661,13 +673,13 @@ public class RocketmqProducer{
                         if (pos < 0)
                             pos = 0;
                         MessageQueue mq = tpInfo.getMessageQueueList().get(pos);
-                        // 通过 isAvailable 方法验证消息队列是否可用
+                        // 通过 isAvailable 方法验证消息队列 mq 是否可用，其实就是判断这个 mq 所属的 Broker 是否可用
                         if (latencyFaultTolerance.isAvailable(mq.getBrokerName())) {
                             if (null == lastBrokerName || mq.getBrokerName().equals(lastBrokerName))
                                 return mq;
                         }
                     }
-    
+
                     // 选择一个相对较好的 Broker，并且获得其对应的一个消息队列，不考虑该队列的可用性
                     final String notBestBroker = latencyFaultTolerance.pickOneAtLeast();
                     int writeQueueNums = tpInfo.getQueueIdByBroker(notBestBroker);
@@ -687,7 +699,7 @@ public class RocketmqProducer{
                 // 选择一个消息队列，不考虑队列的可用性
                 return tpInfo.selectOneMessageQueue();
             }
-    
+
             // 不启用 Broker 的故障延迟机制，选择一个消息队列，不考虑队列的可用性，只要消息队列的名称不等于 lastBrokerName
             return tpInfo.selectOneMessageQueue(lastBrokerName);
         }
@@ -706,7 +718,7 @@ public class RocketmqProducer{
         }
     
         // computeNotAvailableDuration 的作用是计算因本次消息发送故障需要将 Broker 规避的时长，也就是接下来多长时间内
-        // 该 Broker 不参与消息发送队列的负载
+        // 该 Broker 不参与消息发送队列的选择
         // 
         // latencyMax，根据 currentLatency 本次消息的发送延迟，从 latencyMax 尾部向前找到第一个比 currentLatency 
         // 小的索引 index，如果没有找到，返回 0，然后根据这个索引从 notAvailableDuration 数组中取出对应的时间，
@@ -788,11 +800,14 @@ public class RocketmqProducer{
         }
 
         // 根据 broker 名称从缓存表中获取 FaultItem，如果找到则更新 FaultItem，否则创建 FaultItem
+        // LatencyFaultToleranceImpl#updateFaultItem
         @Override
         public void updateFaultItem(final String name, final long currentLatency, final long notAvailableDuration) {
             FaultItem old = this.faultItemTable.get(name);
             if (null == old) {
                 final FaultItem faultItem = new FaultItem(name);
+                // 如果 isolation 为 false 的话，currentLatency 为发送消息到 Broker 所消耗的时间
+                // 如果 isolation 为 true 的话，currentLatency 为默认的 30s
                 faultItem.setCurrentLatency(currentLatency);
                 // 设置的 startTime 为当前系统时间 + 需要进行故障规避的时长，也就是 Broker 可以重新启用的时间点
                 faultItem.setStartTimestamp(System.currentTimeMillis() + notAvailableDuration);
@@ -842,15 +857,43 @@ public class RocketmqProducer{
     }
 
     class FaultItem implements Comparable<FaultItem> {
-
+        // broker name，也就是这个 FaultItem 对应的 Broker 的名称
         private final String name;
         // 本次消息发送的延迟，其实就是从发送消息，到消息发送完毕所花费的时间
         private volatile long currentLatency;
         //  startTimestamp 表示此 Broker 可以启用的时间
         private volatile long startTimestamp;
+
         // 如果现在的时间戳 > Broker 可以启用的时间戳，就表明已经过了 Broker 故障延迟的时间，可以启用
+        // FaultItem#isAvailable
         public boolean isAvailable() {
             return (System.currentTimeMillis() - startTimestamp) >= 0;
+        }
+
+        // FaultItem 是可以进行排序的，并且可用性越高（startTimestamp 越小，currentLatency 越小，可用性越高）
+        @Override
+        public int compareTo(final FaultItem other) {
+            if (this.isAvailable() != other.isAvailable()) {
+                if (this.isAvailable())
+                    return -1;
+
+                if (other.isAvailable())
+                    return 1;
+            }
+
+            if (this.currentLatency < other.currentLatency)
+                return -1;
+            else if (this.currentLatency > other.currentLatency) {
+                return 1;
+            }
+
+            if (this.startTimestamp < other.startTimestamp)
+                return -1;
+            else if (this.startTimestamp > other.startTimestamp) {
+                return 1;
+            }
+
+            return 0;
         }
 
     }
@@ -894,8 +937,8 @@ public class RocketmqProducer{
     public class ClientConfig {
 
         // 为 MQClientInstance 创建一个 clientId，也就是 IP + @ + instanceName
+        // ClientConfig#buildMQClientId
         public String buildMQClientId() {
-
             StringBuilder sb = new StringBuilder();
             sb.append(this.getClientIP());
     
@@ -905,7 +948,6 @@ public class RocketmqProducer{
                 sb.append("@");
                 sb.append(this.unitName);
             }
-    
             return sb.toString();
         }
     }
@@ -913,11 +955,14 @@ public class RocketmqProducer{
     public class SendMessageProcessor extends AbstractSendMessageProcessor implements NettyRequestProcessor {
 
         @Override
+        // SendMessageProcessor#processRequest
         public RemotingCommand processRequest(ChannelHandlerContext ctx, RemotingCommand request) throws RemotingCommandException {
             SendMessageContext mqtraceContext;
             switch (request.getCode()) {
+            // RequestCode.CONSUMER_SEND_MSG_BACK 由下面的方法处理
             case RequestCode.CONSUMER_SEND_MSG_BACK:
                 return this.consumerSendMsgBack(ctx, request);
+            // RequestCode.SEND_MESSAGE 以及其它的 RequestCode 由下面的方法进行处理
             default:
                 SendMessageRequestHeader requestHeader = parseRequestHeader(request);
                 if (requestHeader == null) {
@@ -937,6 +982,147 @@ public class RocketmqProducer{
                 this.executeSendMessageHookAfter(response, mqtraceContext);
                 return response;
             }
+        }
+
+        // SendMessageProcessor#sendMessage
+        private RemotingCommand sendMessage(final ChannelHandlerContext ctx, final RemotingCommand request, final SendMessageContext sendMessageContext, 
+                final SendMessageRequestHeader requestHeader) throws RemotingCommandException {
+
+            final RemotingCommand response = RemotingCommand.createResponseCommand(SendMessageResponseHeader.class);
+            final SendMessageResponseHeader responseHeader = (SendMessageResponseHeader) response.readCustomHeader();
+            // opaque 等同于 requestId，将其保存到 response 中
+            response.setOpaque(request.getOpaque());
+
+            response.addExtField(MessageConst.PROPERTY_MSG_REGION, this.brokerController.getBrokerConfig().getRegionId());
+            response.addExtField(MessageConst.PROPERTY_TRACE_SWITCH, String.valueOf(this.brokerController.getBrokerConfig().isTraceOn()));
+
+            log.debug("receive SendMessage request command, {}", request);
+            // startTimestamp 表示 Broker 可以开始获取请求的时间戳
+            final long startTimstamp = this.brokerController.getBrokerConfig().getStartAcceptSendRequestTimeStamp();
+            if (this.brokerController.getMessageStore().now() < startTimstamp) {
+                response.setCode(ResponseCode.SYSTEM_ERROR);
+                response.setRemark(String.format("broker unable to service, until %s", UtilAll.timeMillisToHumanString2(startTimstamp)));
+                return response;
+            }
+
+            response.setCode(-1);
+            // 进行对应的检查
+            // 1.检查该 Broker 是否有写权限
+            // 2.检查该 topic 是否可以进行消息发送，主要针对默认主题，默认主题不能发送消息，仅仅用于路由查找
+            // 3.在 NameServer 端存储主题的配置信息，默认路径是 ${ROCKET_HOME}/store/config/topic.json
+            // 4.检查队列 id，如果队列 id 不合法，返回错误码
+            super.msgCheck(ctx, requestHeader, response);
+            if (response.getCode() != -1) {
+                return response;
+            }
+
+            final byte[] body = request.getBody();
+
+            int queueIdInt = requestHeader.getQueueId();
+            TopicConfig topicConfig = this.brokerController.getTopicConfigManager().selectTopicConfig(requestHeader.getTopic());
+
+            if (queueIdInt < 0) {
+                queueIdInt = Math.abs(this.random.nextInt() % 99999999) % topicConfig.getWriteQueueNums();
+            }
+
+            MessageExtBrokerInner msgInner = new MessageExtBrokerInner();
+            msgInner.setTopic(requestHeader.getTopic());
+            msgInner.setQueueId(queueIdInt);
+            
+            // 如果消息的重试次数超过允许的最大重试次数，消息将进入到 DLQ 延迟队列，延迟队列的主题为：%DLQ% + 消费组名
+            if (!handleRetryAndDLQ(requestHeader, response, request, msgInner, topicConfig)) {
+                return response;
+            }
+
+            // 将 Message 中的消息保存到 MessageExtBrokerInner 中
+            msgInner.setBody(body);
+            msgInner.setFlag(requestHeader.getFlag());
+            MessageAccessor.setProperties(msgInner, MessageDecoder.string2messageProperties(requestHeader.getProperties()));
+            msgInner.setPropertiesString(requestHeader.getProperties());
+            msgInner.setBornTimestamp(requestHeader.getBornTimestamp());
+            msgInner.setBornHost(ctx.channel().remoteAddress());
+            msgInner.setStoreHost(this.getStoreHost());
+            msgInner.setReconsumeTimes(requestHeader.getReconsumeTimes() == null ? 0 : requestHeader.getReconsumeTimes());
+
+            if (this.brokerController.getBrokerConfig().isRejectTransactionMessage()) {
+                String traFlag = msgInner.getProperty(MessageConst.PROPERTY_TRANSACTION_PREPARED);
+                if (traFlag != null) {
+                    response.setCode(ResponseCode.NO_PERMISSION);
+                    response.setRemark("the broker[" + this.brokerController.getBrokerConfig().getBrokerIP1() + "] sending transaction message is forbidden");
+                    return response;
+                }
+            }
+            // 调用 DefaultMessageStore#putMessage 进行消息存储，
+            PutMessageResult putMessageResult = this.brokerController.getMessageStore().putMessage(msgInner);
+
+            return handlePutMessageResult(putMessageResult, response, request, msgInner, responseHeader, sendMessageContext, ctx, queueIdInt);
+        }
+
+    }
+
+    public abstract class AbstractSendMessageProcessor implements NettyRequestProcessor {
+
+        protected RemotingCommand msgCheck(final ChannelHandlerContext ctx, final SendMessageRequestHeader requestHeader, final RemotingCommand response) {
+            // 检查该 Broker 是否有写权限
+            if (!PermName.isWriteable(this.brokerController.getBrokerConfig().getBrokerPermission())
+                    && this.brokerController.getTopicConfigManager().isOrderTopic(requestHeader.getTopic())) {
+                response.setCode(ResponseCode.NO_PERMISSION);
+                response.setRemark("the broker[" + this.brokerController.getBrokerConfig().getBrokerIP1() + "] sending message is forbidden");
+                return response;
+            }
+
+            // 检查该 topic 是否可以进行消息发送，也就是该 topic 与 rocketmq 中的默认主题 TBW102 是否重复
+            if (!this.brokerController.getTopicConfigManager().isTopicCanSendMessage(requestHeader.getTopic())) {
+                String errorMsg = "the topic[" + requestHeader.getTopic() + "] is conflict with system reserved words.";
+                log.warn(errorMsg);
+                response.setCode(ResponseCode.SYSTEM_ERROR);
+                response.setRemark(errorMsg);
+                return response;
+            }
+
+            TopicConfig topicConfig = this.brokerController.getTopicConfigManager().selectTopicConfig(requestHeader.getTopic());
+            if (null == topicConfig) {
+                int topicSysFlag = 0;
+                if (requestHeader.isUnitMode()) {
+                    if (requestHeader.getTopic().startsWith(MixAll.RETRY_GROUP_TOPIC_PREFIX)) {
+                        topicSysFlag = TopicSysFlag.buildSysFlag(false, true);
+                    } else {
+                        topicSysFlag = TopicSysFlag.buildSysFlag(true, false);
+                    }
+                }
+
+                log.warn("the topic {} not exist, producer: {}", requestHeader.getTopic(), ctx.channel().remoteAddress());
+                topicConfig = this.brokerController.getTopicConfigManager().createTopicInSendMessageMethod(
+                        requestHeader.getTopic(), requestHeader.getDefaultTopic(),
+                        RemotingHelper.parseChannelRemoteAddr(ctx.channel()), requestHeader.getDefaultTopicQueueNums(),
+                        topicSysFlag);
+
+                if (null == topicConfig) {
+                    if (requestHeader.getTopic().startsWith(MixAll.RETRY_GROUP_TOPIC_PREFIX)) {
+                        topicConfig = this.brokerController.getTopicConfigManager().createTopicInSendMessageBackMethod(
+                                requestHeader.getTopic(), 1, PermName.PERM_WRITE | PermName.PERM_READ, topicSysFlag);
+                    }
+                }
+
+                if (null == topicConfig) {
+                    response.setCode(ResponseCode.TOPIC_NOT_EXIST);
+                    response.setRemark("topic[" + requestHeader.getTopic() + "] not exist, apply first please!" + FAQUrl.suggestTodo(FAQUrl.APPLY_TOPIC_URL));
+                    return response;
+                }
+            }
+
+            // 获取到消息应该发送到的 queueId
+            int queueIdInt = requestHeader.getQueueId();
+            int idValid = Math.max(topicConfig.getWriteQueueNums(), topicConfig.getReadQueueNums());
+            // 检查队列 id，如果队列 id 不合法，就直接返回错误码
+            if (queueIdInt >= idValid) {
+                String errorInfo = String.format("request queueId[%d] is illegal, %s Producer: %s", queueIdInt, topicConfig.toString(), RemotingHelper.parseChannelRemoteAddr(ctx.channel()));
+                log.warn(errorInfo);
+                response.setCode(ResponseCode.SYSTEM_ERROR);
+                response.setRemark(errorInfo);
+                return response;
+            }
+            return response;
         }
 
     }

@@ -729,12 +729,13 @@ public class RocketmqPushConsumerAnalysis{
                     case CREATE_JUST:
                         this.serviceState = ServiceState.START_FAILED;
                         // If not specified,looking address from name server
+                        // 如果 NameServer 为空，尝试从 http server 中获取 namesrv 地址，这里看出适合于有统一配置中心的系统
                         if (null == this.clientConfig.getNamesrvAddr()) {
                             this.mQClientAPIImpl.fetchNameServerAddr();
                         }
                         // Start request-response channel
                         // 启动 MQClientAPIImpl，其实也就是启动 remotingClient，
-                        // 在 Producer/Consumer/Broker 中，remotingClient 真正用来进行通信
+                        // 在 Producer/Consumer/Broker 中，remotingClient 真正用来对方进行通信
                         this.mQClientAPIImpl.start();
                         // Start various schedule tasks
                         // 开启定时任务：
@@ -744,7 +745,7 @@ public class RocketmqPushConsumerAnalysis{
                         // 4.定时保存消费进度
                         // 5.根据负载调整本地处理消息的线程池 corePool 大小
                         this.startScheduledTask();
-                        // 启动 PullMessageService
+                        // 启动 PullMessageService，开启拉消息服务
                         this.pullMessageService.start();
                         // 启动 rebalance service，最终会调用 RebalanceImpl 类对象，来给 Consumer 重新调整和分配 queue，触发 rebalance 的情况如下：
                         // 
@@ -1010,6 +1011,125 @@ public class RocketmqPushConsumerAnalysis{
             }
 
             return false;
+        }
+
+        // 在发送消息时，调用此方法获取到 Broker 的具体 ip 地址，注意这里是获取 Master Broker 的地址，不是 Slave 的地址
+        public String findBrokerAddressInPublish(final String brokerName) {
+            HashMap<Long/* brokerId */, String/* address */> map = this.brokerAddrTable.get(brokerName);
+            if (map != null && !map.isEmpty()) {
+                return map.get(MixAll.MASTER_ID);
+            }
+            return null;
+        }
+
+        // MQClientInstance#sendHeartbeatToAllBrokerWithLock
+        public void sendHeartbeatToAllBrokerWithLock() {
+            if (this.lockHeartbeat.tryLock()) {
+                try {
+                    // 将此 Consumer 和 Producer 中的信息发送到所有的 Broker
+                    this.sendHeartbeatToAllBroker();
+                    this.uploadFilterClassSource();
+                } catch (final Exception e) {
+                    log.error("sendHeartbeatToAllBroker exception", e);
+                } finally {
+                    this.lockHeartbeat.unlock();
+                }
+            } else {
+                log.warn("lock heartBeat, but failed.");
+            }
+        }
+
+        // MQClientInstance#sendHeartbeatToAllBroker
+        private void sendHeartbeatToAllBroker() {
+            // 在发送心跳包到所有的 Broker 之前（包括 Master 和 Slave），先收集好 Producer 和 Consumer 的必要的信息。
+            final HeartbeatData heartbeatData = this.prepareHeartbeatData();
+            final boolean producerEmpty = heartbeatData.getProducerDataSet().isEmpty();
+            final boolean consumerEmpty = heartbeatData.getConsumerDataSet().isEmpty();
+            // 如果 producer 和 consumer 的数据都为空，那么则直接返回
+            if (producerEmpty && consumerEmpty) {
+                log.warn("sending heartbeat, but no consumer and no producer");
+                return;
+            }
+
+            if (!this.brokerAddrTable.isEmpty()) {
+                long times = this.sendHeartbeatTimesTotal.getAndIncrement();
+                // 获取到所有 Broker 组的地址，一个 Broker 组 = 一个 Master Broker 和多个 Slave Broker，一个 Broker 组的名称都是一样的
+                Iterator<Entry<String, HashMap<Long, String>>> it = this.brokerAddrTable.entrySet().iterator();
+                while (it.hasNext()) {
+                    Entry<String, HashMap<Long, String>> entry = it.next();
+                    String brokerName = entry.getKey();
+                    HashMap<Long, String> oneTable = entry.getValue();
+                    if (oneTable != null) {
+                        // 一个 entry1 表示一个 Broker 组中一个 Broker 的 id 和地址
+                        for (Map.Entry<Long, String> entry1 : oneTable.entrySet()) {
+                            Long id = entry1.getKey();
+                            String addr = entry1.getValue();
+                            if (addr != null) {
+                                // 如果此 MQClientInstance 中没有 Consumer，并且 Broker 的 id 不是 MASTER_ID 的话，就直接忽略掉这个 Broker
+                                // 这是因为 Consumer 会与 Master Broker 以及 Slave Broker 同时建立连接，而 Producer 只会与 Master 建立连接
+                                if (consumerEmpty) {
+                                    if (id != MixAll.MASTER_ID)
+                                        continue;
+                                }
+
+                                try {
+                                    int version = this.mQClientAPIImpl.sendHearbeat(addr, heartbeatData, 3000);
+                                    if (!this.brokerVersionTable.containsKey(brokerName)) {
+                                        this.brokerVersionTable.put(brokerName, new HashMap<String, Integer>(4));
+                                    }
+                                    this.brokerVersionTable.get(brokerName).put(addr, version);
+                                    if (times % 20 == 0) {
+                                        log.info("send heart beat to broker[{} {} {}] success", brokerName, id, addr);
+                                        log.info(heartbeatData.toString());
+                                    }
+                                } catch (Exception e) {
+                                    // 省略代码
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // 在发送心跳包到所有的 Broker 之前（包括 Master 和 Slave），先收集好 Producer 和 Consumer 的必要的信息。
+        private HeartbeatData prepareHeartbeatData() {
+            HeartbeatData heartbeatData = new HeartbeatData();
+    
+            // clientID = ip + @ + instanceName，instanceName 如果用户没有设置的话，就会被 rocketmq 自动改为 pid
+            // clientId 表示是由哪个 MQClientInstance 发送的心跳请求
+            heartbeatData.setClientID(this.clientId);
+    
+            // Consumer
+            // 遍历 MQClientInstance 中 consumerTable 中的 consumer 信息，将其发送给 Broker
+            for (Map.Entry<String, MQConsumerInner> entry : this.consumerTable.entrySet()) {
+                MQConsumerInner impl = entry.getValue();
+                if (impl != null) {
+                    ConsumerData consumerData = new ConsumerData();
+                    consumerData.setGroupName(impl.groupName());
+                    consumerData.setConsumeType(impl.consumeType());
+                    consumerData.setMessageModel(impl.messageModel());
+                    consumerData.setConsumeFromWhere(impl.consumeFromWhere());
+                    consumerData.getSubscriptionDataSet().addAll(impl.subscriptions());
+                    consumerData.setUnitMode(impl.isUnitMode());
+                    // add consumerData to heartbeatData
+                    heartbeatData.getConsumerDataSet().add(consumerData);
+                }
+            }
+    
+            // Producer
+            // 遍历 MQClientInstance 中的 producerTable 中的 producer 信息，将其发送给 Broker
+            for (Map.Entry<String/* group */, MQProducerInner> entry : this.producerTable.entrySet()) {
+                MQProducerInner impl = entry.getValue();
+                if (impl != null) {
+                    ProducerData producerData = new ProducerData();
+                    producerData.setGroupName(entry.getKey());
+                    // add producerData to heartbeatData
+                    heartbeatData.getProducerDataSet().add(producerData);
+                }
+            }
+    
+            return heartbeatData;
         }
 
 
