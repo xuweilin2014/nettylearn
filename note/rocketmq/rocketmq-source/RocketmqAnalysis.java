@@ -32,29 +32,34 @@ public class RocketmqAnalysis{
      * 
      * 3.定时消息
      * 
-     * RocketMQ 支持定时消息，也就是生产者生产了一些消息到 Broker 中，然后消费者不会立即消费，要等到特定的时间点才会去消费。如果要支持任意精度的定时消息消费，必须在消息服
-     * 务端对消息进行排序，势必带来很大的性能损耗，故 RocketMQ 不支持任意进度的定时消息，而只支持特定延迟级别。
+     * RocketMQ 支持定时消息，也就是生产者生产了一些消息到 Broker 中，然后消费者不会立即消费，要等到特定的时间点才会去消费。如果要支持任意精度的定时消息消费，
+     * 必须在消息服务端对消息进行排序，势必带来很大的性能损耗，故 RocketMQ 不支持任意进度的定时消息，而只支持特定延迟级别。
      */
 
     /**
      * 根据使用者对读取操作的控制情况，消费者可分为两种类型：
+     * 
      * 1.DefaultMQPushConsumer
      * 
      * DefaultMQPushConsumer 由系统控制读取操作，收到消息后自动调用传人的处理方法来处理。并且在加入其它 DefaultMQPushConsumer 之后，会自动做负载均衡。
      * DefaultMQPushConsumer 需要设置三个参数：一是 Consumer 所属的 GroupName，二是 NameServer 的地址和端口号，三是 Topic 的名称。其中 GroupName 用于
      * 把多个 Consumer 组织到一起，提高并发处理能力。GroupName 需要和消息模式一起使用。RocketMQ 支持两种消息模式（MessageModel）：
      * 
-     * Clustering:同一个 ConsumerGroup 里的每个 Consumer 只消费所订阅消息一部分内容，同一个 ConsumerGroup 所有的 Consumer 的内容合来才是所订阅 Topic 从而达到负载均衡的目的
+     * Clustering:同一个 ConsumerGroup 里的每个 Consumer 只消费所订阅消息一部分内容，同一个 ConsumerGroup 所有的 Consumer 的内容合来才是所订阅 Topic 
+     * 从而达到负载均衡的目的
      * Broadcasting:同一个 ConsumerGroup 中的每个 Consumer 都可以消费到所订阅的 Topic 的全部消息，也就是一个消息会被多次分发
      * 
      * 2.DefaultMQPullConsumer: 读取操作中的大部分功能由使用者自主控制
      */
 
     /**
-     * RocketMQ 并没有真正实现推模式，而是消费者主动向消息服务器拉取消息，RocketMQ 推模式是循环向消息服务端发送消息拉取请求，如果消息消费者向 RocketMQ 发送消息拉取时，消息并未到达消费队列，如果不启用长轮询机制，
-     * 则会在服务端等待 shortPollingTimeMills 时间后（挂起）再去判断消息是否已到达消息队列，如果消息未到达则提示消息拉取客户端 PULL_NOT_FOUND （消息不存在），如果开启长轮询模式， RocketMQ 一方面会每 5s 轮询检查一次消息是否可达 
-     * 同时，一有新消息到达后立马通知挂起线程再次验证新消息是否是自己感兴趣的消息，如果是则从 commitlog 文件提取消息返回给消息拉取客户端，否则直到挂起超时，超时时间由消息拉取方在消息拉取时封装在请求参数中，
-     * PUSH 模式默认为 15s，PULL 模式通过 DefaultMQPullConsumer#setBrokerSuspendMaxTimeMillis 设置。RocketMQ 通过在 Broker 端配置 longPollingEnable 为 true 来开启长轮询模式
+     * RocketMQ 并没有真正实现推模式，而是消费者主动向消息服务器拉取消息，RocketMQ 推模式是循环向消息服务端发送消息拉取请求，如果消息消费者向 RocketMQ 发送消息拉取时，
+     * 消息并未到达消费队列，如果不启用长轮询机制，则会在服务端等待 shortPollingTimeMills 时间后（挂起）再去判断消息是否已到达消息队列，如果消息未到达则提示消息拉取
+     * 客户端 PULL_NOT_FOUND （消息不存在），如果开启长轮询模式， RocketMQ 一方面会每 5s 轮询检查一次消息是否可达。
+     * 
+     * 同时，一有新消息到达后立马通知挂起线程再次验证新消息是否是自己感兴趣的消息，如果是则从 commitlog 文件提取消息返回给消息拉取客户端，否则直到挂起超时，
+     * 超时时间由消息拉取方在消息拉取时封装在请求参数中，PUSH 模式默认为 15s，PULL 模式通过 DefaultMQPullConsumer#setBrokerSuspendMaxTimeMillis 设置。
+     * RocketMQ 通过在 Broker 端配置 longPollingEnable 为 true 来开启长轮询模式
      */
     public interface MQPushConsumer extends MQConsumer {
         /**
@@ -95,6 +100,14 @@ public class RocketmqAnalysis{
          */
         void subscribe(final String topic, final MessageSelector selector) throws MQClientException;
     
+        /**
+         * Subscribe some topic
+         *
+         * @param subExpression subscription expression.it only support or operation such as "tag1 || tag2 || tag3"
+         * if null or * expression, meaning subscribe all
+         */
+        void subscribe(final String topic, final String subExpression) throws MQClientException;
+
         /**
          * Unsubscribe consumption some topic
          * @param topic message topic
@@ -208,6 +221,7 @@ public class RocketmqAnalysis{
          */
         @Override
         public void start() throws MQClientException {
+            // 调用 defaultMQPushConsumerImpl#start 方法来真正进行方法的调用
             this.defaultMQPushConsumerImpl.start();
         }
 
@@ -240,7 +254,8 @@ public class RocketmqAnalysis{
         /**
          * Subscribe a topic to consuming subscription.
          * @param topic         topic to subscribe.
-         * @param subExpression subscription expression.it only support or operation such as "tag1 || tag2 || tag3" if null or * expression,meaning subscribe all
+         * @param subExpression subscription expression.it only support or operation such as "tag1 || tag2 || tag3" if null or * expression,
+         * meaning subscribe all
          */
         @Override
         public void subscribe(String topic, String subExpression) throws MQClientException {

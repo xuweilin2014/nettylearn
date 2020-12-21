@@ -106,6 +106,179 @@ public class RocketmqMessageStoreAnalysis{
             MappedFile.ensureDirOK(file.getParent());
             lockFile = new RandomAccessFile(file, "rw");
         }
+
+        public GetMessageResult getMessage(final String group, final String topic, final int queueId, final long offset, final int maxMsgNums, final MessageFilter messageFilter) {
+            
+            if (this.shutdown) {
+                log.warn("message store has shutdown, so getMessage is forbidden");
+                return null;
+            }
+
+            if (!this.runningFlags.isReadable()) {
+                log.warn("message store is not readable, so getMessage is forbidden");
+                return null;
+            }
+
+            long beginTime = this.getSystemClock().now();
+
+            GetMessageStatus status = GetMessageStatus.NO_MESSAGE_IN_QUEUE;
+            // 待查找的消息的偏移量
+            long nextBeginOffset = offset;
+            // 当前消息队列 ConsumeQueue 中消息的最小偏移量
+            long minOffset = 0;
+            // 当前消息队列 ConsumeQueue 中消息的最大偏移量
+            long maxOffset = 0;
+
+            GetMessageResult getResult = new GetMessageResult();
+            // 当前 CommitLog 文件的最大偏移量
+            final long maxOffsetPy = this.commitLog.getMaxOffset();
+
+            ConsumeQueue consumeQueue = findConsumeQueue(topic, queueId);
+            if (consumeQueue != null) {
+                minOffset = consumeQueue.getMinOffsetInQueue();
+                maxOffset = consumeQueue.getMaxOffsetInQueue();
+
+                // maxOffset = 0，表示当前消费队列中没有消息，拉取结果：NO_MESSAGE_IN_QUEUE
+                if (maxOffset == 0) {
+                    status = GetMessageStatus.NO_MESSAGE_IN_QUEUE;
+                    nextBeginOffset = nextOffsetCorrection(offset, 0);
+                // offset < minOffset，表示带拉取的消息偏移量小于队列的起始偏移量，拉取结果：OFFSET_TOO_SMALL
+                } else if (offset < minOffset) {
+                    status = GetMessageStatus.OFFSET_TOO_SMALL;
+                    nextBeginOffset = nextOffsetCorrection(offset, minOffset);
+                // offset == maxOffset，表示待拉取的消息偏移量等于队列的最大偏移量，拉取结果为：OFFSET_OVERFLOW_ONE
+                } else if (offset == maxOffset) {
+                    status = GetMessageStatus.OFFSET_OVERFLOW_ONE;
+                    nextBeginOffset = nextOffsetCorrection(offset, offset);
+                // offset > maxOffset，表示带拉取的消息偏移量越界，拉取结果为：OFFSET_OVERFLOW_BADLY
+                } else if (offset > maxOffset) {
+                    status = GetMessageStatus.OFFSET_OVERFLOW_BADLY;
+                    if (0 == minOffset) {
+                        nextBeginOffset = nextOffsetCorrection(offset, minOffset);
+                    } else {
+                        nextBeginOffset = nextOffsetCorrection(offset, maxOffset);
+                    }
+                // 如果待拉取的偏移量大于 minOffset，小于 maxOffset，从当前 offset 处尝试拉取 32 条消息
+                } else {
+                    SelectMappedBufferResult bufferConsumeQueue = consumeQueue.getIndexBuffer(offset);
+                    if (bufferConsumeQueue != null) {
+                        try {
+                            status = GetMessageStatus.NO_MATCHED_MESSAGE;
+
+                            long nextPhyFileStartOffset = Long.MIN_VALUE;
+                            long maxPhyOffsetPulling = 0;
+
+                            int i = 0;
+                            final int maxFilterMessageCount = Math.max(16000, maxMsgNums * ConsumeQueue.CQ_STORE_UNIT_SIZE);
+                            final boolean diskFallRecorded = this.messageStoreConfig.isDiskFallRecorded();
+                            ConsumeQueueExt.CqExtUnit cqExtUnit = new ConsumeQueueExt.CqExtUnit();
+
+                            for (; i < bufferConsumeQueue.getSize() && i < maxFilterMessageCount; i += ConsumeQueue.CQ_STORE_UNIT_SIZE) {
+
+                                long offsetPy = bufferConsumeQueue.getByteBuffer().getLong();
+                                int sizePy = bufferConsumeQueue.getByteBuffer().getInt();
+                                long tagsCode = bufferConsumeQueue.getByteBuffer().getLong();
+
+                                maxPhyOffsetPulling = offsetPy;
+
+                                if (nextPhyFileStartOffset != Long.MIN_VALUE) {
+                                    if (offsetPy < nextPhyFileStartOffset)
+                                        continue;
+                                }
+
+                                boolean isInDisk = checkInDiskByCommitOffset(offsetPy, maxOffsetPy);
+
+                                if (this.isTheBatchFull(sizePy, maxMsgNums, getResult.getBufferTotalSize(),
+                                        getResult.getMessageCount(), isInDisk)) {
+                                    break;
+                                }
+
+                                boolean extRet = false, isTagsCodeLegal = true;
+                                if (consumeQueue.isExtAddr(tagsCode)) {
+                                    extRet = consumeQueue.getExt(tagsCode, cqExtUnit);
+                                    if (extRet) {
+                                        tagsCode = cqExtUnit.getTagsCode();
+                                    } else {
+                                        // can't find ext content.Client will filter messages by tag also.
+                                        log.error("[BUG] can't find consume queue extend file content!addr={}, offsetPy={}, sizePy={}, topic={}, group={}");
+                                        isTagsCodeLegal = false;
+                                    }
+                                }
+
+                                if (messageFilter != null && !messageFilter.isMatchedByConsumeQueue(isTagsCodeLegal ? tagsCode : null, extRet ? cqExtUnit : null)) {
+                                    if (getResult.getBufferTotalSize() == 0) {
+                                        status = GetMessageStatus.NO_MATCHED_MESSAGE;
+                                    }
+
+                                    continue;
+                                }
+
+                                SelectMappedBufferResult selectResult = this.commitLog.getMessage(offsetPy, sizePy);
+
+                                if (null == selectResult) {
+                                    if (getResult.getBufferTotalSize() == 0) {
+                                        status = GetMessageStatus.MESSAGE_WAS_REMOVING;
+                                    }
+                                    nextPhyFileStartOffset = this.commitLog.rollNextFile(offsetPy);
+                                    continue;
+                                }
+
+                                if (messageFilter != null && !messageFilter.isMatchedByCommitLog(selectResult.getByteBuffer().slice(), null)) {
+                                    if (getResult.getBufferTotalSize() == 0) {
+                                        status = GetMessageStatus.NO_MATCHED_MESSAGE;
+                                    }
+                                    // release...
+                                    selectResult.release();
+                                    continue;
+                                }
+
+                                this.storeStatsService.getGetMessageTransferedMsgCount().incrementAndGet();
+                                getResult.addMessage(selectResult);
+                                status = GetMessageStatus.FOUND;
+                                nextPhyFileStartOffset = Long.MIN_VALUE;
+                            }
+
+                            if (diskFallRecorded) {
+                                long fallBehind = maxOffsetPy - maxPhyOffsetPulling;
+                                brokerStatsManager.recordDiskFallBehindSize(group, topic, queueId, fallBehind);
+                            }
+
+                            nextBeginOffset = offset + (i / ConsumeQueue.CQ_STORE_UNIT_SIZE);
+
+                            long diff = maxOffsetPy - maxPhyOffsetPulling;
+                            long memory = (long) (StoreUtil.TOTAL_PHYSICAL_MEMORY_SIZE * (this.messageStoreConfig.getAccessMessageInMemoryMaxRatio() / 100.0));
+                            getResult.setSuggestPullingFromSlave(diff > memory);
+                        } finally {
+
+                            bufferConsumeQueue.release();
+                        }
+                    } else {
+                        status = GetMessageStatus.OFFSET_FOUND_NULL;
+                        nextBeginOffset = nextOffsetCorrection(offset, consumeQueue.rollNextFile(offset));
+                        log.warn("consumer request topic: " + topic + "offset: " + offset + " minOffset: " + minOffset
+                                + " maxOffset: " + maxOffset + ", but access logic queue failed.");
+                    }
+                }
+            } else {
+                status = GetMessageStatus.NO_MATCHED_LOGIC_QUEUE;
+                nextBeginOffset = nextOffsetCorrection(offset, 0);
+            }
+
+            if (GetMessageStatus.FOUND == status) {
+                this.storeStatsService.getGetMessageTimesTotalFound().incrementAndGet();
+            } else {
+                this.storeStatsService.getGetMessageTimesTotalMiss().incrementAndGet();
+            }
+
+            long eclipseTime = this.getSystemClock().now() - beginTime;
+            this.storeStatsService.setGetMessageEntireTimeMax(eclipseTime);
+
+            getResult.setStatus(status);
+            getResult.setNextBeginOffset(nextBeginOffset);
+            getResult.setMaxOffset(maxOffset);
+            getResult.setMinOffset(minOffset);
+            return getResult;
+        }
         
         // DefaultMessageStore#putMessage
         public PutMessageResult putMessage(MessageExtBrokerInner msg) {
@@ -453,7 +626,8 @@ public class RocketmqMessageStoreAnalysis{
                                 if (size > 0) {
                                     DefaultMessageStore.this.doDispatch(dispatchRequest);
 
-                                    // 如果开启了长轮询机制，那么就会通知阻塞的线程有新的消息到达
+                                    // 如果开启了长轮询，并且 Broker 的角色为主节点的话，则通知有新消息到达，执行 NotifyMessageArrivingListener 代码，
+                                    // 最终调用 pullRequestHoldService 的 notifyMessageArriving 方法，进行一次消息拉取
                                     if (BrokerRole.SLAVE != DefaultMessageStore.this.getMessageStoreConfig().getBrokerRole()
                                         && DefaultMessageStore.this.brokerConfig.isLongPollingEnable()) {
                                         DefaultMessageStore.this.messageArrivingListener.arriving(dispatchRequest.getTopic(),

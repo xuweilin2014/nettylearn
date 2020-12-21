@@ -44,8 +44,8 @@ public class RocketmqPushConsumerAnalysisThree{
      * 本文我们完整的对RocketMQ的定时消息实现方式进行了分析，我们总结一下它的完整流程：
      * 
      * 1.消息发送方发送消息，设置 delayLevel。
-     * 2.如果 delayLevel 大于 0，表明是一条延时消息，broker 处理该消息，将消息的原始主题、队列原始 id 进行备份后，改变消息的主题为 SCHEDULE_TOPIC_XXXX，
-     * 队列 id = 延迟级别 - 1，将消息持久化。
+     * 2.消息持久化时（CommitLog#putMessage）如果 delayLevel 大于 0，表明是一条延时消息，broker 处理该消息，将消息的原始主题、队列原始 id 进行备份后，
+     * 改变消息的主题为 SCHEDULE_TOPIC_XXXX，队列 id = 延迟级别 - 1，将消息持久化。
      * 3.通过定时任务 ScheduleMessageService 对定时消息进行处理，每隔 1s 从上次拉取偏移量取出所有的消息进行处理
      * 4.从消费队列中解析出消息的物理偏移量，从而从 commitLog 中取出消息
      * 5.根据消息的属性重建消息，恢复消息的 topic、原队列 id，将消息的延迟级别属性 delayLevel 清除掉，再次保存到 commitLog 中，此时消费者可以对该消息进行消费
@@ -167,6 +167,8 @@ public class RocketmqPushConsumerAnalysisThree{
      * 2.SQL92 的过滤方式：这种方式的大致做法和上面的 tag 过滤方式一样，只是在 Store 层的具体过滤过程不太一样，真正的 SQL expression 的构建和执行由 rocketmq-filter
      * 模块负责的。每次过滤都去执行 SQL 表达式会影响效率，所以 RocketMQ 使用了 BloomFilter 避免了每次都去执行。SQL92 的表达式上下文为消息的属性。 
      */ 
+
+    
     public class ScheduleMessageService extends ConfigManager {
         // 定时消息统一主题
         public static final String SCHEDULE_TOPIC = "SCHEDULE_TOPIC_XXXX";
@@ -183,7 +185,7 @@ public class RocketmqPushConsumerAnalysisThree{
         // 延迟级别，将 "1s 5s 10s 30s 1m 2m 3m 4m Sm 6m 7m 8m 9m 10m 20m 30m lh 2h" 字符串解析成 delayLevelTable，
         // 转换后的数据结构类似 {1: 1000 ,2 :5000 30000, ...}
         private final ConcurrentMap<Integer /* level */, Long/* delay timeMillis */> delayLevelTable = new ConcurrentHashMap<Integer, Long>(32);
-        // offsetTable,延迟级别对应的消费进度，key=延迟级别，value=对应延迟级别下的消费进度
+        // offsetTable，延迟级别对应的消费进度，key=延迟级别，value=对应延迟级别下的消费进度
         private final ConcurrentMap<Integer /* level */, Long/* offset */> offsetTable = new ConcurrentHashMap<Integer, Long>(32);
 
         public boolean load() {
@@ -206,7 +208,7 @@ public class RocketmqPushConsumerAnalysisThree{
                     offset = 0L;
                 }
     
-                // 然后创建定时任务，每一个时任务第一次启动时默认延迟 ls 先执行一次定时任务，第二次调度开始才使用相应的延迟时间。
+                // 然后创建定时任务，每一个定时任务第一次启动时默认延迟 ls 先执行一次定时任务，第二次调度开始才使用相应的延迟时间。
                 // 延迟级别与消息消费队列的映射关系为：消息队列 ID = 延迟级别 - 1
                 if (timeDelay != null) {
                     this.timer.schedule(new DeliverDelayedMessageTimerTask(level, offset), FIRST_DELAY_TIME);
@@ -232,6 +234,10 @@ public class RocketmqPushConsumerAnalysisThree{
     // ScheduleMessageService#start 方法启动后，会为每一个延迟级别创建一个调度任务，每一个延迟级别其实对应 SCHEDULE_TOPIC_XXXX 主题下的一个消息消费队列。
     // 定时调度任务的实现类为 DeliverDelayedMessageTimerTask，其核心实现为 executeOnTime
     class DeliverDelayedMessageTimerTask extends TimerTask {
+
+        private final int delayLevel;
+        
+        private final long offset;
 
         @Override
         public void run() {
@@ -282,7 +288,8 @@ public class RocketmqPushConsumerAnalysisThree{
                             long deliverTimestamp = this.correctDeliverTimestamp(now, tagsCode);
                             nextOffset = offset + (i / ConsumeQueue.CQ_STORE_UNIT_SIZE);
 
-                            // 定时任务每次执行到这里都进行时间比较，计算延迟时间与当前时间的差值，如果延迟时间-当前时间<=0说明该延迟消息应当被处理，使其能够被消费者消费
+                            // 定时任务每次执行到这里都进行时间比较，计算延迟时间与当前时间的差值，如果延迟时间 - 当前时间 <=0，说明该延迟消息应当被处理，
+                            // 使其能够被消费者消费
                             long countdown = deliverTimestamp - now;
 
                             if (countdown <= 0) {
@@ -384,6 +391,14 @@ public class RocketmqPushConsumerAnalysisThree{
      * 在调用 DefaultMQPushConsumerImpl#subscribe 方法时会对 RebalanceImpl 中的 subTable 属性进行填充
      */
     public abstract class RebalanceImpl{
+
+        protected final ConcurrentMap<MessageQueue, ProcessQueue> processQueueTable = new ConcurrentHashMap<MessageQueue, ProcessQueue>(64);
+    
+        protected final ConcurrentMap<String/* topic */, Set<MessageQueue>> topicSubscribeInfoTable = new ConcurrentHashMap<String, Set<MessageQueue>>();
+
+        protected final ConcurrentMap<String/* topic */, SubscriptionData> subscriptionInner = new ConcurrentHashMap<String, SubscriptionData>();
+
+        protected String consumerGroup;
 
         /**
          * RocketMQ 首先需要通过 RebalanceService 线程实现消息队列的负载， 集群模式下同一个消费组内的消费者共同承担其订阅主题下消息队列的消费，
@@ -517,7 +532,8 @@ public class RocketmqPushConsumerAnalysisThree{
         // 2.定时每隔 20s 来重新进行一次负载均衡
         public void doRebalance(final boolean isOrder) {
             // 获取到该 DefaultMQPushConsumerImpl 中所有的订阅信息
-            // subTable 在调用消费者 DefaultMQPushConsumerImpl#subscribe 方法时进行填充
+            // subTable 在调用消费者 DefaultMQPushConsumerImpl#subscribe 方法时进行填充，如果消费者 consumer 的订阅信息发生了变化，
+            // 例如调用了 unsubscribe 方法，则需要将不关心的主题消费队列从 processQueueTable 中移除
             Map<String, SubscriptionData> subTable = this.getSubscriptionInner();
             if (subTable != null) {
                 for (final Map.Entry<String, SubscriptionData> entry : subTable.entrySet()) {
@@ -537,7 +553,6 @@ public class RocketmqPushConsumerAnalysisThree{
             this.truncateMessageQueueNotMyTopic();
         }
 
-        // 
         private void rebalanceByTopic(final String topic, final boolean isOrder) {
             switch (messageModel) {
                 case BROADCASTING: {
@@ -556,9 +571,9 @@ public class RocketmqPushConsumerAnalysisThree{
                 case CLUSTERING: {
                     // 从路由信息中获取 topic 对应所有的 Queue
                     Set<MessageQueue> mqSet = this.topicSubscribeInfoTable.get(topic);
-                    // 发送请求从 Broker 中获取该 topic 下消费组内所有的消费者客户端 id
-                    // 某个主题 topic 的队列可能分布在多个 Broker 上，请求该发送给哪个 Broker 呢？RocketeMQ 会从主题的路由信息表中随机选择一个 Broker，
-                    // 为什么呢？因为消费者在启动的时候，会向 MQClientInstance 中注册消费者，然后 MQClientInstance 会向所有的 Broker 发送心跳包，而这个
+                    // 发送请求（RequestCode 为 GET_CONSUMER_LIST_BY_GROUP）从 Broker 中获取该 topic 下消费组内所有的消费者客户端 id
+                    // 某个主题 topic 的队列可能分布在多个 Broker 上，那么上面的 GET_CONSUMER_LIST_BY_GROUP 请求该发送给哪个 Broker 呢？RocketeMQ 会从主题的路由信息表中随机选择一个 Broker，
+                    // 为什么呢？因为消费者 DefaultMQPushConsumerImpl 在启动的时候，会向 MQClientInstance 中注册消费者，然后会向所有的 Broker 发送心跳包，而这个
                     // 心跳包中包含了 MQClientInstance 的消费者信息
                     List<String> cidAll = this.mQClientFactory.findConsumerIdList(topic, consumerGroup);
 
@@ -582,7 +597,7 @@ public class RocketmqPushConsumerAnalysisThree{
                         AllocateMessageQueueStrategy strategy = this.allocateMessageQueueStrategy;
                         List<MessageQueue> allocateResult = null;
                         try {
-                            // 按照初始化是指定的分配策略，获取分配的 MQ 列表
+                            // 按照初始化指定的分配策略，获取分配的 MQ 列表
                             // 同一个 topic 的消息会分布于集群内的多个 broker 的不同 queue 上。同一个 group 下面会有多个 consumer，
                             // 分配策略 AllocateMessageQueueStrategy 的作用就是计算当前 consumer 应该消费哪几个 queue 的消息
                             allocateResult = strategy.allocate(this.consumerGroup, this.mQClientFactory.getClientId(), mqAll,cidAll);
@@ -600,8 +615,10 @@ public class RocketmqPushConsumerAnalysisThree{
                         // 根据前面分配策略分配到 queue 之后，会查看是否是新增的 queue，如果是则提交一次 PullRequest 去 broker 拉取消息
                         // 不过对于新启动的 consumer 来说，所有的 queue 都是新添加的，所以所有 queue 都会触发 PullRequest
                         // 
-                        // 1、为什么会有新的 queue，broker 和 consumer 的上下线，造成集群中每个 consumer 重新做一次负载均衡，这样就会有本来不属于这个 consumer 的 queue 被分到当前 consumer 来负责消费
-                        // 2、对于 RebalanceImpl 来说，启动的时候会对每个 queue 发送一次 pullRequest，之后就由处理线程负责发起 pullRequest。所有要有个定时任务定期检查是否有 queue 是新进来的，第一次的 pullRequest 没做
+                        // 1、为什么会有新的 queue，broker 和 consumer 的上下线，造成集群中每个 consumer 重新做一次负载均衡，这样就会有本来不属于这个 
+                        // consumer 的 queue 被分到当前 consumer 来负责消费
+                        // 2、对于 RebalanceImpl 来说，启动的时候会对每个 queue 发送一次 pullRequest，之后就由处理线程负责发起 pullRequest。
+                        // 所以要有个定时任务定期检查是否有 queue 是新进来的，第一次的 pullRequest 没做
                         boolean changed = this.updateProcessQueueTableInRebalance(topic, allocateResultSet, isOrder);
                         if (changed) {
                             // 同步数据到 Broker，通过发送一次心跳实现
@@ -692,6 +709,16 @@ public class RocketmqPushConsumerAnalysisThree{
             return changed;
         }
 
+    }
+
+    public class RebalancePushImpl extends RebalanceImpl {
+        @Override
+        public void dispatchPullRequest(List<PullRequest> pullRequestList) {
+            for (PullRequest pullRequest : pullRequestList) {
+                this.defaultMQPushConsumerImpl.executePullRequestImmediately(pullRequest);
+                log.info("doRebalance, {}, add a new pull request {}", consumerGroup, pullRequest);
+            }
+        }
     }
 
 
@@ -861,7 +888,6 @@ public class RocketmqPushConsumerAnalysisThree{
             } catch (Exception e) {
                 log.error("sendMessageBack exception, group: " + this.consumerGroup + " msg: " + msg.toString(), e);
             }
-    
             return false;
         }
     }
@@ -1049,108 +1075,52 @@ public class RocketmqPushConsumerAnalysisThree{
 
     }
 
+    /**
+     * Rocketmq 默认提供了 5 种分配算法
+     * 1.AllocateMessageQueueAveragely: 平均分配
+     * 2.AllocateMessageQueueAveragelyByCircle: 平均轮询分配
+     * 3.AllocateMessageQueueConsistentHash: 一致性哈希
+     * 4.AllocateMessageQueueByConfig: 根据配置，为每一个消费者配置固定的消息队列
+     * 5.AllocateMessageQueueByMachineRoom: 根据 Broker 部署机房名称，对每个消费者负责不同的 Broker 上的队列
+     * 
+     * 消息负载算法如果没有特殊的要求，尽量使用 AllocateMessageQueueAveragely，AllocateMessageQueueAveragelyByCircle
+     * 因为分配算法比较直观。消息队列分配遵循一个消费者可以分配多个消息队列，但是同一个消息队列只会分配给一个消费者，故如果
+     * 消费者个数大于消息队列数量，则有些消费者无法消费消息。
+     */
+    public interface AllocateMessageQueueStrategy {
 
-    public class DefaultMessageStore extends MessageStore{
-
-        public ConsumeQueue findConsumeQueue(String topic, int queueId) {
-
-            ConcurrentMap<Integer, ConsumeQueue> map = consumeQueueTable.get(topic);
-            if (null == map) {
-                ConcurrentMap<Integer, ConsumeQueue> newMap = new ConcurrentHashMap<Integer, ConsumeQueue>(128);
-                ConcurrentMap<Integer, ConsumeQueue> oldMap = consumeQueueTable.putIfAbsent(topic, newMap);
-                if (oldMap != null) {
-                    map = oldMap;
-                } else {
-                    map = newMap;
-                }
-            }
+        /**
+         * Allocating by consumer id
+         *
+         * @param consumerGroup current consumer group
+         * @param currentCID current consumer id
+         * @param mqAll message queue set in current topic
+         * @param cidAll consumer set in current consumer group
+         * @return The allocate result of given strategy
+         */
+        List<MessageQueue> allocate(final String consumerGroup, final String currentCID, final List<MessageQueue> mqAll, final List<String> cidAll);
     
-            ConsumeQueue logic = map.get(queueId);
-            if (null == logic) {
-                ConsumeQueue newLogic = new ConsumeQueue(topic, queueId, StorePathConfigHelper.getStorePathConsumeQueue(this.messageStoreConfig.getStorePathRootDir()),
-                    this.getMessageStoreConfig().getMapedFileSizeConsumeQueue(), this);
-                ConsumeQueue oldLogic = map.putIfAbsent(queueId, newLogic);
-                if (oldLogic != null) {
-                    logic = oldLogic;
-                } else {
-                    logic = newLogic;
-                }
-            }
-    
-            return logic;
-        }
-
-        class ReputMessageService extends ServiceThread {
-
-            @Override
-            public void run() {
-                DefaultMessageStore.log.info(this.getServiceName() + " service started");
-
-                while (!this.isStopped()) {
-                    try {
-                        Thread.sleep(1);
-                        this.doReput();
-                    } catch (Exception e) {
-                        DefaultMessageStore.log.warn(this.getServiceName() + " service has exception. ", e);
-                    }
-                }
-
-                DefaultMessageStore.log.info(this.getServiceName() + " service end");
-            }
-
-            private void doReput() {
-                for (boolean doNext = true; this.isCommitLogAvailable() && doNext; ) {
-    
-                    if (DefaultMessageStore.this.getMessageStoreConfig().isDuplicationEnable() && this.reputFromOffset >= DefaultMessageStore.this.getConfirmOffset()) {
-                        break;
-                    }
-    
-                    SelectMappedBufferResult result = DefaultMessageStore.this.commitLog.getData(reputFromOffset);
-                    if (result != null) {
-                        try {
-                            this.reputFromOffset = result.getStartOffset();
-    
-                            for (int readSize = 0; readSize < result.getSize() && doNext; ) {
-                                DispatchRequest dispatchRequest = DefaultMessageStore.this.commitLog.checkMessageAndReturnSize(result.getByteBuffer(), false, false);
-                                int size = dispatchRequest.getMsgSize();
-    
-                                if (dispatchRequest.isSuccess()) {
-                                    if (size > 0) {
-                                        DefaultMessageStore.this.doDispatch(dispatchRequest);
-                                        // 如果开启了长轮询，并且 Broker 的角色为主节点的话，则通知有新消息到达，执行 NotifyMessageArrivingListener 代码，
-                                        // 最终调用 pullRequestHoldService 的 notifyMessageArriving 方法，进行一次消息拉取
-                                        if (BrokerRole.SLAVE != DefaultMessageStore.this.getMessageStoreConfig().getBrokerRole()
-                                            && DefaultMessageStore.this.brokerConfig.isLongPollingEnable()) {
-                                            DefaultMessageStore.this.messageArrivingListener.arriving(dispatchRequest.getTopic(),
-                                                dispatchRequest.getQueueId(), dispatchRequest.getConsumeQueueOffset() + 1,
-                                                dispatchRequest.getTagsCode(), dispatchRequest.getStoreTimestamp(),
-                                                dispatchRequest.getBitMap(), dispatchRequest.getPropertiesMap());
-                                        }
-    
-                                        // ignore code
-                                    } else if (size == 0) {
-                                        this.reputFromOffset = DefaultMessageStore.this.commitLog.rollNextFile(this.reputFromOffset);
-                                        readSize = result.getSize();
-                                    }
-                                } else if (!dispatchRequest.isSuccess()) {
-
-                                    // ignore code
-
-                                }
-                            }
-                        } finally {
-                            result.release();
-                        }
-                    } else {
-                        doNext = false;
-                    }
-                }
-            }
-
-        }
-
+        /**
+         * Algorithm name
+         *
+         * @return The strategy name
+         */
+        String getName();
     }
-    
+
+    public class SubscriptionData implements Comparable<SubscriptionData> {
+        public final static String SUB_ALL = "*";
+        private boolean classFilterMode = false;
+        // consumer 订阅的主题信息
+        private String topic;
+        private String subString;
+        // 订阅的 tag 的集合
+        private Set<String> tagsSet = new HashSet<String>();
+        // 订阅的 tag 的 hashcode 集合
+        private Set<Integer> codeSet = new HashSet<Integer>();
+        private long subVersion = System.currentTimeMillis();
+        private String expressionType;
+    }
 
 
 }

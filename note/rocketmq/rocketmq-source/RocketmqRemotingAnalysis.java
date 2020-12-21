@@ -1202,6 +1202,90 @@ public class RocketmqRemotingAnalysis{
             return this.processSendResponse(brokerName, msg, response);
         }
 
+        public PullResult pullMessage(final String addr, final PullMessageRequestHeader requestHeader,
+                final long timeoutMillis, final CommunicationMode communicationMode, final PullCallback pullCallback) throws Exception {
+            // 组装消息拉取命令，RequestCode 为 PULL_MESSAGE，发送到 Broker 端
+            RemotingCommand request = RemotingCommand.createRequestCommand(RequestCode.PULL_MESSAGE, requestHeader);
+
+            switch (communicationMode) {
+            case ONEWAY:
+                assert false;
+                return null;
+            case ASYNC:
+                this.pullMessageAsync(addr, request, timeoutMillis, pullCallback);
+                return null;
+            case SYNC:
+                return this.pullMessageSync(addr, request, timeoutMillis);
+            default:
+                assert false;
+                break;
+            }
+
+            return null;
+        }
+
+        private void pullMessageAsync(final String addr, final RemotingCommand request, final long timeoutMillis, final PullCallback pullCallback) throws Exception {
+
+            this.remotingClient.invokeAsync(addr, request, timeoutMillis, new InvokeCallback() {
+                @Override
+                public void operationComplete(ResponseFuture responseFuture) {
+                    // NettyRemotingClient 在收到 Broker 端的响应结果之后会回调 pullback 的 onSuccess 和 onException 方法，pullback 对象在
+                    // DefaultMQPushConsumerImpl#pullMessage 方法中创建
+                    RemotingCommand response = responseFuture.getResponseCommand();
+                    if (response != null) {
+                        try {
+                            // 根据响应结果 ResponseFuture 的状态，解码并生成 PullResultExt 对象
+                            // ResponseCode 到 PullStatus 状态编码转换
+                            // SUCCESS -> FOUND
+                            // PULL_RETRY_IMMEDIATELY -> NO_MATCHED_MSG
+                            // PULL_OFFSET_MOVED -> OFFSET_ILLEGAL
+                            // PULL_NOT_FOUND -> NO_NEW_MSG
+                            PullResult pullResult = MQClientAPIImpl.this.processPullResponse(response);
+                            assert pullResult != null;
+                            pullCallback.onSuccess(pullResult);
+                        } catch (Exception e) {
+                            pullCallback.onException(e);
+                        }
+                    } else {
+                        if (!responseFuture.isSendRequestOK()) {
+                            pullCallback.onException(new MQClientException());
+                        } else if (responseFuture.isTimeout()) {
+                            pullCallback.onException(new MQClientException());
+                        } else {
+                            pullCallback.onException();
+                        }
+                    }
+                }
+            });
+        }
+
+        private PullResult processPullResponse(final RemotingCommand response)throws MQBrokerException, RemotingCommandException {
+
+            PullStatus pullStatus = PullStatus.NO_NEW_MSG;
+            switch (response.getCode()) {
+            case ResponseCode.SUCCESS:
+                pullStatus = PullStatus.FOUND;
+                break;
+            case ResponseCode.PULL_NOT_FOUND:
+                pullStatus = PullStatus.NO_NEW_MSG;
+                break;
+            case ResponseCode.PULL_RETRY_IMMEDIATELY:
+                pullStatus = PullStatus.NO_MATCHED_MSG;
+                break;
+            case ResponseCode.PULL_OFFSET_MOVED:
+                pullStatus = PullStatus.OFFSET_ILLEGAL;
+                break;
+
+            default:
+                throw new MQBrokerException(response.getCode(), response.getRemark());
+            }
+
+            PullMessageResponseHeader responseHeader = (PullMessageResponseHeader) response.decodeCommandCustomHeader(PullMessageResponseHeader.class);
+
+            return new PullResultExt(pullStatus, responseHeader.getNextBeginOffset(), responseHeader.getMinOffset(),
+                    responseHeader.getMaxOffset(), null, responseHeader.getSuggestWhichBrokerId(), response.getBody());
+        }
+
     }
 
     public class GetRouteInfoRequestHeader implements CommandCustomHeader {

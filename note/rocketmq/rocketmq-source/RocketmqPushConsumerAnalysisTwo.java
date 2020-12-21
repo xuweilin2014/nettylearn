@@ -8,12 +8,46 @@ public class RocketmqPushConsumerAnalysisTwo{
         private final long pullFromThisOffset;
         private final SubscriptionData subscriptionData;
         private final MessageFilter messageFilter;
+
+        public PullRequest(RemotingCommand requestCommand, Channel clientChannel, long timeoutMillis, long suspendTimestamp, long pullFromThisOffset, SubscriptionData subscriptionData,
+                MessageFilter messageFilter) {
+            this.requestCommand = requestCommand;
+            this.clientChannel = clientChannel;
+            // timeoutMills 表示的是长轮询的超时时间
+            this.timeoutMillis = timeoutMillis;
+            // suspendTimestamp 表示的是创建 PullRequest 的当前时间戳
+            // timeoutMillis 和 suspendTimestamp 这两个参数加起来就表示这个长轮询请求的到期时间
+            this.suspendTimestamp = suspendTimestamp;
+            this.pullFromThisOffset = pullFromThisOffset;
+            this.subscriptionData = subscriptionData;
+            this.messageFilter = messageFilter;
+        }
     }
 
     public class PullMessageProcessor implements NettyRequestProcessor {
 
+        @Override
+        public RemotingCommand processRequest(final ChannelHandlerContext ctx, RemotingCommand request) throws RemotingCommandException {
+            return this.processRequest(ctx.channel(), request, true);
+        }
+
         private RemotingCommand processRequest(final Channel channel, RemotingCommand request, boolean brokerAllowSuspend) throws RemotingCommandException {
             
+            RemotingCommand response = RemotingCommand.createResponseCommand(PullMessageResponseHeader.class);
+            final PullMessageResponseHeader responseHeader = (PullMessageResponseHeader) response.readCustomHeader();
+            final PullMessageRequestHeader requestHeader = (PullMessageRequestHeader) request.decodeCommandCustomHeader(PullMessageRequestHeader.class);
+            // 将 request 中的 opaque 参数设置到 response 中，opaque 也就是 requestId
+            response.setOpaque(request.getOpaque());
+
+            // ignore code
+
+            // Broker 是否开启长轮询
+            final boolean hasSuspendFlag = PullSysFlag.hasSuspendFlag(requestHeader.getSysFlag());
+            // Broker 开启长轮询的等待时间，从 requestHeader 中获得
+            final long suspendTimeoutMillisLong = hasSuspendFlag ? requestHeader.getSuspendTimeoutMillis() : 0;
+
+            // ignore code
+
             MessageFilter messageFilter;
             
             // 构建消息过滤对象 ExpressionForRetryMessageFilter，支持对重试主题的过滤
@@ -24,40 +58,144 @@ public class RocketmqPushConsumerAnalysisTwo{
                 messageFilter = new ExpressionMessageFilter(subscriptionData, consumerFilterData, this.brokerController.getConsumerFilterManager());
             }
 
+            // 调用 MessageStore#getMessage 来查找消息
             final GetMessageResult getMessageResult = this.brokerController.getMessageStore().getMessage(
                     requestHeader.getConsumerGroup(), requestHeader.getTopic(), requestHeader.getQueueId(),
                     requestHeader.getQueueOffset(), requestHeader.getMaxMsgNums(), messageFilter);
             
-            // Broker 是否开启长轮询
-            final boolean hasSuspendFlag = PullSysFlag.hasSuspendFlag(requestHeader.getSysFlag());
-            // Broker 开启长轮询的等待时间
-            final long suspendTimeoutMillisLong = hasSuspendFlag ? requestHeader.getSuspendTimeoutMillis() : 0;
+            if (getMessageResult != null) {
+                // 根据 PullResult 来填充 responseHeader 中的 nextBeginOffset、minOffset、maxOffset
+                response.setRemark(getMessageResult.getStatus().name());
+                responseHeader.setNextBeginOffset(getMessageResult.getNextBeginOffset());
+                responseHeader.setMinOffset(getMessageResult.getMinOffset());
+                responseHeader.setMaxOffset(getMessageResult.getMaxOffset());
 
-            switch (response.getCode()) {
-                case ResponseCode.PULL_NOT_FOUND:
-                
-                // brokerAllowSuspend 表示 Broker 是否支持挂起，即是否允许在未找到消息时暂时挂起线程。第一次调用时默认为 true。
-                // 如果该参数为 true，表示支持挂起，则会先将响应对象 response 设置为 null，将不会立即向客户端写入响应
-                // 如果该参数为 false，未找到消息时直接返回客户端消息未找到
-                if (brokerAllowSuspend && hasSuspendFlag) {
-                    // 如果支持长轮询，挂起超时时间来源于请求参数 requestHeader
-                    long pollingTimeMills = suspendTimeoutMillisLong; 
-                    if (!this.brokerController.getBrokerConfig().isLongPollingEnable()) {
-                        pollingTimeMills = this.brokerController.getBrokerConfig().getShortPollingTimeMills();
+                // 根据主从同步延迟，设置下一次拉取任务的 brokerId
+                if (getMessageResult.isSuggestPullingFromSlave()) {
+                    responseHeader.setSuggestWhichBrokerId(subscriptionGroupConfig.getWhichBrokerWhenConsumeSlowly());
+                } else {
+                    responseHeader.setSuggestWhichBrokerId(MixAll.MASTER_ID);
+                }
+
+                switch (this.brokerController.getMessageStoreConfig().getBrokerRole()) {
+                case ASYNC_MASTER:
+                case SYNC_MASTER:
+                    break;
+                case SLAVE:
+                    // 如果当前 broker 是 slave 的话，并且根据设置不可以从 slave 读取消息的话，
+                    // 就将 response code 设置为 PULL_RETRY_IMMEDIATELY，重新拉取消息
+                    if (!this.brokerController.getBrokerConfig().isSlaveReadEnable()) {
+                        response.setCode(ResponseCode.PULL_RETRY_IMMEDIATELY);
+                        responseHeader.setSuggestWhichBrokerId(MixAll.MASTER_ID);
                     }
-
-                    String topic = requestHeader.getTopic();
-                    long offset = requestHeader.getQueueOffset();
-                    int queueId = requestHeader.getQueueId();
-                    // 创建拉取任务 PullRequest
-                    PullRequest pullRequest = new PullRequest(request, channel, pollingTimeMills, this.brokerController.getMessageStore().now(), offset, subscriptionData, messageFilter);
-                    // 将创建好的 PullRequest 提交到 PullRequestHoldService 线程中，PullRequestHoldService 线程每隔 5s 重试一次
-                    this.brokerController.getPullRequestHoldService().suspendPullRequest(topic, queueId, pullRequest);
-                    // 关键，设置 response = null，则此时此次调用不会向客户端输出任何字节，客户端网络请求的读事件不会触发，客户端处于等待状态
-                    response = null;
                     break;
                 }
+
+                // 如果配置允许从 slave 端读取消息，那么会配置下次建议拉取的 broker Id
+                if (this.brokerController.getBrokerConfig().isSlaveReadEnable()) {
+                    // consume too slow ,redirect to another machine
+                    if (getMessageResult.isSuggestPullingFromSlave()) {
+                        responseHeader.setSuggestWhichBrokerId(subscriptionGroupConfig.getWhichBrokerWhenConsumeSlowly());
+                    }
+                    // consume ok
+                    else {
+                        responseHeader.setSuggestWhichBrokerId(subscriptionGroupConfig.getBrokerId());
+                    }
+                // 如果不允许从 slave 读取消息，则直接建议下一次从 master broker 拉取消息
+                } else {
+                    responseHeader.setSuggestWhichBrokerId(MixAll.MASTER_ID);
+                }
+
+                // 根据 GetMessageResult 编码转换成 ResponseCode
+                switch (getMessageResult.getStatus()) {
+                    case FOUND:
+                        response.setCode(ResponseCode.SUCCESS);
+                        break;
+                    case MESSAGE_WAS_REMOVING:
+                        response.setCode(ResponseCode.PULL_RETRY_IMMEDIATELY);
+                        break;
+                    case NO_MATCHED_LOGIC_QUEUE:
+                    case NO_MESSAGE_IN_QUEUE:
+                        if (0 != requestHeader.getQueueOffset()) {
+                            response.setCode(ResponseCode.PULL_OFFSET_MOVED);
+                            log.info("the broker store no queue data, fix the request offset {} to {}, Topic: {} QueueId: {} Consumer Group: {}");
+                        } else {
+                            response.setCode(ResponseCode.PULL_NOT_FOUND);
+                        }
+                        break;
+                    case NO_MATCHED_MESSAGE:
+                        response.setCode(ResponseCode.PULL_RETRY_IMMEDIATELY);
+                        break;
+                    case OFFSET_FOUND_NULL:
+                        response.setCode(ResponseCode.PULL_NOT_FOUND);
+                        break;
+                    case OFFSET_OVERFLOW_BADLY:
+                        response.setCode(ResponseCode.PULL_OFFSET_MOVED);
+                        log.info("the request offset: {} over flow badly, broker max offset: {}, consumer: {}");
+                        break;
+                    case OFFSET_OVERFLOW_ONE:
+                        response.setCode(ResponseCode.PULL_NOT_FOUND);
+                        break;
+                    case OFFSET_TOO_SMALL:
+                        response.setCode(ResponseCode.PULL_OFFSET_MOVED);
+                        log.info("the request offset too small. group={}, topic={}, requestOffset={}, brokerMinOffset={}, clientIp={}",
+                            requestHeader.getConsumerGroup(), requestHeader.getTopic(), requestHeader.getQueueOffset(),
+                            getMessageResult.getMinOffset(), channel.remoteAddress());
+                        break;
+                    default:
+                        assert false;
+                        break;
+                }
+
+                switch (response.getCode()) {
+                    case ResponseCode.PULL_NOT_FOUND:
+                    
+                    // brokerAllowSuspend 表示 Broker 是否支持挂起，即是否允许在未找到消息时暂时挂起线程。第一次调用时默认为 true。
+                    // 如果该参数为 true，表示支持挂起，如果没有找到消息则挂起
+                    // 如果该参数为 false，未找到消息时直接返回客户端消息未找到
+                    if (brokerAllowSuspend && hasSuspendFlag) {
+                        // 如果支持长轮询，则根据是否开启长轮询来决定挂起方式。如果 Broker 支持长轮询，挂起超时时间来源于请求参数 requestHeader，
+                        // Push 模式默认为 15s，然后创建拉取任务 PullRequest 并且提交到 PullRequestHoldService 线程中
+                        long pollingTimeMills = suspendTimeoutMillisLong; 
+                        if (!this.brokerController.getBrokerConfig().isLongPollingEnable()) {
+                            pollingTimeMills = this.brokerController.getBrokerConfig().getShortPollingTimeMills();
+                        }
+
+                        /** 
+                         * RocketMQ 轮询机制由两个线程共同完成：
+                         * 1.PullRequestHoldService: 每隔 5s 重试一次
+                         * 2.DefaultMessageStore#ReputMessageService: 每处理一次重新拉取，Thread.sleep(1) 继续下一次检查
+                         */
+    
+                        String topic = requestHeader.getTopic();
+                        long offset = requestHeader.getQueueOffset();
+                        int queueId = requestHeader.getQueueId();
+                        // 创建拉取任务 PullRequest，pollingTimeMills 表示的是长轮询的超时时间，now 表示的是当前的时间，这两个时间参数会用来计算
+                        // 长轮询的时间间隔
+                        PullRequest pullRequest = new PullRequest(request, channel, pollingTimeMills, this.brokerController.getMessageStore().now(), offset, subscriptionData, messageFilter);
+                        // 将创建好的 PullRequest 提交到 PullRequestHoldService 线程中，PullRequestHoldService 线程每隔 5s 重试一次
+                        this.brokerController.getPullRequestHoldService().suspendPullRequest(topic, queueId, pullRequest);
+                        // 关键，设置 response = null，则此时此次调用不会向客户端输出任何字节，客户端网络请求的读事件不会触发，客户端处于等待状态
+                        response = null;
+                        break;
+                    }
+                }
+            } else {
+                response.setCode(ResponseCode.SYSTEM_ERROR);
+                response.setRemark("store getMessage return null");
             }
+
+            boolean storeOffsetEnable = brokerAllowSuspend;
+            storeOffsetEnable = storeOffsetEnable && hasCommitOffsetFlag;
+            storeOffsetEnable = storeOffsetEnable && this.brokerController.getMessageStoreConfig().getBrokerRole() != BrokerRole.SLAVE;
+            
+            // 如果 commitlog 标记可用，并且当前节点为主节点，那么就更新消息消费进度
+            if (storeOffsetEnable) {
+                this.brokerController.getConsumerOffsetManager().commitOffset(
+                        RemotingHelper.parseChannelRemoteAddr(channel), requestHeader.getConsumerGroup(),
+                        requestHeader.getTopic(), requestHeader.getQueueId(), requestHeader.getCommitOffset());
+            }
+            return response;
             
         }
 
@@ -66,7 +204,7 @@ public class RocketmqPushConsumerAnalysisTwo{
                 @Override
                 public void run() {
                     try {
-                        // 这里又是长轮询的核心代码，其核心是设置 brokerAllowSuspend 为 false，表示不支持拉取线程挂起，
+                        // 这里又是长轮询的核心代码，其核心是设置 brokerAllowSuspend 为 false，表示不支持拉取线程挂起，也就是说，在拉取不到消息时不再进行长轮询
                         // 即当根据偏移量无法获取到消息时将不挂起线程等待新消息的到来，而是直接返回告诉客户端本次消息拉取未找到消息
                         // 因为这里 brokerAllowSuspend 为 false，也就表明不支持长轮询，因此不会将 response 置为 null
                         final RemotingCommand response = PullMessageProcessor.this.processRequest(channel, request, false);
@@ -127,8 +265,8 @@ public class RocketmqPushConsumerAnalysisTwo{
         private ConcurrentMap<String, ManyPullRequest> pullRequestTable = new ConcurrentHashMap<String, ManyPullRequest>(1024);
 
         public void suspendPullRequest(final String topic, final int queueId, final PullRequest pullRequest) {
-            // 根据消息主题和消息队列构建 key，从 pullRequestTable 中获取到该 主题@队列ID 对应的 ManyPullRequest，它内部持有一个 PullRequest 列表，
-            // 表示同一 主题@队列ID 累积拉取的消息队列
+            // 根据消息主题和消息队列构建 key，从 pullRequestTable 中获取到该【主题@队列ID】对应的 ManyPullRequest，它内部持有一个 PullRequest 列表，
+            // 表示同一【主题@队列ID】累积拉取的消息队列
             String key = this.buildKey(topic, queueId);
             ManyPullRequest mpr = this.pullRequestTable.get(key);
             if (null == mpr) {
@@ -155,7 +293,8 @@ public class RocketmqPushConsumerAnalysisTwo{
             log.info("{} service started", this.getServiceName());
             while (!this.isStopped()) {
                 try {
-                    // 如果开启了长轮询机制，每 5s 尝试一次，判断消息是否到达。如果未开启长轮询，则等待 shortPollingTimeMills 之后再尝试，默认 1s
+                    // 如果开启了长轮询机制，每 5s 尝试一次，判断消息是否到达
+                    // 如果未开启长轮询，则等待 shortPollingTimeMills 之后再尝试，shortPollingTimeMills 默认为 1s
                     // 现在有一种场景，在 PullRequest 休眠的5秒钟，如果有消息到达，也需要等待下次调度。
                     //
                     // 如果开启了长轮询，则需要等待 5s 之后才能被唤醒去检查是否有新的消息到达，这样消息的实时性比较差。
@@ -186,7 +325,7 @@ public class RocketmqPushConsumerAnalysisTwo{
         }
 
         private void checkHoldRequest() {
-            // 遍历拉取任务列表，根据键 主题@队列 获取到消息消费队列最大偏移量，如果该偏移量大于待拉取的偏移量，说明有新的消息到达，
+            // 遍历拉取任务列表，根据键 【主题@队列】 获取到消息消费队列最大偏移量，如果该偏移量大于待拉取的偏移量，说明有新的消息到达，
             // 调用 notifyMessageArriving 触发消息拉取
             for (String key : this.pullRequestTable.keySet()) {
                 String[] kArray = key.split(TOPIC_QUEUEID_SEPARATOR);
@@ -203,8 +342,7 @@ public class RocketmqPushConsumerAnalysisTwo{
             }
         }
 
-        public void notifyMessageArriving(final String topic, final int queueId, final long maxOffset,
-                final Long tagsCode, long msgStoreTime, byte[] filterBitMap, Map<String, String> properties) {
+        public void notifyMessageArriving(final String topic, final int queueId, final long maxOffset, final Long tagsCode, long msgStoreTime, byte[] filterBitMap, Map<String, String> properties) {
             String key = this.buildKey(topic, queueId);
             ManyPullRequest mpr = this.pullRequestTable.get(key);
             if (mpr != null) {
@@ -216,7 +354,7 @@ public class RocketmqPushConsumerAnalysisTwo{
                     for (PullRequest request : requestList) {
                         long newestOffset = maxOffset;
                         // newestOffset 表明消息队列中最新的消息 offset
-                        // 如果小于待拉取的偏移量 offset，则重新获取一下消息队列中最新的消息 offset
+                        // 如果 newestOffset 小于待拉取的偏移量 offset，则重新获取一下消息队列中最新的消息 offset
                         if (newestOffset <= request.getPullFromThisOffset()) {
                             newestOffset = this.brokerController.getMessageStore().getMaxOffsetInQueue(topic, queueId);
                         }
@@ -232,6 +370,7 @@ public class RocketmqPushConsumerAnalysisTwo{
 
                             if (match) {
                                 try {
+                                    // executeRequestWhenWakeup 方法会触发再次拉取消息
                                     this.brokerController.getPullMessageProcessor().executeRequestWhenWakeup(request.getClientChannel(), request.getRequestCommand());
                                 } catch (Throwable e) {
                                     log.error("execute request when wakeup failed.", e);
@@ -240,7 +379,7 @@ public class RocketmqPushConsumerAnalysisTwo{
                             }
                         }
 
-                        // 如果挂起超时时间超时，则不继续等待将直接返回客户消息未找到
+                        // 如果挂起超时时间超时，则不继续等待，直接去拉取消息，拉取不到消息也返回
                         if (System.currentTimeMillis() >= (request.getSuspendTimestamp() + request.getTimeoutMillis())) {
                             try {
                                 this.brokerController.getPullMessageProcessor().executeRequestWhenWakeup(request.getClientChannel(), request.getRequestCommand());
@@ -283,13 +422,67 @@ public class RocketmqPushConsumerAnalysisTwo{
     }
 
     /**
-     * PullMessageService 负责对消息队列进行消息拉取，从远端服务器拉取消息后存入消息处理队列 ProcessQueue 中，然后会调用 ConsumeMessageService#submitConsumeRequest 方法进行消息消费，
-     * 并且使用线程池来消费消息，确保了消息拉取和消息消费的解耦。RocketMQ 使用 ConsumeMessageService 来实现消息消费的处理逻辑。RocketMQ 支持顺序消费和并发消费。
+     * PullMessageService 负责对消息队列进行消息拉取，从远端服务器拉取消息后存入消息处理队列 ProcessQueue 中，然后会调用 
+     * ConsumeMessageService#submitConsumeRequest 方法进行消息消费，并且使用线程池来消费消息，确保了消息拉取和消息消费的解耦。RocketMQ 使用 
+     * ConsumeMessageService 来实现消息消费的处理逻辑。RocketMQ 支持顺序消费和并发消费。
      * 
-     * 从服务器拉取到消息后回调 PullCallBack 回调方法后，先将消息放入到 ProccessQueue 中，然后把消息提交到消费线程池中执行，也就是调用 ConsumeMessageService#submitConsumeRequest 
-     * 开始进入到消息消费的世界中来
+     * 从服务器拉取到消息后回调 PullCallBack 回调方法后，先将消息放入到 ProccessQueue 中，然后把消息提交到消费线程池中执行，也就是调用
+     * ConsumeMessageService#submitConsumeRequest 开始进入到消息消费的世界中来
      */
     public class ConsumeMessageConcurrentlyService implements ConsumeMessageService {
+
+        private static final Logger log = ClientLogger.getLog();
+        private final DefaultMQPushConsumerImpl defaultMQPushConsumerImpl;
+        private final DefaultMQPushConsumer defaultMQPushConsumer;
+        private final MessageListenerConcurrently messageListener;
+        private final BlockingQueue<Runnable> consumeRequestQueue;
+        private final ThreadPoolExecutor consumeExecutor;
+        private final String consumerGroup;
+        private final ScheduledExecutorService scheduledExecutorService;
+        private final ScheduledExecutorService cleanExpireMsgExecutors;
+
+        public ConsumeMessageConcurrentlyService(DefaultMQPushConsumerImpl defaultMQPushConsumerImpl, MessageListenerConcurrently messageListener) {
+
+            this.defaultMQPushConsumerImpl = defaultMQPushConsumerImpl;
+            this.messageListener = messageListener;
+
+            this.defaultMQPushConsumer = this.defaultMQPushConsumerImpl.getDefaultMQPushConsumer();
+            this.consumerGroup = this.defaultMQPushConsumer.getConsumerGroup();
+            this.consumeRequestQueue = new LinkedBlockingQueue<Runnable>();
+
+            /** 
+             * 接下来创建 3 个线程池，一个普通线程池 consumeExecutor，两个定时线程池 scheduledExecutorService 和 cleanExpiredMsgExecutors 
+             * cleanExpiredMsgExecutors:用来定时清理过期的消息
+             * consumeExecutor:用来进行消息消费
+             * scheduledExecutorService:延后一段时间来进行消息消费
+             */
+            this.consumeExecutor = new ThreadPoolExecutor(this.defaultMQPushConsumer.getConsumeThreadMin(),
+                    this.defaultMQPushConsumer.getConsumeThreadMax(), 1000 * 60, TimeUnit.MILLISECONDS,
+                    this.consumeRequestQueue, new ThreadFactoryImpl("ConsumeMessageThread_"));
+
+            this.scheduledExecutorService = Executors.newSingleThreadScheduledExecutor(new ThreadFactoryImpl("ConsumeMessageScheduledThread_"));
+            this.cleanExpireMsgExecutors = Executors.newSingleThreadScheduledExecutor(new ThreadFactoryImpl("CleanExpireMsgScheduledThread_"));
+
+        }
+
+        public void start() {
+            this.cleanExpireMsgExecutors.scheduleAtFixedRate(new Runnable() {
+                @Override
+                public void run() {
+                    // 清理过期的消息
+                    cleanExpireMsg();
+                }
+            }, this.defaultMQPushConsumer.getConsumeTimeout(), this.defaultMQPushConsumer.getConsumeTimeout(), TimeUnit.MINUTES);
+        }
+
+        private void cleanExpireMsg() {
+            Iterator<Map.Entry<MessageQueue, ProcessQueue>> it = this.defaultMQPushConsumerImpl.getRebalanceImpl().getProcessQueueTable().entrySet().iterator();
+            while (it.hasNext()) {
+                Map.Entry<MessageQueue, ProcessQueue> next = it.next();
+                ProcessQueue pq = next.getValue();
+                pq.cleanExpiredMsg(this.defaultMQPushConsumer);
+            }
+        }
 
         public void submitConsumeRequest(final List<MessageExt> msgs, final ProcessQueue processQueue, final MessageQueue messageQueue, final boolean dispatchToConsume) {
             // consumeMessageBatchMaxSize，在这里看来也就是一次消息消费任务 ConumeRequest 中包含的消息条数，默认为 1
@@ -307,8 +500,8 @@ public class RocketmqPushConsumerAnalysisTwo{
                     this.submitConsumeRequestLater(consumeRequest);
                 }
              
-            // 如果拉取的消息条数大于 consumeMessageBatchMaxSize 则对拉取消息进行分页，每页 consumeMessagBatchMaxSize 条消息，创建多个 ConsumeRequest 任务并提交到
-            // 消费线程池。ConsumRequest#run 方法封装了具体消息消费逻辑    
+            // 如果拉取的消息条数大于 consumeMessageBatchMaxSize 则对拉取消息进行分页，每页 consumeMessagBatchMaxSize 条消息，创建多个 ConsumeRequest 
+            // 任务并提交到消费线程池。ConsumRequest#run 方法封装了具体消息消费逻辑    
             } else {
                 for (int total = 0; total < msgs.size();) {
                     List<MessageExt> msgThis = new ArrayList<MessageExt>(consumeBatchSize);
@@ -319,7 +512,8 @@ public class RocketmqPushConsumerAnalysisTwo{
                             break;
                         }
                     }
-
+                    
+                    // msgThis 中的 msg 数目小于等于 consumeBatchSize
                     ConsumeRequest consumeRequest = new ConsumeRequest(msgThis, processQueue, messageQueue);
                     try {
                         this.consumeExecutor.submit(consumeRequest);
@@ -389,17 +583,8 @@ public class RocketmqPushConsumerAnalysisTwo{
             ConsumeConcurrentlyStatus status = null;
             ConsumeMessageContext consumeMessageContext = null;
 
-            // 执行消息消费的钩子函数 ConsumeMessageHook#consumeMessageBefore 函数
+            // 执行消息消费的钩子函数 ConsumeMessageHook#consumeMessageBefore 函数...
             // 钩子函数的注册是通过 consumer.getDefaultMQPushConsumerlmpl().registerConsumeMessageHook(hook)
-            if (ConsumeMessageConcurrentlyService.this.defaultMQPushConsumerImpl.hasHook()) {
-                consumeMessageContext = new ConsumeMessageContext();
-                consumeMessageContext.setConsumerGroup(defaultMQPushConsumer.getConsumerGroup());
-                consumeMessageContext.setProps(new HashMap<String, String>());
-                consumeMessageContext.setMq(messageQueue);
-                consumeMessageContext.setMsgList(msgs);
-                consumeMessageContext.setSuccess(false);
-                ConsumeMessageConcurrentlyService.this.defaultMQPushConsumerImpl.executeHookBefore(consumeMessageContext);
-            }
 
             long beginTimestamp = System.currentTimeMillis();
             boolean hasException = false;
@@ -443,15 +628,15 @@ public class RocketmqPushConsumerAnalysisTwo{
                 status = ConsumeConcurrentlyStatus.RECONSUME_LATER;
             }
 
-            // 执行消息消费的钩子函数 ConsumeMessageHook#consumeMessageAfter 函数
-            if (ConsumeMessageConcurrentlyService.this.defaultMQPushConsumerImpl.hasHook()) {
-                consumeMessageContext.setStatus(status.toString());
-                consumeMessageContext.setSuccess(ConsumeConcurrentlyStatus.CONSUME_SUCCESS == status);
-                ConsumeMessageConcurrentlyService.this.defaultMQPushConsumerImpl.executeHookAfter(consumeMessageContext);
-            }
+            // 执行消息消费的钩子函数 ConsumeMessageHook#consumeMessageAfter 函数...
 
             ConsumeMessageConcurrentlyService.this.getConsumerStatsManager().incConsumeRT(ConsumeMessageConcurrentlyService.this.consumerGroup, messageQueue.getTopic(), consumeRT);
 
+            // 执行业务消息消费后，在处理结果前再次验证一下 ProcessQueue 的 isDropped 状态值。前面说过，在 RebalanceImpl#updateProcessQueueTableInRebalance
+            // 方法中，如果当前 consumer 中的某一个 ProcessQueue 不再被使用，那么就将这个 PrcocessQueue 状态设置为 dropped。
+            // 也就是如果由于新的消费者加入或者原先的消费者出现宕机导致原先分配给消费者的队列在负载之后分配给别的消费者，那么
+            // 从 rocketmq 的角度看，消息就可能会被重复消费，所以必须将 ProcessQueue 设置为 dropped。并且在这里，如果
+            // dropped 为 true，就不对结果进行处理。
             if (!processQueue.isDropped()) {
                 ConsumeMessageConcurrentlyService.this.processConsumeResult(status, context, this);
             } else {
@@ -461,12 +646,12 @@ public class RocketmqPushConsumerAnalysisTwo{
 
         /**
          * 首先，我们需要明确，只有当消费模式为 MessageModel.CLUSTERING(集群模式) 时，Broker 才会自动进行重试，对于广播消息是不会重试的。
-         * 集群消费模式下，当消息消费失败，RocketMQ 会通过消息重试机制重新投递消息（sendMessageBack），努力使该消息消费成功。当消费者消费该重试消息后，需要返回结果给 broker，
-         * 告知 broker 消费成功（ConsumeConcurrentlyStatus.CONSUME_SUCCESS）或者需要重新消费（ConsumeConcurrentlyStatus.RECONSUME_LATER）。
+         * 集群消费模式下，当消息消费失败，RocketMQ 会通过消息重试机制重新投递消息（sendMessageBack），努力使该消息消费成功。当消费者消费该重试消息后，
+         * 需要返回结果给 broker，告知 broker 消费成功（ConsumeConcurrentlyStatus.CONSUME_SUCCESS）或者需要重新消费（ConsumeConcurrentlyStatus.RECONSUME_LATER）。
          * 
          * 只要返回 ConsumeConcurrentlyStatus.RECONSUME_LATER，RocketMQ 就会认为这批消息消费失败了。
-         * 为了保证消息是肯定被至少消费成功一次，RocketMQ 会把这批消息重发回 Broker（topic 不是原 topic 而是这个消费租的 RETRY topic），在延迟的某个时间点（默认是10秒，业务可设置）后，
-         * 再次投递到这个 ConsumerGroup。而如果一直这样重复消费都持续失败到一定次数（默认16次），就会投递到 DLQ 死信队列
+         * 为了保证消息是肯定被至少消费成功一次，RocketMQ 会把这批消息重发回 Broker（topic 不是原 topic 而是这个消费组的 RETRY topic），在延迟的某个时间点
+         * （默认是10秒，业务可设置）后，再次投递到这个 ConsumerGroup。而如果一直这样重复消费都持续失败到一定次数（默认16次），就会投递到 DLQ 死信队列
          * 
          * RocketMQ 规定，以下三种情况统一按照消费失败处理并会发起重试。
          * 
@@ -474,10 +659,10 @@ public class RocketmqPushConsumerAnalysisTwo{
          * 业务消费方返回 null
          * 业务消费方主动/被动抛出异常
          * 
-         * 前两种情况较容易理解，当返回 ConsumeConcurrentlyStatus.RECONSUME_LATER 或者 null 时，broker 会知道消费失败，后续就会发起消息重试，重新投递该消息。
-         * 注意 对于抛出异常的情况，只要我们在业务逻辑中显式抛出异常或者非显式抛出异常，broker 也会重新投递消息，如果业务对异常做了捕获，那么该消息将不会发起重试。
+         * 前两种情况较容易理解，当返回 ConsumeConcurrentlyStatus.RECONSUME_LATER 或者 null 时, rocketmq 会知道消费失败，后续就会发起消息重试，重新投递该消息。
+         * 注意 对于抛出异常的情况，只要我们在业务逻辑中显式抛出异常或者非显式抛出异常，rocketmq 也会重新投递消息，如果业务对异常做了捕获，那么该消息将不会发起重试。
          * 因此对于需要重试的业务，消费方在捕获异常的时候要注意返回 ConsumeConcurrentlyStatus.RECONSUMELATER 或 null 并输出异常日志，打印当前重试次数。
-         * （推荐返回ConsumeConcurrentlyStatus.RECONSUMELATER）
+         * （推荐返回 ConsumeConcurrentlyStatus.RECONSUMELATER）
          */
         public void processConsumeResult(final ConsumeConcurrentlyStatus status, final ConsumeConcurrentlyContext context, final ConsumeRequest consumeRequest) {
             // 从哪里开始重试，ackIndex默认是int最大值，除非用户自己指定了从哪些消息开始重试
@@ -489,7 +674,7 @@ public class RocketmqPushConsumerAnalysisTwo{
             // 根据消息监听器返回的结果，计算 ackIndex，如果返回 CONSUME_SUCCESS，ackIndex 设置为 msgs.size() - 1，
             // 如果返回 RECONSUME_LATER，ackIndex = -1，这是为下文发送 msg back（ACK）做准备
             switch (status) {
-                // 即使是CONSUME_SUCCESS，也可能部分消息需要重试
+                // 即使是CONSUME_SUCCESS，也可能部分消息需要重试, ackIndex 表示的是消费成功的消息的索引
                 case CONSUME_SUCCESS:
                     if (ackIndex >= consumeRequest.getMsgs().size()) {
                         ackIndex = consumeRequest.getMsgs().size() - 1;
@@ -521,7 +706,8 @@ public class RocketmqPushConsumerAnalysisTwo{
                         MessageExt msg = consumeRequest.getMsgs().get(i);
                         // 进行消息重试
                         boolean result = this.sendMessageBack(msg, context);
-                        // 如果消息重试失败，则把发送失败的消息再次封装称为 ConsumeRequest，然后延迟 5s 重新消费，如果 ACK 消息发送成功，则该消息会进行延迟消费
+                        // 如果消息重试失败，则把消息添加到 msgBackFailed 中，稍后再进行一次消费
+                        // 则把发送失败的消息再次封装称为 ConsumeRequest，然后延迟 5s 重新消费，如果 ACK 消息发送成功，则该消息会进行延迟消费
                         if (!result) {
                             msg.setReconsumeTimes(msg.getReconsumeTimes() + 1);
                             msgBackFailed.add(msg);
@@ -537,6 +723,7 @@ public class RocketmqPushConsumerAnalysisTwo{
                 default:
                     break;
             }
+
             // 将消费前缓存的消息从 ProcessQueue 中清除
             // 这里有一个问题，在普通消息消费的时候，是并发处理，如果出现offset靠后的消息先被消费完，但是我们的offset靠前的还没有被消费完，
             // 这个时候出现了宕机，我们的offset靠前的这部分数据是否会丢失呢？也就是下次消费的时候是否会从offset靠后的没有被消费的开始消费呢？
@@ -669,7 +856,7 @@ public class RocketmqPushConsumerAnalysisTwo{
 
             // 创建重试主题，重试主题名称为 %RETRY% + 消费组名
             String newTopic = MixAll.getRetryTopic(requestHeader.getGroup());
-            // 从重试队列中随机选择一个队列
+            // 创建一个新的消息队列 id，queueId，从重试队列中随机选择一个队列
             int queueIdInt = Math.abs(this.random.nextInt() % 99999999) % subscriptionGroupConfig.getRetryQueueNums();
 
             int topicSysFlag = 0;
@@ -695,6 +882,7 @@ public class RocketmqPushConsumerAnalysisTwo{
                 return response;
             }
 
+            // PROPERTY_RETRY_TOPIC 保存的是这个消息原始的 topic，比如 test-topic 
             final String retryTopic = msgExt.getProperty(MessageConst.PROPERTY_RETRY_TOPIC);
             if (null == retryTopic) {
                 MessageAccessor.putProperty(msgExt, MessageConst.PROPERTY_RETRY_TOPIC, msgExt.getTopic());
@@ -725,7 +913,8 @@ public class RocketmqPushConsumerAnalysisTwo{
                 msgExt.setDelayTimeLevel(delayLevel);
             }
 
-            // 根据原先的消息创建一个新的消息对象，重试消息会拥有自己唯一消息 ID(msgID) 并存人到 commitlog 文件中，并不会去更新原先消息（也就是 msgExt），其它属性与原先消息保持相同，主题名称为重试主题
+            // 根据原先的消息创建一个新的消息对象，重试消息会拥有自己唯一消息 ID(msgID) 并存人到 commitlog 文件中，并不会去更新原先消息（也就是 msgExt），
+            //
             // 将消息存入到 CommitLog 件中，这里介绍一个机制，消息重试机制依托于定时任务实现。
             // MessageExtBrokerInner，也就是对重试的消息，rocketMQ 会创建一个新的 MessageExtBrokerInner 对象，它实际上是继承了 MessageExt
             MessageExtBrokerInner msgInner = new MessageExtBrokerInner();
@@ -736,7 +925,6 @@ public class RocketmqPushConsumerAnalysisTwo{
             MessageAccessor.setProperties(msgInner, msgExt.getProperties());
             msgInner.setPropertiesString(MessageDecoder.messageProperties2String(msgExt.getProperties()));
             msgInner.setTagsCode(MessageExtBrokerInner.tagsString2tagsCode(null, msgExt.getTags()));
-
             // 设置重试队列的队列 id
             msgInner.setQueueId(queueIdInt);
             msgInner.setSysFlag(msgExt.getSysFlag());
@@ -748,13 +936,13 @@ public class RocketmqPushConsumerAnalysisTwo{
 
             String originMsgId = MessageAccessor.getOriginMessageId(msgExt);
             MessageAccessor.setOriginMessageId(msgInner, UtilAll.isBlank(originMsgId) ? msgExt.getMsgId() : originMsgId);
+
             // 消息刷盘
-            // 按照正常的消息消费流程，消息保存在 broker 之后，consumer 就可以拉取消费了，和普通消息不一样的是拉取消息的并不是 consumer 本来订阅的 topic，而是 %RETRY%+group。
-            // broker 创建 retryTopic 之后，和正常的 topic 配置一样同步到 namesrv，然后 consumer 就可以从 namesrv 获取到 retryTopic 配置了。
-            // 所以 consumer 会拉取 %RETRY%+group 对应的消息：
-            // consumer 发送重试消息给 broker 以后，broker 存储在新的 retryTopic下，作为一个新的 topic，consume 会拉取这个新的 topic 的消息
-            // consumer 拉取到这个 retryTopic 的消息之后再把 topic 换成原来的 topic：org.apache.rocketmq.client.impl.consumer.ConsumeMessageConcurrentlyService#resetRetryTopic，
-            // 然后交给 consume 的 listener 处理
+            // 按照正常的消息消费流程，消息保存在 broker 之后，consumer 就可以拉取消费了，和普通消息不一样的是拉取消息的并不是 consumer 本来订阅的 topic，
+            // 而是 %RETRY%+group
+            // 这里保存消息到 CommitLog 中，如果 delayLevel > 0，则将 msgInner 的 topic 由 %RETRY% + consumerGroup 更改为 SCHEDULE_TOPIC_XXXX，
+            // 并且将队列 id 改为 delayLevel - 1，然后将原始的 topic（%RETRY% + consumer group）和 queueId 保存到 properties 的 PROPERTY_REAL_TOPIC
+            // 和 PROPERTY_REAL_QUEUE_ID 属性中
             PutMessageResult putMessageResult = this.brokerController.getMessageStore().putMessage(msgInner);
             if (putMessageResult != null) {
                 switch (putMessageResult.getPutMessageStatus()) {
@@ -811,78 +999,6 @@ public class RocketmqPushConsumerAnalysisTwo{
             }
 
             return result;
-
-        }
-
-    }
-
-    public class CommitLog{
-
-        public PutMessageResult putMessage(final MessageExtBrokerInner msg) {
-            // Set the storage time
-            msg.setStoreTimestamp(System.currentTimeMillis());
-            // Set the message body BODY CRC (consider the most appropriate setting
-            // on the client)
-            msg.setBodyCRC(UtilAll.crc32(msg.getBody()));
-            // Back to Results
-            AppendMessageResult result = null;
-    
-            StoreStatsService storeStatsService = this.defaultMessageStore.getStoreStatsService();
-    
-            String topic = msg.getTopic();
-            int queueId = msg.getQueueId();
-            final int tranType = MessageSysFlag.getTransactionValue(msg.getSysFlag());
-
-            // 如果是重试消息，在进行延时级别判断时候，返回 true，则进入分支逻辑，通过这段逻辑我们可以知道，
-            // 对于重试的消息，rocketMQ 并不会从原队列中获取消息，而是创建了一个新的 Topic 进行消息存储的
-            if (tranType == MessageSysFlag.TRANSACTION_NOT_TYPE || tranType == MessageSysFlag.TRANSACTION_COMMIT_TYPE) {
-                // 处理延时级别
-                if (msg.getDelayTimeLevel() > 0) {
-                    if (msg.getDelayTimeLevel() > this.defaultMessageStore.getScheduleMessageService().getMaxDelayLevel()) {
-                        msg.setDelayTimeLevel(this.defaultMessageStore.getScheduleMessageService().getMaxDelayLevel());
-                    }
-                    // 更换 Topic，也就是 SCHEDULE_TOPIC_XXXX 字符串
-                    topic = ScheduleMessageService.SCHEDULE_TOPIC;
-                    // 队列 ID 为延迟级别减 1
-                    queueId = ScheduleMessageService.delayLevel2QueueId(msg.getDelayTimeLevel());
-    
-                    // Backup real topic, queueId
-                    // 保存 msg 到原来的 topic 和 queueId，也就是 Message 的 properties 中
-                    MessageAccessor.putProperty(msg, MessageConst.PROPERTY_REAL_TOPIC, msg.getTopic());
-                    MessageAccessor.putProperty(msg, MessageConst.PROPERTY_REAL_QUEUE_ID, String.valueOf(msg.getQueueId()));
-                    msg.setPropertiesString(MessageDecoder.messageProperties2String(msg.getProperties()));
-
-                    // 重置 topic 及 queueId
-                    msg.setTopic(topic);
-                    msg.setQueueId(queueId);
-                }
-            }
-    
-            // ignore code
-    
-            return putMessageResult;
-        }
-
-        public DispatchRequest checkMessageAndReturnSize(java.nio.ByteBuffer byteBuffer, final boolean checkCRC, final boolean readBody) {
-
-            // ignore code
-
-            // Timing message processing
-            {
-                String t = propertiesMap.get(MessageConst.PROPERTY_DELAY_TIME_LEVEL);
-                if (ScheduleMessageService.SCHEDULE_TOPIC.equals(topic) && t != null) {
-                    int delayLevel = Integer.parseInt(t);
-
-                    if (delayLevel > this.defaultMessageStore.getScheduleMessageService().getMaxDelayLevel()) {
-                        delayLevel = this.defaultMessageStore.getScheduleMessageService().getMaxDelayLevel();
-                    }
-
-                    if (delayLevel > 0) {
-                        tagsCode = this.defaultMessageStore.getScheduleMessageService().computeDeliverTimestamp(delayLevel, storeTimestamp);
-                    }
-                }
-            }
-
         }
 
     }
