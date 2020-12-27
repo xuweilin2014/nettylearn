@@ -1057,6 +1057,39 @@ public class RocketmqRemotingAnalysis{
             this.remotingClient.registerProcessor(RequestCode.CONSUME_MESSAGE_DIRECTLY, this.clientRemotingProcessor, null);
         }
 
+        public void consumerSendMessageBack(final String addr, final MessageExt msg, final String consumerGroup,
+                final int delayLevel, final long timeoutMillis, final int maxConsumeRetryTimes)throws RemotingException, MQBrokerException, InterruptedException {
+
+            ConsumerSendMsgBackRequestHeader requestHeader = new ConsumerSendMsgBackRequestHeader();
+            // 和普通的发送消息的 RequestCode 不一样，broker 处理的方法也不一样
+            RemotingCommand request = RemotingCommand.createRequestCommand(RequestCode.CONSUMER_SEND_MSG_BACK, requestHeader);
+
+            requestHeader.setGroup(consumerGroup);
+            // 因为重试的消息被 broker 拿到后会修改 topic，所以这里设置原始的 topic
+            requestHeader.setOriginTopic(msg.getTopic());
+            // broker 会根据 offset 查询原始的消息
+            requestHeader.setOffset(msg.getCommitLogOffset());
+            // 设置 delayLevel，这个值决定了该消息是否会被延时消费、延时多久，
+            // 用户可以设置延时等级，默认是 0，不延时(但是 broker 端会有逻辑：如果为 0 会加 3)
+            requestHeader.setDelayLevel(delayLevel);
+            // 设置最初的 msgId
+            requestHeader.setOriginMsgId(msg.getMsgId());
+            // 设置最多被重试的次数，默认是 16
+            requestHeader.setMaxReconsumeTimes(maxConsumeRetryTimes);
+            // 以同步的方式发送 ACK 请求到服务端
+            RemotingCommand response = this.remotingClient.invokeSync(MixAll.brokerVIPChannel(this.clientConfig.isVipChannelEnabled(), addr), request, timeoutMillis);
+            assert response != null;
+            switch (response.getCode()) {
+                case ResponseCode.SUCCESS: {
+                    return;
+                }
+                default:
+                    break;
+            }
+
+            throw new MQBrokerException(response.getCode(), response.getRemark());
+        }
+
         public TopicRouteData getTopicRouteInfoFromNameServer(final String topic, final long timeoutMillis) throws Exception {
             return getTopicRouteInfoFromNameServer(topic, timeoutMillis, true);
         }
@@ -1224,6 +1257,7 @@ public class RocketmqRemotingAnalysis{
             return null;
         }
 
+        // MQClientAPIImpl#pullMessageAsync
         private void pullMessageAsync(final String addr, final RemotingCommand request, final long timeoutMillis, final PullCallback pullCallback) throws Exception {
 
             this.remotingClient.invokeAsync(addr, request, timeoutMillis, new InvokeCallback() {

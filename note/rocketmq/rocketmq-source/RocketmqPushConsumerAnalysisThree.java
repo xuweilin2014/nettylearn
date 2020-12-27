@@ -169,7 +169,7 @@ public class RocketmqPushConsumerAnalysisThree{
      */ 
 
     
-    public class ScheduleMessageService extends ConfigManager {
+    public static class ScheduleMessageService extends ConfigManager {
         // 定时消息统一主题
         public static final String SCHEDULE_TOPIC = "SCHEDULE_TOPIC_XXXX";
         // 第一次调度延迟的时间，默认为 1s
@@ -229,6 +229,14 @@ public class RocketmqPushConsumerAnalysisThree{
             }, 10000, this.defaultMessageStore.getMessageStoreConfig().getFlushDelayOffsetInterval());
         }
 
+        public static int queueId2DelayLevel(final int queueId) {
+            return queueId + 1;
+        }
+    
+        public static int delayLevel2QueueId(final int delayLevel) {
+            return delayLevel - 1;
+        }
+
     }
 
     // ScheduleMessageService#start 方法启动后，会为每一个延迟级别创建一个调度任务，每一个延迟级别其实对应 SCHEDULE_TOPIC_XXXX 主题下的一个消息消费队列。
@@ -240,6 +248,7 @@ public class RocketmqPushConsumerAnalysisThree{
         private final long offset;
 
         @Override
+        // DeliverDelayedMessageTimerTask#run
         public void run() {
             try {
                 this.executeOnTimeup();
@@ -349,6 +358,7 @@ public class RocketmqPushConsumerAnalysisThree{
         }
 
         // 根据消息重新构建新的消息对象，清除消息的延迟级别属性(delayLevel)、并恢复消息原先的消息主题与消息消费队列，消息的消费次数 reconsumeTimes 并不会丢失
+        // DeliverDelayedMessageTimerTask#messageTimeup
         private MessageExtBrokerInner messageTimeup(MessageExt msgExt) {
             // 创建一个新的 MessageExtBrokerInner 对象
             MessageExtBrokerInner msgInner = new MessageExtBrokerInner();
@@ -380,7 +390,6 @@ public class RocketmqPushConsumerAnalysisThree{
     
             return storeTimestamp + 1000;
         }
-
     }
 
     /**
@@ -527,6 +536,7 @@ public class RocketmqPushConsumerAnalysisThree{
             }
         }
 
+        // RebalanceImpl#doRebalance
         // 有两种情况下，要重新进行负载均衡（doRebalance）：
         // 1.消费者 Consumer 的上线和下线
         // 2.定时每隔 20s 来重新进行一次负载均衡
@@ -553,6 +563,7 @@ public class RocketmqPushConsumerAnalysisThree{
             this.truncateMessageQueueNotMyTopic();
         }
 
+        // RebalanceImpl#rebalanceByTopic
         private void rebalanceByTopic(final String topic, final boolean isOrder) {
             switch (messageModel) {
                 case BROADCASTING: {
@@ -582,18 +593,18 @@ public class RocketmqPushConsumerAnalysisThree{
                             log.warn("doRebalance, {}, but the topic[{}] not exist.", consumerGroup, topic);
                         }
                     }
-    
+
                     if (null == cidAll) {
                         log.warn("doRebalance, {} {}, get consumer id list failed", consumerGroup, topic);
                     }
-    
+
                     if (mqSet != null && cidAll != null) {
                         List<MessageQueue> mqAll = new ArrayList<MessageQueue>();
                         mqAll.addAll(mqSet);
                         // 将 MQ 和 cid 都排好序，这个很重要，因为要确保同一个消费队列不会被分配给多个消费者
                         Collections.sort(mqAll);
                         Collections.sort(cidAll);
-    
+
                         AllocateMessageQueueStrategy strategy = this.allocateMessageQueueStrategy;
                         List<MessageQueue> allocateResult = null;
                         try {
@@ -605,7 +616,7 @@ public class RocketmqPushConsumerAnalysisThree{
                             log.error("AllocateMessageQueueStrategy.allocate Exception. allocateMessageQueueStrategyName={}", strategy.getName(), e);
                             return;
                         }
-    
+
                         Set<MessageQueue> allocateResultSet = new HashSet<MessageQueue>();
                         if (allocateResult != null) {
                             allocateResultSet.addAll(allocateResult);
@@ -638,6 +649,7 @@ public class RocketmqPushConsumerAnalysisThree{
          * 
          * 由此可见，新增的 queue 只有第一次 Pull 请求时 RebalanceImpl 发起的，后续请求是在 broker 返回数据后，处理线程发起的。
          */
+        // RebalanceImpl#updateProcessQueueTableInRebalance
         private boolean updateProcessQueueTableInRebalance(final String topic, final Set<MessageQueue> mqSet, final boolean isOrder) {
             boolean changed = false;
 
@@ -669,7 +681,7 @@ public class RocketmqPushConsumerAnalysisThree{
                 if (!this.processQueueTable.containsKey(mq)) {
                     // 如果是顺序消息，对于新分配的消息队列，首先尝试向 Broker 发起锁定该消息队列的请求
                     // 如果返回加锁成功则创建该消息队列的拉取请求，否则直接跳过。等待其他消费者释放该消息队列的锁，然后在下一次队列重新负载均衡的时候
-                    //  再尝试重新加锁
+                    // 再尝试重新加锁
                     if (isOrder && !this.lock(mq)) {
                         log.warn("doRebalance, {}, add a new mq failed, {}, because lock failed", consumerGroup, mq);
                         continue;
@@ -712,6 +724,7 @@ public class RocketmqPushConsumerAnalysisThree{
     }
 
     public class RebalancePushImpl extends RebalanceImpl {
+        // RebalancePushImpl#dispatchPullRequest
         @Override
         public void dispatchPullRequest(List<PullRequest> pullRequestList) {
             for (PullRequest pullRequest : pullRequestList) {
@@ -1043,7 +1056,6 @@ public class RocketmqPushConsumerAnalysisThree{
 
 
     public class ProcessQueue{
-
         /**
          * 提交，就是将该批消息从 ProceeQueue 中移除，维护 msgCount (消息处理队列中消息条数) 并获取消息消费的偏移量 offset，
          * 然后将该批消息从 msgTreeMapTemp 中移除，并返回待保存的消息消费进度 (offset+ 1)，从中可以看出 offset 表示消息消费队列的逻辑偏移似于数组的下标，
@@ -1072,7 +1084,6 @@ public class RocketmqPushConsumerAnalysisThree{
     
             return -1;
         }
-
     }
 
     /**

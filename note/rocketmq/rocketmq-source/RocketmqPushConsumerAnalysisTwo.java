@@ -39,14 +39,15 @@ public class RocketmqPushConsumerAnalysisTwo{
             // 将 request 中的 opaque 参数设置到 response 中，opaque 也就是 requestId
             response.setOpaque(request.getOpaque());
 
-            // ignore code
+            // 省略代码
 
-            // Broker 是否开启长轮询
+            // 这个就是 DefaultMQPushConsumerImpl 中 sysFlag 的 FLAG_SUSPEND 位，表示 Consumer 是否希望 Broker 开启长轮询
             final boolean hasSuspendFlag = PullSysFlag.hasSuspendFlag(requestHeader.getSysFlag());
-            // Broker 开启长轮询的等待时间，从 requestHeader 中获得
+            // 从 requestHeader 中获得，这个参数也是 DefaultMQPushConsumerImpl 中的
+            // CONSUMER_TIMEOUT_MILLIS_WHEN_SUSPEND，表示 Consumer 希望 Broker 端长轮询挂起的时间
             final long suspendTimeoutMillisLong = hasSuspendFlag ? requestHeader.getSuspendTimeoutMillis() : 0;
 
-            // ignore code
+            // 省略代码
 
             MessageFilter messageFilter;
             
@@ -199,6 +200,7 @@ public class RocketmqPushConsumerAnalysisTwo{
             
         }
 
+        // PullMessageProcessor#executeRequestWhenWakeup
         public void executeRequestWhenWakeup(final Channel channel, final RemotingCommand request) throws RemotingCommandException {
             Runnable run = new Runnable() {
                 @Override
@@ -264,6 +266,7 @@ public class RocketmqPushConsumerAnalysisTwo{
         // topic@queueId -> ManyPullRequest
         private ConcurrentMap<String, ManyPullRequest> pullRequestTable = new ConcurrentHashMap<String, ManyPullRequest>(1024);
 
+        // PullRequestHoldService#suspendPullRequest
         public void suspendPullRequest(final String topic, final int queueId, final PullRequest pullRequest) {
             // 根据消息主题和消息队列构建 key，从 pullRequestTable 中获取到该【主题@队列ID】对应的 ManyPullRequest，它内部持有一个 PullRequest 列表，
             // 表示同一【主题@队列ID】累积拉取的消息队列
@@ -280,8 +283,10 @@ public class RocketmqPushConsumerAnalysisTwo{
             mpr.addPullRequest(pullRequest);
         }
 
+        // PullRequestHoldService#buildKey
         private String buildKey(final String topic, final int queueId) {
             StringBuilder sb = new StringBuilder();
+            // key = topic + @ + queueId
             sb.append(topic);
             sb.append(TOPIC_QUEUEID_SEPARATOR);
             sb.append(queueId);
@@ -311,6 +316,7 @@ public class RocketmqPushConsumerAnalysisTwo{
                     }
 
                     long beginLockTimestamp = this.systemClock.now();
+                    // 依次检查 pullRequestTable 中的 PullRequest，也就是判断是否有符合其条件的消息到达 Broker
                     this.checkHoldRequest();
                     long costTime = this.systemClock.now() - beginLockTimestamp;
                     if (costTime > 5 * 1000) {
@@ -324,6 +330,7 @@ public class RocketmqPushConsumerAnalysisTwo{
             log.info("{} service end", this.getServiceName());
         }
 
+        // PullRequestHoldService#checkHoldRequest
         private void checkHoldRequest() {
             // 遍历拉取任务列表，根据键 【主题@队列】 获取到消息消费队列最大偏移量，如果该偏移量大于待拉取的偏移量，说明有新的消息到达，
             // 调用 notifyMessageArriving 触发消息拉取
@@ -484,6 +491,7 @@ public class RocketmqPushConsumerAnalysisTwo{
             }
         }
 
+        // ConsumeMessageConcurrentlyService#submitConsumeRequest
         public void submitConsumeRequest(final List<MessageExt> msgs, final ProcessQueue processQueue, final MessageQueue messageQueue, final boolean dispatchToConsume) {
             // consumeMessageBatchMaxSize，在这里看来也就是一次消息消费任务 ConumeRequest 中包含的消息条数，默认为 1
             final int consumeBatchSize = this.defaultMQPushConsumer.getConsumeMessageBatchMaxSize();
@@ -499,7 +507,7 @@ public class RocketmqPushConsumerAnalysisTwo{
                 } catch (RejectedExecutionException e) {
                     this.submitConsumeRequestLater(consumeRequest);
                 }
-             
+                
             // 如果拉取的消息条数大于 consumeMessageBatchMaxSize 则对拉取消息进行分页，每页 consumeMessagBatchMaxSize 条消息，创建多个 ConsumeRequest 
             // 任务并提交到消费线程池。ConsumRequest#run 方法封装了具体消息消费逻辑    
             } else {
@@ -529,22 +537,23 @@ public class RocketmqPushConsumerAnalysisTwo{
 
         }
 
+        // ConsumeMessageConcurrentlyService#sendMessageBack
         public boolean sendMessageBack(final MessageExt msg, final ConsumeConcurrentlyContext context) {
+            // 当 msg 第一次进行消息重试时，delayLevel 默认设置为 0
             int delayLevel = context.getDelayLevelWhenNextConsume();
-    
             try {
                 this.defaultMQPushConsumerImpl.sendMessageBack(msg, delayLevel, context.getMessageQueue().getBrokerName());
                 return true;
             } catch (Exception e) {
                 log.error("sendMessageBack exception, group: " + this.consumerGroup + " msg: " + msg.toString(), e);
             }
-    
             return false;
         }
 
-        // 恢复重试消息主题名。这是为什么呢？这是由消息重试机制决定的，RocketMQ 将消息存入 commitlog 文件时，如果发现消息的延时级别 delayTimeLevel > 0 会首先
-        // 将重试主题存入在消息的属性中，然后设置主题名称为 SCHEDULE_TOPIC_XXX，以便时间到后重新参与消息消费。而消费者在从重试队列中 pull 拉取到了对应的数据之后，
-        // 需要再把 topic（也就是 %RETRY% + ConsumerGroup） 换成原来的 topic
+        // 恢复重试消息主题名。这是为什么呢？这是由消息重试机制决定的，Broker 端在对重试消息进行处理时，
+        // 会把原始的消息主题（比如 test-topic）保存到 PROPERTY_RETRY_TOPIC 中，替换为重试主题 %RETRY% + consumer group，
+        // 所以在这里要将重试主题更改为原来的主题
+        // ConsumeMessageConcurrentlyService#resetRetryTopic
         public void resetRetryTopic(final List<MessageExt> msgs) {
             final String groupTopic = MixAll.getRetryTopic(consumerGroup);
             for (MessageExt msg : msgs) {
@@ -552,95 +561,6 @@ public class RocketmqPushConsumerAnalysisTwo{
                 if (retryTopic != null && groupTopic.equals(msg.getTopic())) {
                     msg.setTopic(retryTopic);
                 }
-            }
-        }
-
-    }
-
-    class ConsumeRequest implements Runnable {
-
-        private final List<MessageExt> msgs;
-        private final ProcessQueue processQueue;
-        private final MessageQueue messageQueue;
-
-        public ConsumeRequest(List<MessageExt> msgs, ProcessQueue processQueue, MessageQueue messageQueue) {
-            this.msgs = msgs;
-            this.processQueue = processQueue;
-            this.messageQueue = messageQueue;
-        }
-
-        // 消息处理的逻辑比较简单，就是回调Consumer启动时注册的Listener。无论Listener是否处理成功，消息都会从ProcessQueue中移除掉
-        @Override
-        public void run() {
-            // 先检查 processQueue 的 dropped，
-            if (this.processQueue.isDropped()) {
-                log.info("the message queue not be able to consume, because it's dropped. group={} {}", ConsumeMessageConcurrentlyService.this.consumerGroup, this.messageQueue);
-                return;
-            }
-
-            MessageListenerConcurrently listener = ConsumeMessageConcurrentlyService.this.messageListener;
-            ConsumeConcurrentlyContext context = new ConsumeConcurrentlyContext(messageQueue);
-            ConsumeConcurrentlyStatus status = null;
-            ConsumeMessageContext consumeMessageContext = null;
-
-            // 执行消息消费的钩子函数 ConsumeMessageHook#consumeMessageBefore 函数...
-            // 钩子函数的注册是通过 consumer.getDefaultMQPushConsumerlmpl().registerConsumeMessageHook(hook)
-
-            long beginTimestamp = System.currentTimeMillis();
-            boolean hasException = false;
-            ConsumeReturnType returnType = ConsumeReturnType.SUCCESS;
-            try {
-                ConsumeMessageConcurrentlyService.this.resetRetryTopic(msgs);
-                if (msgs != null && !msgs.isEmpty()) {
-                    for (MessageExt msg : msgs) {
-                        MessageAccessor.setConsumeStartTimeStamp(msg, String.valueOf(System.currentTimeMillis()));
-                    }
-                }
-                // 执行具体的消息消费，调用应用程序消息监昕器的 consumeMessage 方法，进入到具体的消息消费业务逻辑，返回该批消息的消费结果，
-                // 最终将返回 CONSUME_SUCCESS （消费成功）或 RECONSUME_LATER （需要重新消费）
-                status = listener.consumeMessage(Collections.unmodifiableList(msgs), context);
-            } catch (Throwable e) {
-                // 打印日志
-                hasException = true;
-            }
-
-            long consumeRT = System.currentTimeMillis() - beginTimestamp;
-            if (null == status) {
-                if (hasException) {
-                    returnType = ConsumeReturnType.EXCEPTION;
-                } else {
-                    returnType = ConsumeReturnType.RETURNNULL;
-                }
-            } else if (consumeRT >= defaultMQPushConsumer.getConsumeTimeout() * 60 * 1000) {
-                returnType = ConsumeReturnType.TIME_OUT;
-            } else if (ConsumeConcurrentlyStatus.RECONSUME_LATER == status) {
-                returnType = ConsumeReturnType.FAILED;
-            } else if (ConsumeConcurrentlyStatus.CONSUME_SUCCESS == status) {
-                returnType = ConsumeReturnType.SUCCESS;
-            }
-
-            if (ConsumeMessageConcurrentlyService.this.defaultMQPushConsumerImpl.hasHook()) {
-                consumeMessageContext.getProps().put(MixAll.CONSUME_CONTEXT_TYPE, returnType.name());
-            }
-
-            if (null == status) {
-                // 打印日志
-                status = ConsumeConcurrentlyStatus.RECONSUME_LATER;
-            }
-
-            // 执行消息消费的钩子函数 ConsumeMessageHook#consumeMessageAfter 函数...
-
-            ConsumeMessageConcurrentlyService.this.getConsumerStatsManager().incConsumeRT(ConsumeMessageConcurrentlyService.this.consumerGroup, messageQueue.getTopic(), consumeRT);
-
-            // 执行业务消息消费后，在处理结果前再次验证一下 ProcessQueue 的 isDropped 状态值。前面说过，在 RebalanceImpl#updateProcessQueueTableInRebalance
-            // 方法中，如果当前 consumer 中的某一个 ProcessQueue 不再被使用，那么就将这个 PrcocessQueue 状态设置为 dropped。
-            // 也就是如果由于新的消费者加入或者原先的消费者出现宕机导致原先分配给消费者的队列在负载之后分配给别的消费者，那么
-            // 从 rocketmq 的角度看，消息就可能会被重复消费，所以必须将 ProcessQueue 设置为 dropped。并且在这里，如果
-            // dropped 为 true，就不对结果进行处理。
-            if (!processQueue.isDropped()) {
-                ConsumeMessageConcurrentlyService.this.processConsumeResult(status, context, this);
-            } else {
-                log.warn("processQueue is dropped without process consume result. messageQueue={}, msgs={}", messageQueue, msgs);
             }
         }
 
@@ -740,6 +660,96 @@ public class RocketmqPushConsumerAnalysisTwo{
             }
         }
 
+    }
+
+    class ConsumeRequest implements Runnable {
+
+        private final List<MessageExt> msgs;
+        private final ProcessQueue processQueue;
+        private final MessageQueue messageQueue;
+
+        public ConsumeRequest(List<MessageExt> msgs, ProcessQueue processQueue, MessageQueue messageQueue) {
+            this.msgs = msgs;
+            this.processQueue = processQueue;
+            this.messageQueue = messageQueue;
+        }
+
+        // ConsumeRequest#run
+        // 消息处理的逻辑比较简单，就是回调Consumer启动时注册的Listener。无论Listener是否处理成功，消息都会从ProcessQueue中移除掉
+        @Override
+        public void run() {
+            // 先检查 processQueue 的 dropped，
+            if (this.processQueue.isDropped()) {
+                log.info("the message queue not be able to consume, because it's dropped. group={} {}");
+                return;
+            }
+
+            MessageListenerConcurrently listener = ConsumeMessageConcurrentlyService.this.messageListener;
+            ConsumeConcurrentlyContext context = new ConsumeConcurrentlyContext(messageQueue);
+            ConsumeConcurrentlyStatus status = null;
+            ConsumeMessageContext consumeMessageContext = null;
+
+            // 执行消息消费的钩子函数 ConsumeMessageHook#consumeMessageBefore 函数...
+            // 钩子函数的注册是通过 consumer.getDefaultMQPushConsumerlmpl().registerConsumeMessageHook(hook)
+
+            long beginTimestamp = System.currentTimeMillis();
+            boolean hasException = false;
+            ConsumeReturnType returnType = ConsumeReturnType.SUCCESS;
+            try {
+                ConsumeMessageConcurrentlyService.this.resetRetryTopic(msgs);
+                if (msgs != null && !msgs.isEmpty()) {
+                    for (MessageExt msg : msgs) {
+                        MessageAccessor.setConsumeStartTimeStamp(msg, String.valueOf(System.currentTimeMillis()));
+                    }
+                }
+                // 执行具体的消息消费，调用应用程序消息监昕器的 consumeMessage 方法，进入到具体的消息消费业务逻辑，返回该批消息的消费结果，
+                // 最终将返回 CONSUME_SUCCESS （消费成功）或 RECONSUME_LATER （需要重新消费）
+                status = listener.consumeMessage(Collections.unmodifiableList(msgs), context);
+            } catch (Throwable e) {
+                // 打印日志
+                hasException = true;
+            }
+
+            long consumeRT = System.currentTimeMillis() - beginTimestamp;
+            if (null == status) {
+                if (hasException) {
+                    returnType = ConsumeReturnType.EXCEPTION;
+                } else {
+                    returnType = ConsumeReturnType.RETURNNULL;
+                }
+            } else if (consumeRT >= defaultMQPushConsumer.getConsumeTimeout() * 60 * 1000) {
+                returnType = ConsumeReturnType.TIME_OUT;
+            } else if (ConsumeConcurrentlyStatus.RECONSUME_LATER == status) {
+                returnType = ConsumeReturnType.FAILED;
+            } else if (ConsumeConcurrentlyStatus.CONSUME_SUCCESS == status) {
+                returnType = ConsumeReturnType.SUCCESS;
+            }
+
+            if (ConsumeMessageConcurrentlyService.this.defaultMQPushConsumerImpl.hasHook()) {
+                consumeMessageContext.getProps().put(MixAll.CONSUME_CONTEXT_TYPE, returnType.name());
+            }
+
+            if (null == status) {
+                // 打印日志
+                status = ConsumeConcurrentlyStatus.RECONSUME_LATER;
+            }
+
+            // 执行消息消费的钩子函数 ConsumeMessageHook#consumeMessageAfter 函数...
+
+            ConsumeMessageConcurrentlyService.this.getConsumerStatsManager().incConsumeRT(ConsumeMessageConcurrentlyService.this.consumerGroup, messageQueue.getTopic(), consumeRT);
+
+            // 执行业务消息消费后，在处理结果前再次验证一下 ProcessQueue 的 isDropped 状态值。前面说过，在 RebalanceImpl#updateProcessQueueTableInRebalance
+            // 方法中，如果当前 consumer 中的某一个 ProcessQueue 不再被使用，那么就将这个 PrcocessQueue 状态设置为 dropped。
+            // 也就是如果由于新的消费者加入或者原先的消费者出现宕机导致原先分配给消费者的队列在负载之后分配给别的消费者，那么
+            // 从 rocketmq 的角度看，消息就可能会被重复消费，所以必须将 ProcessQueue 设置为 dropped。并且在这里，如果
+            // dropped 为 true，就不对结果进行处理。
+            if (!processQueue.isDropped()) {
+                ConsumeMessageConcurrentlyService.this.processConsumeResult(status, context, this);
+            } else {
+                log.warn("processQueue is dropped without process consume result. messageQueue={}, msgs={}", messageQueue, msgs);
+            }
+        }
+
         public boolean sendMessageBack(final MessageExt msg, final ConsumeConcurrentlyContext context) {
             int delayLevel = context.getDelayLevelWhenNextConsume();
     
@@ -769,43 +779,6 @@ public class RocketmqPushConsumerAnalysisTwo{
 
     }
 
-    public class MQClientAPIImpl {
-
-        public void consumerSendMessageBack(final String addr, final MessageExt msg, final String consumerGroup,
-                final int delayLevel, final long timeoutMillis, final int maxConsumeRetryTimes)throws RemotingException, MQBrokerException, InterruptedException {
-
-            ConsumerSendMsgBackRequestHeader requestHeader = new ConsumerSendMsgBackRequestHeader();
-            // 和普通的发送消息的 RequestCode 不一样，broker 处理的方法也不一样
-            RemotingCommand request = RemotingCommand.createRequestCommand(RequestCode.CONSUMER_SEND_MSG_BACK, requestHeader);
-
-            requestHeader.setGroup(consumerGroup);
-            // 因为重试的消息被 broker 拿到后会修改 topic，所以这里设置原始的 topic
-            requestHeader.setOriginTopic(msg.getTopic());
-            // broker 会根据 offset 查询原始的消息
-            requestHeader.setOffset(msg.getCommitLogOffset());
-            // 设置 delayLevel，这个值决定了该消息是否会被延时消费、延时多久，
-            // 用户可以设置延时等级，默认是 0，不延时(但是 broker 端会有逻辑：如果为 0 会加 3)
-            requestHeader.setDelayLevel(delayLevel);
-            // 设置最初的 msgId
-            requestHeader.setOriginMsgId(msg.getMsgId());
-            // 设置最多被重试的次数，默认是 16
-            requestHeader.setMaxReconsumeTimes(maxConsumeRetryTimes);
-            // 以同步的方式发送 ACK 请求到服务端
-            RemotingCommand response = this.remotingClient.invokeSync(MixAll.brokerVIPChannel(this.clientConfig.isVipChannelEnabled(), addr), request, timeoutMillis);
-            assert response != null;
-            switch (response.getCode()) {
-                case ResponseCode.SUCCESS: {
-                    return;
-                }
-                default:
-                    break;
-            }
-
-            throw new MQBrokerException(response.getCode(), response.getRemark());
-        }
-
-    }
-
     public class ConsumerSendMsgBackRequestHeader implements CommandCustomHeader {
         // 消费物理偏移量
         @CFNotNull
@@ -829,6 +802,110 @@ public class RocketmqPushConsumerAnalysisTwo{
     }
 
     public class SendMessageProcessor extends AbstractSendMessageProcessor implements NettyRequestProcessor {
+
+        @Override
+        // SendMessageProcessor#processRequest
+        public RemotingCommand processRequest(ChannelHandlerContext ctx, RemotingCommand request) throws RemotingCommandException {
+            SendMessageContext mqtraceContext;
+            switch (request.getCode()) {
+            // RequestCode.CONSUMER_SEND_MSG_BACK 由下面的方法处理
+            case RequestCode.CONSUMER_SEND_MSG_BACK:
+                return this.consumerSendMsgBack(ctx, request);
+            // RequestCode.SEND_MESSAGE 以及其它的 RequestCode 由下面的方法进行处理
+            default:
+                SendMessageRequestHeader requestHeader = parseRequestHeader(request);
+                if (requestHeader == null) {
+                    return null;
+                }
+
+                mqtraceContext = buildMsgContext(ctx, requestHeader);
+                this.executeSendMessageHookBefore(ctx, request, mqtraceContext);
+
+                RemotingCommand response;
+                if (requestHeader.isBatch()) {
+                    response = this.sendBatchMessage(ctx, request, mqtraceContext, requestHeader);
+                } else {
+                    response = this.sendMessage(ctx, request, mqtraceContext, requestHeader);
+                }
+
+                this.executeSendMessageHookAfter(response, mqtraceContext);
+                return response;
+            }
+        }
+
+        // SendMessageProcessor#sendMessage
+        private RemotingCommand sendMessage(final ChannelHandlerContext ctx, final RemotingCommand request, final SendMessageContext sendMessageContext, 
+                final SendMessageRequestHeader requestHeader) throws RemotingCommandException {
+
+            final RemotingCommand response = RemotingCommand.createResponseCommand(SendMessageResponseHeader.class);
+            final SendMessageResponseHeader responseHeader = (SendMessageResponseHeader) response.readCustomHeader();
+            // opaque 等同于 requestId，将其保存到 response 中
+            response.setOpaque(request.getOpaque());
+
+            response.addExtField(MessageConst.PROPERTY_MSG_REGION, this.brokerController.getBrokerConfig().getRegionId());
+            response.addExtField(MessageConst.PROPERTY_TRACE_SWITCH, String.valueOf(this.brokerController.getBrokerConfig().isTraceOn()));
+
+            log.debug("receive SendMessage request command, {}", request);
+            // startTimestamp 表示 Broker 可以开始获取请求的时间戳
+            final long startTimstamp = this.brokerController.getBrokerConfig().getStartAcceptSendRequestTimeStamp();
+            if (this.brokerController.getMessageStore().now() < startTimstamp) {
+                response.setCode(ResponseCode.SYSTEM_ERROR);
+                response.setRemark(String.format("broker unable to service, until %s", UtilAll.timeMillisToHumanString2(startTimstamp)));
+                return response;
+            }
+
+            response.setCode(-1);
+            // 进行对应的检查
+            // 1.检查该 Broker 是否有写权限
+            // 2.检查该 topic 是否可以进行消息发送，主要针对默认主题，默认主题不能发送消息，仅仅用于路由查找
+            // 3.在 NameServer 端存储主题的配置信息，默认路径是 ${ROCKET_HOME}/store/config/topic.json
+            // 4.检查队列 id，如果队列 id 不合法，返回错误码
+            super.msgCheck(ctx, requestHeader, response);
+            if (response.getCode() != -1) {
+                return response;
+            }
+
+            final byte[] body = request.getBody();
+
+            int queueIdInt = requestHeader.getQueueId();
+            TopicConfig topicConfig = this.brokerController.getTopicConfigManager().selectTopicConfig(requestHeader.getTopic());
+
+            if (queueIdInt < 0) {
+                queueIdInt = Math.abs(this.random.nextInt() % 99999999) % topicConfig.getWriteQueueNums();
+            }
+
+            MessageExtBrokerInner msgInner = new MessageExtBrokerInner();
+            msgInner.setTopic(requestHeader.getTopic());
+            msgInner.setQueueId(queueIdInt);
+            
+            // 如果消息的重试次数超过允许的最大重试次数，消息将进入到 DLQ 延迟队列，延迟队列的主题为：%DLQ% + 消费组名
+            if (!handleRetryAndDLQ(requestHeader, response, request, msgInner, topicConfig)) {
+                return response;
+            }
+
+            // 将 Message 中的消息保存到 MessageExtBrokerInner 中
+            msgInner.setBody(body);
+            msgInner.setFlag(requestHeader.getFlag());
+            MessageAccessor.setProperties(msgInner, MessageDecoder.string2messageProperties(requestHeader.getProperties()));
+            msgInner.setPropertiesString(requestHeader.getProperties());
+            msgInner.setBornTimestamp(requestHeader.getBornTimestamp());
+            msgInner.setBornHost(ctx.channel().remoteAddress());
+            msgInner.setStoreHost(this.getStoreHost());
+            msgInner.setReconsumeTimes(requestHeader.getReconsumeTimes() == null ? 0 : requestHeader.getReconsumeTimes());
+
+            if (this.brokerController.getBrokerConfig().isRejectTransactionMessage()) {
+                String traFlag = msgInner.getProperty(MessageConst.PROPERTY_TRANSACTION_PREPARED);
+                if (traFlag != null) {
+                    response.setCode(ResponseCode.NO_PERMISSION);
+                    response.setRemark("the broker[" + this.brokerController.getBrokerConfig().getBrokerIP1() + "] sending transaction message is forbidden");
+                    return response;
+                }
+            }
+            // 调用 DefaultMessageStore#putMessage 进行消息存储，
+            PutMessageResult putMessageResult = this.brokerController.getMessageStore().putMessage(msgInner);
+
+            return handlePutMessageResult(putMessageResult, response, request, msgInner, responseHeader, sendMessageContext, ctx, queueIdInt);
+        }
 
         private RemotingCommand consumerSendMsgBack(final ChannelHandlerContext ctx, final RemotingCommand request) throws RemotingCommandException {
 
