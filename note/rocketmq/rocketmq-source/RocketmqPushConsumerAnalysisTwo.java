@@ -893,16 +893,23 @@ public class RocketmqPushConsumerAnalysisTwo{
             msgInner.setStoreHost(this.getStoreHost());
             msgInner.setReconsumeTimes(requestHeader.getReconsumeTimes() == null ? 0 : requestHeader.getReconsumeTimes());
 
-            if (this.brokerController.getBrokerConfig().isRejectTransactionMessage()) {
-                String traFlag = msgInner.getProperty(MessageConst.PROPERTY_TRANSACTION_PREPARED);
-                if (traFlag != null) {
+            PutMessageResult putMessageResult = null;
+            Map<String, String> oriProps = MessageDecoder.string2messageProperties(requestHeader.getProperties());
+            // 如果从消息中获取 PROPERTY_TRANSACTION_PREPARED 属性的值，这个值表明消息是否是事务消息中的 prepare 消息，
+            // Broker 端在收到消息存储请求时，如果消息为 prepare 消息，则执行 prepareMessage 方法，否则走普通的消息存储流程
+            String traFlag = oriProps.get(MessageConst.PROPERTY_TRANSACTION_PREPARED);
+            if (traFlag != null && Boolean.parseBoolean(traFlag)) {
+                // 如果 Broker 被配置为拒绝事务消息，那么就会直接返回 NO_PERMISSION
+                if (this.brokerController.getBrokerConfig().isRejectTransactionMessage()) {
                     response.setCode(ResponseCode.NO_PERMISSION);
-                    response.setRemark("the broker[" + this.brokerController.getBrokerConfig().getBrokerIP1() + "] sending transaction message is forbidden");
+                    response.setRemark("the broker [" + this.brokerController.getBrokerConfig().getBrokerIP1() + "] sending transaction message is forbidden");
                     return response;
                 }
+                putMessageResult = this.brokerController.getTransactionalMessageService().prepareMessage(msgInner);
+            } else {
+                // 调用 DefaultMessageStore#putMessage 进行消息存储，
+                putMessageResult = this.brokerController.getMessageStore().putMessage(msgInner);
             }
-            // 调用 DefaultMessageStore#putMessage 进行消息存储，
-            PutMessageResult putMessageResult = this.brokerController.getMessageStore().putMessage(msgInner);
 
             return handlePutMessageResult(putMessageResult, response, request, msgInner, responseHeader, sendMessageContext, ctx, queueIdInt);
         }

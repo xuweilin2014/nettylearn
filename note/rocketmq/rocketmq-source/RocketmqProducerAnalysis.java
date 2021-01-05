@@ -406,6 +406,98 @@ public class RocketmqProducer{
             throw new MQClientException().setResponseCode(ClientErrorCode.NOT_FOUND_TOPIC_EXCEPTION);
         }
 
+        @Override
+        public TransactionListener checkListener() {
+            if (this.defaultMQProducer instanceof TransactionMQProducer) {
+                TransactionMQProducer producer = (TransactionMQProducer) defaultMQProducer;
+                return producer.getTransactionListener();
+            }
+            return null;
+        }
+
+        /**
+         * 事务回查命令的最终处理者为 ClientRemotingProcessor 的 processRequest 方法，最终将任务提交到 TransactionMQProducer 的
+         * 线程池中执行，最终调用应用程序实现的 TransactionListener 的 checkLocalTransaction 方法，返回事务状态。如果事务状态为
+         * LocalTransactionState#COMMIT_MESSAGE，则向消息服务器发送提交事务消息命令；如果事务状态为 LocalTransactionState#ROLLBACK_MESSAGE
+         * 则向 Broker 服务器发送回滚事务操作；如果事务状态为 UNKNOW，则服务端会忽略此次提交。
+         */
+
+        @Override
+        public void checkTransactionState(final String addr, final MessageExt msg, final CheckTransactionStateRequestHeader header) {
+            Runnable request = new Runnable() {
+                private final String brokerAddr = addr;
+                private final MessageExt message = msg;
+                private final CheckTransactionStateRequestHeader checkRequestHeader = header;
+                private final String group = DefaultMQProducerImpl.this.defaultMQProducer.getProducerGroup();
+
+                @Override
+                public void run() {
+                    // 获取当前 producer 所注册的 TransactionListener
+                    TransactionListener transactionCheckListener = DefaultMQProducerImpl.this.checkListener();
+                    if (transactionCheckListener != null) {
+                        LocalTransactionState localTransactionState = LocalTransactionState.UNKNOW;
+                        Throwable exception = null;
+                        try {
+                            // 回调 TransactionListener 的 checkLocalTransaction 方法，回查事务状态
+                            localTransactionState = transactionCheckListener.checkLocalTransaction(message);
+                        } catch (Throwable e) {
+                            log.error("Broker call checkTransactionState, but checkLocalTransactionState exception", e);
+                            exception = e;
+                        }
+                        // 发送事务的回查结果到 Broker
+                        this.processTransactionState(localTransactionState, group, exception);
+                    } else {
+                        log.warn("checkTransactionState, pick transactionCheckListener by group[{}] failed", group);
+                    }
+                }
+
+                private void processTransactionState(final LocalTransactionState localTransactionState, final String producerGroup, final Throwable exception) {
+
+                    final EndTransactionRequestHeader thisHeader = new EndTransactionRequestHeader();
+                    thisHeader.setCommitLogOffset(checkRequestHeader.getCommitLogOffset());
+                    thisHeader.setProducerGroup(producerGroup);
+                    thisHeader.setTranStateTableOffset(checkRequestHeader.getTranStateTableOffset());
+                    thisHeader.setFromTransactionCheck(true);
+
+                    String uniqueKey = message.getProperties().get(MessageConst.PROPERTY_UNIQ_CLIENT_MESSAGE_ID_KEYIDX);
+                    if (uniqueKey == null) {
+                        uniqueKey = message.getMsgId();
+                    }
+
+                    thisHeader.setMsgId(uniqueKey);
+                    thisHeader.setTransactionId(checkRequestHeader.getTransactionId());
+                    switch (localTransactionState) {
+                    case COMMIT_MESSAGE:
+                        thisHeader.setCommitOrRollback(MessageSysFlag.TRANSACTION_COMMIT_TYPE);
+                        break;
+                    case ROLLBACK_MESSAGE:
+                        thisHeader.setCommitOrRollback(MessageSysFlag.TRANSACTION_ROLLBACK_TYPE);
+                        log.warn("when broker check, client rollback this transaction, {}", thisHeader);
+                        break;
+                    case UNKNOW:
+                        thisHeader.setCommitOrRollback(MessageSysFlag.TRANSACTION_NOT_TYPE);
+                        log.warn("when broker check, client does not know this transaction state, {}", thisHeader);
+                        break;
+                    default:
+                        break;
+                    }
+
+                    String remark = null;
+                    if (exception != null) {
+                        remark = "checkLocalTransactionState Exception: " + RemotingHelper.exceptionSimpleDesc(exception);
+                    }
+
+                    try {
+                        DefaultMQProducerImpl.this.mQClientFactory.getMQClientAPIImpl().endTransactionOneway(brokerAddr, thisHeader, remark, 3000);
+                    } catch (Exception e) {
+                        log.error("endTransactionOneway exception", e);
+                    }
+                }
+            };
+            // 异步执行事务的回查
+            this.checkExecutor.submit(request);
+        }
+
         /**
          * 
          * @param msg 待发送的消息
@@ -448,7 +540,9 @@ public class RocketmqProducer{
                         sysFlag |= MessageSysFlag.COMPRESSED_FLAG;
                     }
 
-                    // 如果是事务消息 prepared 消息，则设置消息的系统标记为 MessageSysFlag.TRANSACTION_PREPARED_TYPE
+                    // 在发送消息之前，如果消息为 prepare 消息，则设置消息的系统标记为 MessageSysFlag.TRANSACTION_PREPARED_TYPE
+                    // 方便消息服务器正确识别事务类型消息
+                    // DefaultMQProducerImpl#sendKernelImpl
                     final String tranMsg = msg.getProperty(MessageConst.PROPERTY_TRANSACTION_PREPARED);
                     if (tranMsg != null && Boolean.parseBoolean(tranMsg)) {
                         sysFlag |= MessageSysFlag.TRANSACTION_PREPARED_TYPE;

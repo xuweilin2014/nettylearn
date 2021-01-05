@@ -331,19 +331,20 @@ public class RocketmqPushConsumerAnalysis{
                 }
             } else {
                 // 如果 processQueue 被锁定的话
-                // processQueue 被锁定（设置其 locked）属性是在 RebalanceImpl#lock 方法中，在 consumer 向 Broker 发送锁定消息队列请求之后，Broker 会返回
-                // 已经锁定好的消息队列集合，接着就会依次遍历这些消息队列 mq，并且从缓存 processQueueTable 中获取到和 mq 对应的 ProcessQueue，
+                // processQueue 被锁定（设置其 locked）属性是在 RebalanceImpl#lock/lockAll 方法中，在 consumer 向 Broker 发送锁定消息队列请求之后，
+                // Broker 会返回已经锁定好的消息队列集合，接着就会依次遍历这些消息队列 mq，并且从缓存 processQueueTable 中获取到和 mq 对应的 ProcessQueue，
                 // 并且将这些 ProcessQueue 的 locked 属性设置为 true
+                // RebalanceImpl#lock 是对新分配给 consumer 的 mq 进行加锁，而 RebalanceImpl#lockAll 则是周期性的进行加锁
                 if (processQueue.isLocked()) {
                     // 该处理队列是第一次拉取任务，则首先计算拉取偏移量，然后向消息服务端拉取消息
                     // pullRequest 第一次被处理的时候，lockedFirst 属性为 false，之后都为 true
                     if (!pullRequest.isLockedFirst()) {
                         final long offset = this.rebalanceImpl.computePullFromWhere(pullRequest.getMessageQueue());
-                        // 如果 Broker 的 offset 小于 pullRequest 的 offset，则说明 Broker 可能比较繁忙，来不及更新消息队列的 offset
+                        // 如果 Broker 的 consume offset 小于 pullRequest 的 offset，则说明 Broker 可能比较繁忙，来不及更新消息队列的 offset
                         boolean brokerBusy = offset < pullRequest.getNextOffset();
-                        log.info("the first time to pull message, so fix offset from broker. pullRequest: {} NewOffset: {} brokerBusy: {}", pullRequest, offset, brokerBusy);
+                        log.info("the first time to pull message, so fix offset from broker");
                         if (brokerBusy) {
-                            log.info("[NOTIFYME]the first time to pull message, but pull request offset larger than broker consume offset. pullRequest: {} NewOffset: {}", pullRequest, offset);
+                            log.info("the first time to pull message, but pull request offset larger than broker consume offset");
                         }
     
                         pullRequest.setLockedFirst(true);
@@ -1488,6 +1489,12 @@ public class RocketmqPushConsumerAnalysis{
         private final TreeMap<Long, MessageExt> msgTreeMap = new TreeMap<Long, MessageExt>();
         // 读写锁，控制多线程并发修改 msgTreeMap 和 msgTreeMapTemp
         private final ReadWriteLock lockTreeMap = new ReentrantReadWriteLock();
+
+        /**
+         * A subset of msgTreeMap, will only be used when orderly consume
+         */
+        private final TreeMap<Long, MessageExt> consumingMsgOrderlyTreeMap = new TreeMap<Long, MessageExt>();
+
         // 当前 ProcessQueue 中的消息总数
         private final AtomicLong msgCount = new AtomicLong();
         // 当前 ProcessQueue 中包含的最大队列偏移量
@@ -1510,6 +1517,89 @@ public class RocketmqPushConsumerAnalysis{
 
         public boolean putMessage(final List<MessageExt> msgs) {
             // 添加消息，PullMessageService 拉取到消息后，先调用这个方法将消息添加到 processQueue 中
+        }
+
+        // ConsumeMessageOrderlyService#ConsumeRequest#run 方法进行消息的消费时，从 ProcessQueue 的 msgTreeMap 中
+        // 获取消息，同时将获取到的消息保存到 consumingMagOrderlyTreeMap 中。这个 map 是 msgTreeMap 的一个子集，只在
+        // 顺序消息消费的时候使用
+        // ProcessQueue#takeMessags
+        public List<MessageExt> takeMessags(final int batchSize) {
+            List<MessageExt> result = new ArrayList<MessageExt>(batchSize);
+            final long now = System.currentTimeMillis();
+            try {
+                this.lockTreeMap.writeLock().lockInterruptibly();
+                this.lastConsumeTimestamp = now;
+                try {
+                    if (!this.msgTreeMap.isEmpty()) {
+                        for (int i = 0; i < batchSize; i++) {
+                            // 从 msgTreeMap 上读取一条消息，并且在读取的同时，会将这条消息从 msgTreeMap 中移除掉
+                            Map.Entry<Long, MessageExt> entry = this.msgTreeMap.pollFirstEntry();
+                            if (entry != null) {
+                                result.add(entry.getValue());
+                                // 将从 msgTreeMap 中获取到的消息保存到 consuimgMsgOrderlyTreeMap 中
+                                consumingMsgOrderlyTreeMap.put(entry.getKey(), entry.getValue());
+                            } else {
+                                break;
+                            }
+                        }
+                    }
+                    if (result.isEmpty()) {
+                        consuming = false;
+                    }
+                } finally {
+                    this.lockTreeMap.writeLock().unlock();
+                }
+            } catch (InterruptedException e) {
+                log.error("take Messages exception", e);
+            }
+            return result;
+        }
+
+        // commit 方法就是将 consumingMsgOrderlyTreeMap 中的消息移除掉维护 msgCount 和 msgSize 这两个变量
+        // ProcessQueue#commit
+        public long commit() {
+            try {
+                this.lockTreeMap.writeLock().lockInterruptibly();
+                try {
+                    Long offset = this.consumingMsgOrderlyTreeMap.lastKey();
+                    // 将 consumingMsgOrderlyTreeMap 中的该批消息从 ProcessQueue 中移除，
+                    // 更新 msgCount 和 msgSize 这两个变量
+                    msgCount.addAndGet(0 - this.consumingMsgOrderlyTreeMap.size());
+                    for (MessageExt msg : this.consumingMsgOrderlyTreeMap.values()) {
+                        msgSize.addAndGet(0 - msg.getBody().length);
+                    }
+                    this.consumingMsgOrderlyTreeMap.clear();
+                    // 从这里可以看出，offset 表示消息消费队列的逻辑偏移量，类似于数组的下标，代表第 n 个 ConsumeQueue 条目
+                    if (offset != null) {
+                        return offset + 1;
+                    }
+                } finally {
+                    this.lockTreeMap.writeLock().unlock();
+                }
+            } catch (InterruptedException e) {
+                log.error("commit exception", e);
+            }
+    
+            return -1;
+        }
+
+        // ProcessQueue#takeMessags
+        public void makeMessageToCosumeAgain(List<MessageExt> msgs) {
+            try {
+                this.lockTreeMap.writeLock().lockInterruptibly();
+                try {
+                    for (MessageExt msg : msgs) {
+                        // 将消息从 consumingMsgOrderlyTreeMap 中移除掉
+                        this.consumingMsgOrderlyTreeMap.remove(msg.getQueueOffset());
+                        // 将消息重新保存到 msgTreeMap 中
+                        this.msgTreeMap.put(msg.getQueueOffset(), msg);
+                    }
+                } finally {
+                    this.lockTreeMap.writeLock().unlock();
+                }
+            } catch (InterruptedException e) {
+                log.error("makeMessageToCosumeAgain exception", e);
+            }
         }
 
     }
