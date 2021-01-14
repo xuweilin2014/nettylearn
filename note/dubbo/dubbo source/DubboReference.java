@@ -206,12 +206,12 @@ public class DubboReference{
 
         /**
          * init方法主要的作用是
-         * 1.创建一个ConsumerConfig对象（如果不存在的话），并且将<dubbo:consumer/>和<dubbo:reference/>标签中的配置信息保存到ConsumerConfig
-         * 和ReferenceConfig对象中，接着通过反射获取到interface属性对应的Class值
-         * 2.从系统属性或配置文件中加载与接口名相对应的配置，并将解析结果赋值给 url 字段，这个url字段用于点对点调用
+         * 1.创建一个 ConsumerConfig 对象（如果不存在的话），并且将 <dubbo:consumer/> 和 <dubbo:reference/> 标签中的配置信息保存到 ConsumerConfig
+         * 和 ReferenceConfig 对象中，接着通过反射获取到 interface 属性对应的 Class 值
+         * 2.从系统属性或配置文件中加载与接口名相对应的配置，并将解析结果赋值给 url 字段，这个 url 字段用于点对点调用
          * 3.检测几个核心配置类是否为空，为空则尝试从其他配置类中获取
-         * 4.用于收集各种配置，并将配置存储到 map 中。比如side信息、dubbo版本、进程号、时间戳、方法列表等等
-         * 5.处理 MethodConfig 实例。该实例包含了事件通知配置，比如 onreturn、onthrow、oninvoke 等，同时会处理<dubbo:method/>中已经被废弃的属性retry
+         * 4.用于收集各种配置，并将配置存储到 map 中。比如 side 信息、dubbo 版本、进程号、时间戳、方法列表等等
+         * 5.处理 MethodConfig 实例。该实例包含了事件通知配置，比如 onreturn、onthrow、oninvoke 等，同时会处理 <dubbo:method/> 中已经被废弃的属性 retry
          * 6.获取服务消费者 ip，以及调用 createProxy 创建代理对象
          */
         private void init() {
@@ -225,10 +225,10 @@ public class DubboReference{
                 throw new IllegalStateException("<dubbo:reference interface=\"\" /> interface not allow null!");
             }
             
-            //1.检测 consumer 变量（consumer变量为ConsumerConfig类型，表示<dubbo:consumer/>标签中的配置信息）是否为空，为空则创建，
+            //1.检测 consumer 变量（consumer 变量为 ConsumerConfig 类型，表示 <dubbo:consumer/> 标签中的配置信息）是否为空，为空则创建，
             //2.并且通过 appendProperties 方法把 <dubbo:consumer/> 中的配置信息保存到 ConsumerConfig 类型的对象中（也就是 consumer 对象）中去
             checkDefault();
-            //将标签<dubbo:reference/>中的配置信息保存到ReferenceConfig对象中
+            //将标签 <dubbo:reference/> 中的配置信息保存到 ReferenceConfig 对象中
             appendProperties(this);
             if (getGeneric() == null && getConsumer() != null) {
                 setGeneric(getConsumer().getGeneric());
@@ -239,12 +239,11 @@ public class DubboReference{
                 interfaceClass = GenericService.class;
             } else {
                 try {
-                    interfaceClass = Class.forName(interfaceName, true, Thread.currentThread()
-                            .getContextClassLoader());
+                    interfaceClass = Class.forName(interfaceName, true, Thread.currentThread().getContextClassLoader());
                 } catch (ClassNotFoundException e) {
                     throw new IllegalStateException(e.getMessage(), e);
                 }
-                //这个方法用来检查<dubbo:reference/>标签中interface属性所指定的类是否存在，以及是否是一个接口
+                //这个方法用来检查 <dubbo:reference/> 标签中 interface 属性所指定的类是否存在，以及是否是一个接口
                 checkInterfaceAndMethods(interfaceClass, methods);
             }
 
@@ -258,7 +257,7 @@ public class DubboReference{
 
             // -------------------------------✨ 分割线3 ✨------------------------------
 
-            //将side信息（这里是consumer），dubbo的版本，时间戳以及进程号放入到map中
+            //将 side 信息（这里是 consumer），dubbo 的版本，时间戳以及进程号放入到 map 中
             Map<String, String> map = new HashMap<String, String>();
             Map<Object, Object> attributes = new HashMap<Object, Object>();
             map.put(Constants.SIDE_KEY, Constants.CONSUMER_SIDE);
@@ -276,21 +275,21 @@ public class DubboReference{
                     map.put("revision", revision);
                 }
     
-                //Wrapper会对interfaceClass表示的类进行包装，生成一个Wrapper$N类，这个类继承了Wrapper类，同时也实现了Wrapper类中的抽象方法。比如getMethodNames
-                //以及getPropertyNames等。这里的getMethodNames返回的是interfaceClass这个被包装类中的方法名称，然后将其添加到map对象中
+                //Wrapper 会对 interfaceClass 表示的类进行包装，生成一个 Wrapper$N 类，这个类继承了 Wrapper 类，同时也实现了 Wrapper 类中的抽象方法。比如 getMethodNames
+                //以及 getPropertyNames 等。这里的 getMethodNames 返回的是 interfaceClass 这个被包装类中的方法名称，然后将其添加到 map 对象中
                 String[] methods = Wrapper.getWrapper(interfaceClass).getMethodNames();
                 if (methods.length == 0) {
                     logger.warn("NO method found in service interface " + interfaceClass.getName());
                     map.put("methods", Constants.ANY_VALUE);
                 } else {
-                    // 将interfaceClass中的所有方法名使用逗号,作为分隔符，比如某接口中有A和B两个方法，则map中会存放
+                    // 将 interfaceClass 中的所有方法名使用逗号,作为分隔符，比如某接口中有 A 和 B 两个方法，则 map 中会存放
                     // methods -> A,B 键值对
                     map.put("methods", StringUtils.join(new HashSet<String>(Arrays.asList(methods)), ","));
                 }
             }
 
-            //Constants.INTERFACE_KEY的值为interface，将 interface -> interfaceName 键值对保存到map中
-            //interfaceName为<dubbo:reference/>中interface属性的值，比如com.dubbo.simple.common.DemoService
+            // Constants.INTERFACE_KEY 的值为 interface，将 interface -> interfaceName 键值对保存到map中
+            // interfaceName 为<dubbo:reference/>中interface属性的值，比如com.dubbo.simple.common.DemoService
             map.put(Constants.INTERFACE_KEY, interfaceName);
 
             //将ApplicationConfig、ModuleConfig、ConsumerConfig以及ReferenceConfig中的配置信息放入到map中
@@ -318,8 +317,7 @@ public class DubboReference{
                             map.put(method.getName() + ".retries", "0");
                         }
                     }
-
-                    //添加 MethodConfig 中的“属性”字段到 attributes。比如 onreturn、onthrow、oninvoke 等。这3个属性为attribute属性，不在URL中体现
+                    //添加 MethodConfig 中的"属性"字段到 attributes。比如 onreturn、onthrow、oninvoke 等。这3个属性为attribute属性，不在URL中体现
                     appendAttributes(attributes, method, prifix + "." + method.getName());
                     checkAndConvertImplicitConfig(method, map, attributes);
                 }
@@ -327,14 +325,14 @@ public class DubboReference{
     
             // -------------------------------✨ 分割线5 ✨------------------------------
 
-            //获取到服务消费者ip地址
+            //获取到服务消费者 ip 地址
             String hostToRegistry = ConfigUtils.getSystemProperty(Constants.DUBBO_IP_TO_REGISTRY);
             if (hostToRegistry == null || hostToRegistry.length() == 0) {
                 hostToRegistry = NetUtils.getLocalHost();
             } else if (isInvalidLocalHost(hostToRegistry)) {
                 throw new IllegalArgumentException("Specified invalid registry ip from property:" + Constants.DUBBO_IP_TO_REGISTRY + ", value:" + hostToRegistry);
             }
-            // 在map中保存服务消费者的ip地址，其中Constants.REGISTER_IP_KEY的值为：register.ip
+            // 在 map 中保存服务消费者的 ip 地址，其中 Constants.REGISTER_IP_KEY 的值为：register.ip
             // 放入的键值对为：<register.ip, 169.254.207.250>
             map.put(Constants.REGISTER_IP_KEY, hostToRegistry);
     
@@ -357,13 +355,15 @@ public class DubboReference{
          *      3.1.读取直连配置项，并且将url存储到urls中
          *      3.2.若不是，读取注册中心url，并且将url存储到urls中
          *      3.3.若 urls 元素数量为1，则直接通过 Protocol 自适应拓展类构建 Invoker 实例接口
-         *      3.4.若 urls 元素数量大于1，即存在多个注册中心或服务直连 url，此时先根据每个 url 构建 Invoker。然后再通过 Cluster 合并多个 Invoker，最后调用 ProxyFactory 生成代理类
+         *      3.4.若 urls 元素数量大于1，即存在多个注册中心或服务直连 url，此时先根据每个 url 构建 Invoker。然后再通过 Cluster 合并多个 Invoker，
+         *          最后调用 ProxyFactory 生成代理类
          */
+        // ReferenceConfig#createProxy
         private T createProxy(Map<String, String> map) {
             URL tmpUrl = new URL("temp", "localhost", 0, map);
             final boolean isJvmRefer;
             if (isInjvm() == null) {
-                //url 配置被指定，则不做本地引用
+                //url 配置被指定，则不做本地引用，也就是说进行 url 直连的话，本能进行本地调用
                 if (url != null && url.length() > 0) { 
                     isJvmRefer = false;
                 //根据 url 的协议、scope 以及 injvm 等参数检测是否需要本地引用, 比如如果用户显式配置了 scope=local，此时 isInjvmRefer 返回 true
@@ -379,7 +379,7 @@ public class DubboReference{
     
             //本地引用
             if (isJvmRefer) {
-                //生成本地引用 URL，协议为 injvm
+                //生成本地引用 URL，协议为 injvm，ip 为 LOCALHOST，port 为 0
                 URL url = new URL(Constants.LOCAL_PROTOCOL, NetUtils.LOCALHOST, 0, interfaceClass.getName()).addParameters(map);
                 //调用 refer 方法构建 InjvmInvoker 实例
                 invoker = refprotocol.refer(interfaceClass, url);
@@ -389,7 +389,7 @@ public class DubboReference{
             
             //远程引用
             } else {
-                //url 不为空，表明用户可能想进行点对点调用
+                //url 不为空，表明用户可能想进行点对点调用，即 url 直连
                 if (url != null && url.length() > 0) { 
                     //当需要配置多个 url 时，可用分号进行分割，这里会进行切分
                     String[] us = Constants.SEMICOLON_SPLIT_PATTERN.split(url);
@@ -406,9 +406,7 @@ public class DubboReference{
                             }
                         }
                     }
-                
                 } else { // assemble URL from register center's configuration
-
                     //加载注册中心 url
                     List<URL> us = loadRegistries(false);
                     if (us != null && us.size() > 0) {
@@ -431,22 +429,23 @@ public class DubboReference{
                 /**
                  * 在进行服务引用时，可能只在一个注册中心上有提供者，也有可能在多个注册中心上都有提供者。
                  * 
-                 * 1）对于第一种情况，先通过RegistryProtocol的refer方法获得到一个MockClusterInvoker类对象，在这个对象中还封装了一个
-                 * FailoverClusterInvoker对象。在FailoverClusterInvoker对象中还持有一个RegistryDirectory，用于保存Invoker对象的集合。在我们调用代理对象的某个方法时，
-                 * 会进入到AbstractClusterInvoker中的invoke方法中，首先会通过directory获取到可调用的invoker集合（通过了路由规则的筛选），然后再在FailoverClusterInvoker#doInvoke方法中，
-                 * 通过负载均衡策略筛选出一个Invoker，进行调用。这里的Invoker（我们以DubboInvoker为例），就会向服务器端发起调用请求。而directory中，确切地说是RegistryDirectory对象中的Invoker集合，
-                 * 是在RegistryDirectory中的refreshInvoker中创建并且进行更新的
+                 * 1）对于第一种情况，先通过 RegistryProtocol 的 refer 方法获得到一个 MockClusterInvoker 类对象，在这个对象中还持有 RegistryDirectory 和
+                 * FailoverClusterInvoker 对象。在 FailoverClusterInvoker 对象中也持有一个 RegistryDirectory（和前面的 MockClusterInvoker 中的是同一个），
+                 * 用于保存 invoker 对象的集合。在我们调用代理对象的某个方法时，先进入到 MockClusterInvoker 的服务降级逻辑，
+                 * 接着会进入到 AbstractClusterInvoker 中的 invoke 方法中，首先会通过 directory 获取到可调用的 invoker 集合（通过了路由规则的筛选），然后再在 FailoverClusterInvoker#doInvoke方法中，
+                 * 通过负载均衡策略筛选出一个 invoker，进行调用。这里的 invoker（我们以 DubboInvoker 为例），就会向服务器端发起调用请求。而directory中，确切地说是 RegistryDirectory 对象中的 invoker 集合，
+                 * 是在 RegistryDirectory 中的 refreshInvoker 中创建并且进行更新的
                  * 
-                 * 2）对于第二种情况，对于每个注册中心上的提供者，或者说urls中的每个url，和前面的流程一样，都是先通过RegistryProtocol的refer方法生成一个MockClusterInvoker，这个对象里面同样封装了
-                 * FailoverClusterInvoker对象以及其他东西。接着，创建一个StaticDirectory对象，包含前面创建的每个MockClusterInvoker。接着，此时的cluster的类型仍然是MockClusterWrapper
+                 * 2）对于第二种情况，对于每个注册中心上的提供者，或者说 urls 中的每个 url，和前面的流程一样，都是先通过 RegistryProtocol 的 refer 方法生成一个 MockClusterInvoker，这个对象里面同样封装了
+                 * FailoverClusterInvoker 对象以及 RegistryDirectory。接着，创建一个 StaticDirectory 对象，包含前面创建的 MockClusterInvoker 集合。接着，在下面的方法中通过 cluster.join 方法生成的还是
+                 * MockClusterInvoker，这是因为，cluster 也是一个 MockClusterWrapper 包装类：
                  * 
-                 * cluster.join(new StaticDirectory(u, invokers))
+                 * invoker = cluster.join(new StaticDirectory(u, invokers));
                  * 
-                 * 因此上述代码的结果依旧是创建一个MockClusterInvoker，不过这里的MockClusterInvoker和上面的不是同一个。而在MockClusterWrapper中的cluster则为AvailableCluster类型，因此，这里的
-                 * MockClusterInvoker封装了AvailableCluster的join方法创建的一个ClusterInvoker，并且持有StaticDirectory，用来保存前面所说的每个MockClusterInvoker（每个都代表一个注册中心上的
-                 * 所有提供者）。
-                 * 
-                 * 调用上面的cluster.join创建的Invoker的invoke方法时，会从StaticDirectory中保存的MockClusterInvoker里面选一个可用的，调用其invoke方法。接着的逻辑就和第一种情况一样。
+                 * 因此上述代码的结果依旧是创建一个 MockClusterInvoker，不过这里的 MockClusterInvoker 和上面的不是同一个。在 MockClusterInvoker 中的 directory 为 StaticDirectory 类型，
+                 * 这个 directory 用来保存前面所说的每个 MockClusterInvoker（每个都代表一个注册中心上的所有提供者），在 MockClusterInvoker 的 invoker 是在 AvailableCluster 中生成的一个
+                 * 内部类 invoker，AvailableCluster$1。调用上面的 cluster.join 创建的 invoker 的 invoke 方法时，会从 StaticDirectory 中保存的 MockClusterInvoker 里面选一个可用的，
+                 * 调用其 invoke 方法。接着的逻辑就和第一种情况一样。
                  */
 
                 // 单个注册中心或者单个服务直连url
@@ -461,7 +460,7 @@ public class DubboReference{
                     // 获取所有的 Invoker
                     for (URL url : urls) {
                         // 通过 refprotocol 调用 refer 构建 Invoker，refprotocol 会在运行时根据 url 协议头加载指定的 Protocol 实例，并调用实例的 refer 方法。
-                        // 这里一般是调用RegistryProtocol的refer方法。
+                        // 这里一般是调用 RegistryProtocol 的 refer 方法。
                         // 注意，这里的 url 指代的是一个注册中心的地址，refprotocol.refer 返回一个 MockClusterInvoker 对象，包含了 url 对应注册中心里面所有的
                         // invoker 集合。invokers 则为所有 MockClusterInvoker 对象的集合，一个 MockClusterInvoker 对应一个注册中心
                         invokers.add(refprotocol.refer(interfaceClass, url));
@@ -473,10 +472,10 @@ public class DubboReference{
                     if (registryURL != null) { 
                         // 如果注册中心链接不为空，则将使用 AvailableCluster
                         URL u = registryURL.addParameter(Constants.CLUSTER_KEY, AvailableCluster.NAME);
-                        // 创建 StaticDirectory 实例，并由 Cluster 对多个 Invoker 进行合并，这里会使用AvailableCluster创建一个Invoker，不过同样会把这个
-                        // invoker封装在MockClusterInvoker对象中（有服务降级的逻辑），而这个MockClusterInvoker中的directory则是StaticDirectory。
-                        // 这个StaticDirectory中Invoker集合中的每一个都可以代表一个注册中心中providers目录下所有的invoker的代表（其实是通过FailoverClusterInvoker
-                        // 中的RegistryDirectory进行管理），在真正调用时，直接从StaticDirectory的invoker集合中选一个可用的，调用其invoke方法
+                        // 创建 StaticDirectory 实例，并由 Cluster 对多个 Invoker 进行合并，这里会使用 AvailableCluster 创建一个 invoker，不过同样会把这个
+                        // invoker 封装在 MockClusterInvoker 对象中（有服务降级的逻辑），而这个 MockClusterInvoker 中的 directory 则是 StaticDirectory。
+                        // 这个 StaticDirectory 中 invoker 集合中的每一个都可以代表一个注册中心中 providers 目录下所有的 invoker 的代表，在真正调用时，
+                        // 直接从 StaticDirectory 的 invoker 集合中选一个可用的，调用其 invoke 方法
                         invoker = cluster.join(new StaticDirectory(u, invokers));
                     } else { // not a registry url
                         invoker = cluster.join(new StaticDirectory(invokers));
@@ -494,24 +493,21 @@ public class DubboReference{
 
             //invoker 可用性检查
             if (c && !invoker.isAvailable()) {
-                throw new IllegalStateException("Failed to check the status of the service " + interfaceName + ". No provider available for the service " + 
-                (group == null ? "" : group + "/") + interfaceName + (version == null ? "" : ":" + version) + " from the url " + invoker.getUrl() + " to the consumer " + 
-                NetUtils.getLocalHost() + " use dubbo version " + Version.getVersion());
+                throw new IllegalStateException("Failed to check the status of the service ");
             }
             if (logger.isInfoEnabled()) {
                 logger.info("Refer dubbo service " + interfaceClass.getName() + " from url " + invoker.getUrl());
             }
             
-            //生成代理类，proxyFactory的类型为ProxyFactory$Adaptive，调用ProxyFactory$Adaptive的getProxy方法时，会根据invoker中的url的proxy参数值，来获取对应的扩展
-            //然后调用对应扩展的getProxy方法。由于在获取扩展的时候可能还有对扩展进行Wrapper包装，所以实际返回的可能是一个Wrapper包装类对象，在这里就是
-            //StubProxyFactoryWrapper类对象。
+            // 生成代理类，proxyFactory 的类型为 ProxyFactory$Adaptive，调用 ProxyFactory$Adaptive 的 getProxy 方法时，会根据 invoker 中的 url 的 proxy 参数值，来获取对应的扩展
+            // 然后调用对应扩展的 getProxy 方法。由于在获取扩展的时候可能还有对扩展进行 Wrapper 包装，所以实际返回的可能是一个 Wrapper 包装类对象，在这里就是
+            // StubProxyFactoryWrapper 类对象。
             return (T) proxyFactory.getProxy(invoker);
         }
 
     }
 
     public class MockClusterWrapper implements Cluster {
-
         private Cluster cluster;
     
         public MockClusterWrapper(Cluster cluster) {
@@ -519,10 +515,8 @@ public class DubboReference{
         }
     
         public <T> Invoker<T> join(Directory<T> directory) throws RpcException {
-            return new MockClusterInvoker<T>(directory,
-                    this.cluster.join(directory));
+            return new MockClusterInvoker<T>(directory, this.cluster.join(directory));
         }
-    
     }
 
     public class AvailableCluster implements Cluster {
@@ -607,18 +601,19 @@ public class DubboReference{
 
     public class RegistryProtocol implements Protocol{
 
+        // RegistryProtocol#refer
         public <T> Invoker<T> refer(Class<T> type, URL url) throws RpcException {
-            //取 registry 参数值，并将其设置为协议头，比如url中配置了registry=zookeeper，那么就将zookeeper设置为url的协议，
-            //然后把registry=zookeeper从url中移除掉
+            //取 registry 参数值，并将其设置为协议头，比如 url 中配置了 registry=zookeeper，那么就将 zookeeper 设置为 url 的协议，
+            //然后把 registry=zookeeper 从 url 中移除掉
             url = url.setProtocol(url.getParameter(Constants.REGISTRY_KEY, Constants.DEFAULT_REGISTRY)).removeParameter(Constants.REGISTRY_KEY);
 
-            //registryFactory为RegistryFactory$Adaptive，所以这里会根据url中的protocol，也就是url中协议的类型来调用对应RegistryFactory对象
-            //的getRegistry方法。这里则是调用ZookeeperRegistryFactory对象的getRegistry方法，返回一个ZookeeperRegistry对象
+            //registryFactory 为 RegistryFactory$Adaptive，所以这里会根据 url 中的 protocol，也就是 url 中协议的类型来调用对应 RegistryFactory 对象
+            //的 getRegistry 方法。这里则是调用 ZookeeperRegistryFactory 对象的 getRegistry 方法，返回一个 ZookeeperRegistry 对象
             Registry registry = registryFactory.getRegistry(url);
             if (RegistryService.class.equals(type)) {
                 return proxyFactory.getInvoker((T) registry, type, url);
             }
-    
+
             // group="a,b" or group="*"
             // 将 url 查询字符串转为 Map
             Map<String, String> qs = StringUtils.parseQueryString(url.getParameterAndDecoded(Constants.REFER_KEY));
@@ -640,6 +635,7 @@ public class DubboReference{
          * 完成订阅后，RegistryDirectory 会收到这几个节点下的子节点信息。由于一个服务可能部署在多台服务器上，这样就会在 providers 产生多个节点，这个时候就需要 Cluster 将多个服务节点合并为一个，
          * 并生成一个 Invoker。
          */
+        // RegistryProtocol#doRefer
         private <T> Invoker<T> doRefer(Cluster cluster, Registry registry, Class<T> type, URL url) {
             // 创建 RegistryDirectory 实例
             RegistryDirectory<T> directory = new RegistryDirectory<T>(type, url);
@@ -661,14 +657,11 @@ public class DubboReference{
             }
 
             // 订阅 providers、configurators、routers 等节点数据
-            directory.subscribe(subscribeUrl.addParameter(Constants.CATEGORY_KEY,
-                            Constants.PROVIDERS_CATEGORY
-                            + "," + Constants.CONFIGURATORS_CATEGORY
-                            + "," + Constants.ROUTERS_CATEGORY));
-    
-            // 一个注册中心可能有多个服务提供者，因此这里需要将多个服务提供者合并为一个，这里的cluster的类型为Cluster$Adaptive，
-            // 也就是说通过自适应扩展机制来获取对应的 Cluster 扩展，并且调用其 join 方法。不过通过ExtensionLoader.getExtensionLoader(Cluster.class).getExtension(cluster)，
-            // 不过获取到Cluster扩展实际上是一个Wrapper包装类 MockClusterWrapper，调用的为这个MockClusterWrapper的join方法，它创建一个MockClusterInvoker，这个Invoker中包含了
+            directory.subscribe(subscribeUrl.addParameter(Constants.CATEGORY_KEY, Constants.PROVIDERS_CATEGORY + "," + Constants.CONFIGURATORS_CATEGORY + "," + Constants.ROUTERS_CATEGORY));
+
+            // 一个注册中心可能有多个服务提供者，因此这里需要将多个服务提供者合并为一个，这里的 cluster 的类型为 Cluster$Adaptive，
+            // 也就是说通过自适应扩展机制来获取对应的 Cluster 扩展，并且调用其 join 方法。不过通过 ExtensionLoader.getExtensionLoader(Cluster.class).getExtension(cluster)，
+            // 不过获取到 Cluster 扩展实际上是一个 Wrapper 包装类 MockClusterWrapper，调用的为这个 MockClusterWrapper 的 join 方法，它创建一个 MockClusterInvoker，这个 Invoker 中包含了
             // 服务降级的逻辑
             Invoker invoker = cluster.join(directory);
             ProviderConsumerRegTable.registerConsuemr(invoker, url, subscribeUrl, directory);
@@ -1003,19 +996,16 @@ public class DubboReference{
     public class InvokerInvocationHandler implements InvocationHandler {
 
         private final Invoker<?> invoker;
-    
+
         public InvokerInvocationHandler(Invoker<?> invoker) {
             this.invoker = invoker;
         }
-    
+
         public Object invoke(Object proxy, Method method, Object[] args) throws Throwable {
             String methodName = method.getName();
-            
             //省略代码
-
             return invoker.invoke(new RpcInvocation(method, args)).recreate();
         }
-    
     }
 
 

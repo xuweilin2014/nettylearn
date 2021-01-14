@@ -32,6 +32,17 @@ public class DubboServiceInvokingProcess {
      *  —> AbstractClient#send(Object, boolean)
      *  —> NettyChannel#send(Object, boolean)
      *  —> NioClientSocketChannel#write(Object)
+     * 
+     * 在把消息从 NioClientSocketChannel 中写出去之后，消息还会被 NettyClientHandler 以及其中封装的各个 handler 处理。具体的处理流程如下：
+     * 
+     * NettyClientHandler#write
+     * -> NettyClient 的父类 AbstractPeer#sent
+     * -> MultiMessageHandler 的父类 AbstractChannelHandlerDelegate#sent
+     * -> HeartbeatHandler#sent
+     * -> AllChannelHandler 的父类 WrappedChannelHandler#sent
+     * -> DecodeHandler 的父类 AbstractChannelHandlerDelegate#sent
+     * -> HeaderExchangeHandler#sent
+     * -> DubboProtocol$1 的父类 ChannelHandlerAdapter#sent（这是一个空方法，实际上不做任何处理）
      */
 
     public class JavassistProxyFactory extends AbstractProxyFactory {
@@ -269,7 +280,7 @@ public class DubboServiceInvokingProcess {
 
         /**
          * 前面说过，Dubbo 的调用方式可以细分为3种：同步调用、异步无返回值（单向通信）、异步有返回值。
-         * 同步调用和异步调用的区别是由谁调用 RpcFuture 的get 方法，同步调用是由框架自身调用 get 方法，而异步调用则是由用户调用 get 方法
+         * 同步调用和异步调用的区别是由谁调用 RpcFuture 的 get 方法，同步调用是由框架自身调用 get 方法，而异步调用则是由用户调用 get 方法
          */
         protected Result doInvoke(final Invocation invocation) throws Throwable {
             RpcInvocation inv = (RpcInvocation) invocation;
@@ -291,7 +302,7 @@ public class DubboServiceInvokingProcess {
                 // 获取异步配置
                 boolean isAsync = RpcUtils.isAsync(getUrl(), invocation);
                 // isOneway 为 true，表明单向通信，也就是异步无返回值
-                // isOneway其实就是根据url中return参数的值，如果return为false，则表明不关注返回值，因此在后面中不会在RpcContext中设置future
+                // isOneway 其实就是根据 url 中 return 参数的值，如果 return 为 false，则表明不关注返回值，因此在后面中不会在 RpcContext 中设置 future
                 boolean isOneway = RpcUtils.isOneway(getUrl(), invocation);
                 int timeout = getUrl().getMethodParameter(methodName, Constants.TIMEOUT_KEY, Constants.DEFAULT_TIMEOUT);
 
@@ -302,7 +313,7 @@ public class DubboServiceInvokingProcess {
                 // 默认为false
                 if (isOneway) {
                     boolean isSent = getUrl().getMethodParameter(methodName, Constants.SENT_KEY, false);
-                    // 发送请求
+                    // 发送请求，isSent 就是上面所说的 sent 请求
                     currentClient.send(inv, isSent);
                     // 将 context 中的 future 设置为 null
                     RpcContext.getContext().setFuture(null);
@@ -321,17 +332,16 @@ public class DubboServiceInvokingProcess {
                 // 如果是同步调用的话
                 } else {
                     RpcContext.getContext().setFuture(null);
-                    // 发送请求，得到一个 ResponseFuture 实例，并调用该实例的 get 方法进行等待。ResponseFuture 是一个接口，而DefaultFuture 则是它的默认实现类
+                    // 发送请求，得到一个 ResponseFuture 实例，并调用该实例的 get 方法进行等待。ResponseFuture 是一个接口，而 DefaultFuture 则是它的默认实现类
                     return (Result) currentClient.request(inv, timeout).get();
                 }
             
-            // 在抛出 TimeoutException 和 RemotingException 之后，都会将其封装成 RpcException 对象，这个 RpcException 可以被上级（比如 FailoverClusterInvoker）捕获
+            // 在抛出 TimeoutException 和 RemotingException 之后，都会将其封装成 RpcException 对象，
+            // 这个 RpcException 可以被上级（比如 FailoverClusterInvoker）捕获
             } catch (TimeoutException e) {
-                throw new RpcException(RpcException.TIMEOUT_EXCEPTION, "Invoke remote method timeout. method: "
-                                + invocation.getMethodName() + ", provider: " + getUrl() + ", cause: " + e.getMessage(), e);
+                throw new RpcException("Invoke remote method timeout. method: ");
             } catch (RemotingException e) {
-                throw new RpcException(RpcException.NETWORK_EXCEPTION, "Failed to invoke remote method: "
-                        + invocation.getMethodName() + ", provider: " + getUrl() + ", cause: " + e.getMessage(), e);
+                throw new RpcException("Failed to invoke remote method: ");
             }
         }
     }
@@ -365,7 +375,6 @@ public class DubboServiceInvokingProcess {
         }
 
         private static class RemotingInvocationTimeoutScan implements Runnable {
-
             @Override
             public void run() {
                 while (true) {
@@ -375,11 +384,13 @@ public class DubboServiceInvokingProcess {
                             if (future == null || future.isDone()) {
                                 continue;
                             }
-                            // 如果future未完成，且超时
+                            // 如果 future 未完成，且超时
                             if (System.currentTimeMillis() - future.getStartTimestamp() > future.getTimeout()) {
-                                // 创建一个异常的Response
+                                // 创建一个异常的 Response
                                 Response timeoutResponse = new Response(future.getId());
                                 // set timeout status.
+                                // 如果消息已经被客户端发送出去，那么就是服务端时间超时
+                                // 如果消息还没有被客户端发送出去，那么就是客户端超时
                                 timeoutResponse.setStatus(future.isSent() ? Response.SERVER_TIMEOUT : Response.CLIENT_TIMEOUT);
                                 timeoutResponse.setErrorMessage(future.getTimeoutMessage(true));
                                 // 处理异常
@@ -710,8 +721,7 @@ public class DubboServiceInvokingProcess {
 
         public ResponseFuture request(Object request, int timeout) throws RemotingException {
             if (closed) {
-                throw new RemotingException(this.getLocalAddress(), null,
-                        "Failed to send request " + request + ", cause: The channel " + this + " is closed!");
+                throw new RemotingException("Failed to send request " + request + ", cause: The channel " + this + " is closed!");
             }
             // 创建 Request 对象
             Request req = new Request();
@@ -953,8 +963,8 @@ public class DubboServiceInvokingProcess {
         }
 
         // 和服务端建立新连接，并且替换掉旧的连接
-        // 替换掉就得连接的原因是在 AbstractClient 的connect代码中，会添加一个定时任务主动检测客户端到服务端的连接是否已经断开，如果断开则会进行重连
-        // 所以，doConnect有可能会被反复调用，因此在进行重连的时候，必须要替换掉之前的channel
+        // 替换掉就得连接的原因是在 AbstractClient 的 connect 代码中，会添加一个定时任务主动检测客户端到服务端的连接是否已经断开，如果断开则会进行重连
+        // 所以，doConnect 有可能会被反复调用，因此在进行重连的时候，必须要替换掉之前的 channel
         protected void doConnect() throws Throwable {
             long start = System.currentTimeMillis();
             ChannelFuture future = bootstrap.connect(getConnectAddress());

@@ -225,7 +225,7 @@ public class DubboReference2{
         }
 
         // 下面方法先访问缓存，若缓存未命中，则通过 initClient 方法创建新的 ExchangeClient 实例，并将该实例传给 
-        // ReferenceCountExchangeClient 构造方法创建一个带有引用计数功能的 ExchangeClient 实例，记录有多少个Invoker在使用该 ExchangeClient实例
+        // ReferenceCountExchangeClient 构造方法创建一个带有引用计数功能的 ExchangeClient 实例，记录有多少个 Invoker 在使用该 ExchangeClient 实例
         private ExchangeClient getSharedClient(URL url) {
             String key = url.getAddress();
             // 获取带有"引用计数"功能的 ExchangeClient
@@ -260,13 +260,12 @@ public class DubboReference2{
             // 添加编解码参数到 url 中
             url = url.addParameter(Constants.CODEC_KEY, DubboCodec.NAME);
             // enable heartbeat by default
-            // 在url中添加heartbeat参数，默认是6000ms，也就是说默认开启心跳机制
+            // 在 url 中添加 heartbeat 参数，默认是 6000ms，也就是说默认开启心跳机制
             url = url.addParameterIfAbsent(Constants.HEARTBEAT_KEY, String.valueOf(Constants.DEFAULT_HEARTBEAT));
     
             // BIO is not allowed since it has severe performance issue.
             if (str != null && str.length() > 0 && !ExtensionLoader.getExtensionLoader(Transporter.class).hasExtension(str)) {
-                throw new RpcException("Unsupported client type: " + str + "," +
-                        " supported client type is " + StringUtils.join(ExtensionLoader.getExtensionLoader(Transporter.class).getSupportedExtensions(), " "));
+                throw new RpcException("Unsupported client type: ");
             }
     
             ExchangeClient client;
@@ -713,6 +712,7 @@ public class DubboReference2{
             startHeatbeatTimer();
         }
 
+        // HeaderExchangeServer
         private void startHeatbeatTimer() {
             stopHeartbeatTimer();
             if (heartbeat > 0) {
@@ -778,6 +778,7 @@ public class DubboReference2{
             }
         }
 
+        // HeaderExchangeClient
         private void startHeatbeatTimer() {
             // 开始新的心跳之前，先从线程池中移除掉之前的心跳包发送任务
             stopHeartbeatTimer();
@@ -846,19 +847,19 @@ public class DubboReference2{
     final static class HeartBeatTask implements Runnable {
 
         private static final Logger logger = LoggerFactory.getLogger(HeartBeatTask.class);
-    
+
         private ChannelProvider channelProvider;
-    
+
         private int heartbeat;
-    
+
         private int heartbeatTimeout;
-    
+
         HeartBeatTask(ChannelProvider provider, int heartbeat, int heartbeatTimeout) {
             this.channelProvider = provider;
             this.heartbeat = heartbeat;
             this.heartbeatTimeout = heartbeatTimeout;
         }
-    
+
         /**
          * Dubbo 中采取的是双向心跳，即服务端会向客户端发送心跳，客户端也会向服务端发送心跳。HeartbeatTask 的主要作用就是发送心跳包，以及
          * 当超出设置的心跳总时间之后，进行相应的处理。
@@ -918,11 +919,11 @@ public class DubboReference2{
                 logger.warn("Unhandled exception when heartbeat, cause: " + t.getMessage(), t);
             }
         }
-    
+
         interface ChannelProvider {
             Collection<Channel> getChannels();
         }
-    
+
     }
 
     /**
@@ -987,6 +988,4 @@ public class DubboReference2{
         }
 
     }
-
-
 }

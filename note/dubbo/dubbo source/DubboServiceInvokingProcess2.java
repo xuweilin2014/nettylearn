@@ -87,8 +87,8 @@ public class DubboServiceInvokingProcess2{
      * 
      * decode -> encoder -> NettyServerHandler
      * 
-     * 其中NettyServerHandler是Netty中ChannelDuplexHandler的子类，可以处理入站和出站数据。其中其中，有一个ChannelHandler类型的handler对象，它真正的类型是NettyServer。NettyServer
-     * 的父类实现了ChannelHandler接口。而NettyServer中的handler也经过了层层封装。具体的层次如下：
+     * 其中 NettyServerHandler 是 Netty 中 ChannelDuplexHandler 的子类，可以处理入站和出站数据。其中，有一个 ChannelHandler 类型的 handler 对象，它真正的类型是 NettyServer。NettyServer
+     * 的父类实现了 ChannelHandler 接口。而 NettyServer 中的 handler 也经过了层层封装。具体的层次如下：
      * 
      * NettServerHandler
      * -> NettyServer（ChannelHandler handler）
@@ -115,11 +115,11 @@ public class DubboServiceInvokingProcess2{
      */
 
     /**
-     * Client的创建在DubboProtocol的getSharedClient和initClient中进行。
+     * Client 的创建在 DubboProtocol 的 getSharedClient 和 initClient 中进行。
      * 
-     * initClient返回一个HeaderExchangeClient对象，其中封装了NettyClient对象。
-     * getSharedClient在initClient的基础上又封装了一层，会返回一个ReferenceCountExchangeClient，其中包含了HeaderExchangeClient对象，而
-     * HeaderExchangeClient对象中自然也封装了NettyClient对象
+     * initClient 返回一个 HeaderExchangeClient 对象，其中封装了 NettyClient 对象。
+     * getSharedClient在initClient 的基础上又封装了一层，会返回一个 ReferenceCountExchangeClient，其中包含了 HeaderExchangeClient 对象，而
+     * ReferenceCountExchangeClient 对象中自然也封装了 NettyClient 对象
      */
 
     public class HeaderExchanger implements Exchanger {
@@ -131,12 +131,12 @@ public class DubboServiceInvokingProcess2{
         }
     
         public ExchangeServer bind(URL url, ExchangeHandler handler) throws RemotingException {
+            // 参数中的 handler 为 DubboProtocol$1
+            // 这里会将 handler 包装成为 DecodeHandler -> HeaderExchangeHandler -> DubboProtocol$1
             return new HeaderExchangeServer(Transporters.bind(url, new DecodeHandler(new HeaderExchangeHandler(handler))));
         }
     
     }
-
-    
 
     public abstract class AbstractPeer implements Endpoint, ChannelHandler {
 
@@ -264,7 +264,8 @@ public class DubboServiceInvokingProcess2{
         protected ChannelHandler wrapInternal(ChannelHandler handler, URL url) {
             // 使用自适应拓展机制，根据url中dispatcher参数的值，获取对应的扩展，也就是Dispatcher接口的实现类，然后调用其dispatch方法。
             // url中没有 dispatcher 参数的话，默认扩展是AllDispatcher，表示所有的消息都发送到线程池中去处理
-            // 这里的handler类型任然是 DecodeHandler
+            // 这里参数中的 handler 类型任然是：DecodeHandler -> HeaderExchangeHandler -> DubboProtocol$1
+            // 经过处理返回的 handler 类型为：MultiMessageHandler -> HeartbeatHandler -> AllChannelHandler -> DecodeHandler -> HeaderExchangeHandler -> DubboProtocol$1
             return new MultiMessageHandler(new HeartbeatHandler(
                 ExtensionLoader.getExtensionLoader(Dispatcher.class).getAdaptiveExtension().dispatch(handler, url)));
         }
@@ -395,19 +396,17 @@ public class DubboServiceInvokingProcess2{
     public abstract class AbstractChannelHandlerDelegate implements ChannelHandlerDelegate {
 
         protected ChannelHandler handler;
-    
+
         protected AbstractChannelHandlerDelegate(ChannelHandler handler) {
             Assert.notNull(handler, "handler == null");
             this.handler = handler;
         }
-    
         public ChannelHandler getHandler() {
             if (handler instanceof ChannelHandlerDelegate) {
                 return ((ChannelHandlerDelegate) handler).getHandler();
             }
             return handler;
         }
-    
     }
 
     public class MultiMessageHandler extends AbstractChannelHandlerDelegate {
@@ -550,8 +549,7 @@ public class DubboServiceInvokingProcess2{
                         // 将 channel 和 message 传给 ChannelHandler 对象，进行后续的调用，这里的 handler 是 DecodeHandler 类型
                         handler.received(channel, message);
                     } catch (Exception e) {
-                        logger.warn("ChannelEventRunnable handle " + state + " operation error, channel is " + channel
-                                + ", message is " + message, e);
+                        logger.warn("ChannelEventRunnable handle ");
                     }
                     break;
                 case CAUGHT:
@@ -609,7 +607,7 @@ public class DubboServiceInvokingProcess2{
     }
 
     /**
-     * 在Exchange层引入了Request和Response语义
+     * 在 Exchange 层引入了 Request 和 Response 语义
      */
     public static class HeaderExchangeHandler implements ChannelHandlerDelegate {
 
@@ -632,7 +630,7 @@ public class DubboServiceInvokingProcess2{
                             // 真正的调用服务，并且将调用得到的结果封装到 Response 对象中，最后再将该对象返回给服务消费方。
                             // 如果服务调用的过程中发生错误，则将错误信息封装到 Response 对象中，并返回给服务消费方。
                             Response response = handleRequest(exchangeChannel, request);
-                            // 将调用结果返回给服务消费端，channel的类型为NettyChannel
+                            // 将调用结果返回给服务消费端，channel 的类型为 NettyChannel
                             channel.send(response);
                         }
                         // 如果是单向通信，仅向后调用指定服务即可，无需返回调用结果
@@ -690,12 +688,11 @@ public class DubboServiceInvokingProcess2{
 
         static void handleResponse(Channel channel, Response response) throws RemotingException {
             // 如果服务器端发送过来的 response 不为 null，并且 response 不是服务器对客户端发送的心跳包的响应
-            // Dubbo里面心跳包都是客户端发送给服务器端，然后服务器端返回一个响应
+            // Dubbo 里面心跳包都是客户端发送给服务器端，然后服务器端返回一个响应
             if (response != null && !response.isHeartbeat()) {
                 DefaultFuture.received(channel, response);
             }
         }
-
     }
 
     public abstract class AbstractServer extends AbstractEndpoint implements Server {
@@ -726,8 +723,7 @@ public class DubboServiceInvokingProcess2{
                     logger.info("Start " + getClass().getSimpleName() + " bind " + getBindAddress() + ", export " + getLocalAddress());
                 }
             } catch (Throwable t) {
-                throw new RemotingException(url.toInetSocketAddress(), null, "Failed to bind " + getClass().getSimpleName()
-                        + " on " + getLocalAddress() + ", cause: " + t.getMessage(), t);
+                throw new RemotingException("Failed to bind ");
             }
             //fixme replace this with better method
             DataStore dataStore = ExtensionLoader.getExtensionLoader(DataStore.class).getDefaultExtension();
@@ -735,9 +731,19 @@ public class DubboServiceInvokingProcess2{
         }
 
         protected abstract void doOpen() throws Throwable;
+    }
 
+    public class NettyTransporter implements Transporter {
 
-
+        public static final String NAME = "netty4";
+    
+        public Server bind(URL url, ChannelHandler listener) throws RemotingException {
+            return new NettyServer(url, listener);
+        }
+    
+        public Client connect(URL url, ChannelHandler listener) throws RemotingException {
+            return new NettyClient(url, listener);
+        }
     }
 
     public class NettyServer extends AbstractServer implements Server {
@@ -846,6 +852,7 @@ public class DubboServiceInvokingProcess2{
         public void channelRead(ChannelHandlerContext ctx, Object msg) throws Exception {
             NettyChannel channel = NettyChannel.getOrAddChannel(ctx.channel(), url, handler);
             try {
+                // 这里的 handler 是 NettyServer 类型，会进入到 AbstractPeer 的 received 方法
                 handler.received(channel, msg);
             } finally {
                 NettyChannel.removeChannelIfDisconnected(ctx.channel());
@@ -893,10 +900,7 @@ public class DubboServiceInvokingProcess2{
                     // 通过 Invoker 调用具体的服务
                     return invoker.invoke(inv);
                 }
-                throw new RemotingException(channel,
-                        "Unsupported request: " + message == null ? null
-                                : (message.getClass().getName() + ": " + message) + ", channel: consumer: "
-                                        + channel.getRemoteAddress() + " --> provider: " + channel.getLocalAddress());
+                throw new RemotingException("Unsupported request");
             }
         };
 
@@ -910,18 +914,13 @@ public class DubboServiceInvokingProcess2{
 
             // 计算 service key，格式为 groupName/serviceName:serviceVersion:port。比如：
             // dubbo/com.alibaba.dubbo.demo.DemoService:1.0.0:20880
-            String serviceKey = serviceKey(port, path, inv.getAttachments().get(Constants.VERSION_KEY),
-                    inv.getAttachments().get(Constants.GROUP_KEY));
+            String serviceKey = serviceKey(port, path, inv.getAttachments().get(Constants.VERSION_KEY), inv.getAttachments().get(Constants.GROUP_KEY));
 
             // 从 exporterMap 查找与 serviceKey 相对应的 DubboExporter 对象，服务导出过程中会将 <serviceKey, DubboExporter> 映射关系存储到 exporterMap 集合中
             DubboExporter<?> exporter = (DubboExporter<?>) exporterMap.get(serviceKey);
 
             if (exporter == null)
-                throw new RemotingException(channel,
-                        "Not found exported service: " + serviceKey + " in " + exporterMap.keySet()
-                                + ", may be version or group mismatch " + ", channel: consumer: "
-                                + channel.getRemoteAddress() + " --> provider: " + channel.getLocalAddress()
-                                + ", message:" + inv);
+                throw new RemotingException("Not found exported service: ");
 
             // 获取 Invoker 对象，并返回
             return exporter.getInvoker();
@@ -936,8 +935,7 @@ public class DubboServiceInvokingProcess2{
             try {
                 // 调用 doInvoke 执行后续的调用，并将调用结果封装到 RpcResult 中
                 // this 为 JavassistProxyFactory 类型的对象
-                return new RpcResult(doInvoke(proxy, invocation.getMethodName(), invocation.getParameterTypes(),
-                        invocation.getArguments()));
+                return new RpcResult(doInvoke(proxy, invocation.getMethodName(), invocation.getParameterTypes(), invocation.getArguments()));
             } catch (InvocationTargetException e) {
                 return new RpcResult(e.getTargetException());
             } catch (Throwable e) {
@@ -945,8 +943,7 @@ public class DubboServiceInvokingProcess2{
             }
         }
 
-        protected abstract Object doInvoke(T proxy, String methodName, Class<?>[] parameterTypes, Object[] arguments)
-                throws Throwable;
+        protected abstract Object doInvoke(T proxy, String methodName, Class<?>[] parameterTypes, Object[] arguments) throws Throwable;
     }
 
     public class JavassistProxyFactory extends AbstractProxyFactory {
@@ -955,8 +952,7 @@ public class DubboServiceInvokingProcess2{
 
         @Override
         public <T> Invoker<T> getInvoker(T proxy, Class<T> type, URL url) {
-            final Wrapper wrapper = Wrapper
-                    .getWrapper(proxy.getClass().getName().indexOf('$') < 0 ? proxy.getClass() : type);
+            final Wrapper wrapper = Wrapper.getWrapper(proxy.getClass().getName().indexOf('$') < 0 ? proxy.getClass() : type);
             // 创建匿名类对象
             return new AbstractProxyInvoker<T>(proxy, type, url) {
                 @Override
@@ -996,8 +992,7 @@ public class DubboServiceInvokingProcess2{
             } catch (Throwable throwable) {
                 throw new InvocationTargetException(throwable);
             }
-            throw new NoSuchMethodException(new StringBuffer().append("Not found method \"").append(string)
-                    .append("\" in class com.alibaba.dubbo.demo.DemoService.").toString());
+            throw new NoSuchMethodException("Not found method in class com.alibaba.dubbo.demo.DemoService");
         }
     }
 
