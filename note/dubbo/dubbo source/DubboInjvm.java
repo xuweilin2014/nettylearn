@@ -17,8 +17,8 @@ public class DubboInjvm{
      * 
      * <Dubbo:reference id="demoService" interface="org.apache.Dubbo.samples.local.api.DemoService" url="injvm://127.0.0.1/org.apache.Dubbo.samples.local.api.DemoService"/>
      * 
-     * 本地调用是可以显式关闭的，通过这种方式，服务提供者可以做到对远端服务消费者和本地消费者一视同仁（即本地调用的流程与远端服务消费者一样）。
-     * 具体做法是通过 scope="remote" 来关闭 injvm 协议的暴露，这样，即使是本地调用者，也需要从注册中心上获取服务地址列表，然后才能发起调用，
+     * 本地调用是可以显式关闭的，通过这种方式，服务提供者可以做到对远端服务消费者和本地消费者一视同仁（即本地调用的流程与远端服务消费者一样，需要去订阅注册中心的目录，
+     * 然后获取到 invoker 信息）。具体做法是通过 scope="remote" 来关闭 injvm 协议的暴露，这样，即使是本地调用者，也需要从注册中心上获取服务地址列表，然后才能发起调用，
      * 而这个时候的调用过程，与远端的服务消费者的过程是一致的。
      * 
      * <bean id="target" class="org.apache.Dubbo.samples.local.impl.DemoServiceImpl"/>
@@ -32,7 +32,7 @@ public class DubboInjvm{
         public static void main(String[] args) {
             ClassPathXmlApplicationContext context = new ClassPathXmlApplicationContext("classpath:consumer.xml");
             context.start();
-    
+
             DemoService demoService = (DemoService) context.getBean("demoService");
             String s = demoService.sayHello("world");
             System.out.println(s);
@@ -97,9 +97,10 @@ public class DubboInjvm{
             return INSTANCE;
         }
     
+        // InjvmProtocol#getExporter
         static Exporter<?> getExporter(Map<String, Exporter<?>> map, URL key) {
             Exporter<?> result = null;
-    
+
             if (!key.getServiceKey().contains("*")) {
                 result = map.get(key.getServiceKey());
             } else {
@@ -112,7 +113,7 @@ public class DubboInjvm{
                     }
                 }
             }
-    
+
             if (result == null) {
                 return null;
             } else if (ProtocolUtils.isGeneric(
@@ -127,10 +128,12 @@ public class DubboInjvm{
             return DEFAULT_PORT;
         }
     
+        // InjvmProtocol#export
         public <T> Exporter<T> export(Invoker<T> invoker) throws RpcException {
             return new InjvmExporter<T>(invoker, invoker.getUrl().getServiceKey(), exporterMap);
         }
     
+        // InjvmProtocol#refer
         public <T> Invoker<T> refer(Class<T> serviceType, URL url) throws RpcException {
             return new InjvmInvoker<T>(serviceType, url, url.getServiceKey(), exporterMap);
         }
@@ -205,6 +208,7 @@ public class DubboInjvm{
             }
         }
 
+        // ServiceConfig<T>#exportLocal
         private void exportLocal(URL url) {
             if (!Constants.LOCAL_PROTOCOL.equalsIgnoreCase(url.getProtocol())) {
                 // 如果说url的协议不为injvm的话，就会对url进行重新设置，也就是将协议设置为injvm，ip地址设置为localhost，port设置为0
@@ -225,43 +229,44 @@ public class DubboInjvm{
 
     public class ReferenceConfig<T> extends AbstractReferenceConfig{
 
-        private T createProxy(Map<String, String> map) {
-            URL tmpUrl = new URL("temp", "localhost", 0, map);
-            final boolean isJvmRefer;
-            if (isInjvm() == null) {
-                if (url != null && url.length() > 0) { // if a url is specified, don't do local reference
-                    isJvmRefer = false;
-                } else if (InjvmProtocol.getInjvmProtocol().isInjvmRefer(tmpUrl)) {
-                    // by default, reference local service if there is
-                    isJvmRefer = true;
-                } else {
-                    isJvmRefer = false;
-                }
+    // ReferenceConfig#createProxy
+    private T createProxy(Map<String, String> map) {
+        URL tmpUrl = new URL("temp", "localhost", 0, map);
+        final boolean isJvmRefer;
+        if (isInjvm() == null) {
+            if (url != null && url.length() > 0) { // if a url is specified, don't do local reference
+                isJvmRefer = false;
+            } else if (InjvmProtocol.getInjvmProtocol().isInjvmRefer(tmpUrl)) {
+                // by default, reference local service if there is
+                isJvmRefer = true;
             } else {
-                isJvmRefer = isInjvm().booleanValue();
+                isJvmRefer = false;
             }
-    
-            // 如果是本地调用的话，就使用InjvmProtocol生成一个InjvmInvoker
-            if (isJvmRefer) {
-                URL url = new URL(Constants.LOCAL_PROTOCOL, NetUtils.LOCALHOST, 0, interfaceClass.getName()).addParameters(map);
-                invoker = refprotocol.refer(interfaceClass, url);
-                if (logger.isInfoEnabled()) {
-                    logger.info("Using injvm service " + interfaceClass.getName());
-                }
-            } else {
-                // 代码省略
-            }
-    
-            // 代码省略
-
-            // create service proxy
-            // 将前面生成的InjvmInvoker，使用ProxyFactory类中的getProxy包装成一个远程服务代理，然后返回
-            // 在这里本地调用与远程调用不同的是，远程调用生成的Invoker的doInvoke方法是向远程服务器发起调用，而在InjvmInvoker的doInvoke方法中，
-            // 它是直接获取到exporter中的invoker对象，从而调用其invoke方法。注意在exporter中的invoker对象一般都是通过ProxyFactory类中的
-            // getInvoker方法获取到的，它会真正调用执行具体的方法，也就是说，通过本地调用没有经过网络传输的过程，不过还是会经过一系列的
-            // 拦截器
-            return (T) proxyFactory.getProxy(invoker);
+        } else {
+            isJvmRefer = isInjvm().booleanValue();
         }
+
+        // 如果是本地调用的话，就使用InjvmProtocol生成一个InjvmInvoker
+        if (isJvmRefer) {
+            URL url = new URL(Constants.LOCAL_PROTOCOL, NetUtils.LOCALHOST, 0, interfaceClass.getName()).addParameters(map);
+            invoker = refprotocol.refer(interfaceClass, url);
+            if (logger.isInfoEnabled()) {
+                logger.info("Using injvm service " + interfaceClass.getName());
+            }
+        } else {
+            // 代码省略
+        }
+
+        // 代码省略
+
+        // create service proxy
+        // 将前面生成的InjvmInvoker，使用ProxyFactory类中的getProxy包装成一个远程服务代理，然后返回
+        // 在这里本地调用与远程调用不同的是，远程调用生成的Invoker的doInvoke方法是向远程服务器发起调用，而在InjvmInvoker的doInvoke方法中，
+        // 它是直接获取到exporter中的invoker对象，从而调用其invoke方法。注意在exporter中的invoker对象一般都是通过ProxyFactory类中的
+        // getInvoker方法获取到的，它会真正调用执行具体的方法，也就是说，通过本地调用没有经过网络传输的过程，不过还是会经过一系列的
+        // 拦截器
+        return (T) proxyFactory.getProxy(invoker);
+    }
 
     }
 
@@ -309,21 +314,21 @@ public class DubboInjvm{
     class InjvmExporter<T> extends AbstractExporter<T> {
 
         private final String key;
-    
+
         private final Map<String, Exporter<?>> exporterMap;
-    
+
         InjvmExporter(Invoker<T> invoker, String key, Map<String, Exporter<?>> exporterMap) {
             super(invoker);
             this.key = key;
             this.exporterMap = exporterMap;
             exporterMap.put(key, this);
         }
-    
+
         public void unexport() {
             super.unexport();
             exporterMap.remove(key);
         }
-    
+
     }
 
     /**
@@ -333,15 +338,15 @@ public class DubboInjvm{
     class InjvmInvoker<T> extends AbstractInvoker<T> {
 
         private final String key;
-    
+
         private final Map<String, Exporter<?>> exporterMap;
-    
+
         InjvmInvoker(Class<T> type, URL url, String key, Map<String, Exporter<?>> exporterMap) {
             super(type, url);
             this.key = key;
             this.exporterMap = exporterMap;
         }
-    
+
         @Override
         public boolean isAvailable() {
             InjvmExporter<?> exporter = (InjvmExporter<?>) exporterMap.get(key);
@@ -351,7 +356,8 @@ public class DubboInjvm{
                 return super.isAvailable();
             }
         }
-    
+
+        // InjvmInvoker#doInvoke
         public Result doInvoke(Invocation invocation) throws Throwable {
             Exporter<?> exporter = InjvmProtocol.getExporter(exporterMap, getUrl());
             if (exporter == null) {

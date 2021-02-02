@@ -771,14 +771,15 @@ public class DubboServiceInvokingProcess {
         send(message, url.getParameter(Constants.SENT_KEY, false));
     }
 
-    // AbstractClient的子类有GrizzlyClient，MinaClient，NettyClient，NettyClient（分别是Netty3和Netty4）
+    // AbstractClient 的子类有 GrizzlyClient，MinaClient，NettyClient，NettyClient（分别是 Netty3 和 Netty4）
     public abstract class AbstractClient extends AbstractEndpoint implements Client {
- 
+
         private final boolean send_reconnect;
 
         private final AtomicInteger reconnect_count = new AtomicInteger(0);
 
         // Reconnection error log has been called before?
+        // 重连警告是否已经被写入到日志中
         private final AtomicBoolean reconnect_error_log_flag = new AtomicBoolean(false);
 
         private final long shutdown_timeout;
@@ -789,19 +790,19 @@ public class DubboServiceInvokingProcess {
 
         public AbstractClient(URL url, ChannelHandler handler) throws RemotingException {
             super(url, handler);
-    
+
             /**
              * 客户端需要提供重连机制，所以初始化的几个参数都和重连有关：
              */
 
-            // send_reconnect表示在发送消息时发现连接已经断开是否发起重连
+            // send_reconnect 表示在发送消息时如果发现连接已经断开是否发起重连，默认为 false
             send_reconnect = url.getParameter(Constants.SEND_RECONNECT_KEY, false);
-            // shutdown_timeout表示连接服务器一直连接不上的超时时间
+            // shutdown_timeout 表示连接服务器一直连接不上的超时时间
             shutdown_timeout = url.getParameter(Constants.SHUTDOWN_TIMEOUT_KEY, Constants.DEFAULT_SHUTDOWN_TIMEOUT);
             // The default reconnection interval is 2s, 1800 means warning interval is 1 hour.
-            // reconnect_warning_period表示经过多少次重连尝试之后报一次重连警告
+            // reconnect_warning_period 表示经过多少次重连尝试之后报一次重连警告
             reconnect_warning_period = url.getParameter("reconnect.waring.period", 1800);
-    
+
             try {
                 doOpen();
             } catch (Throwable t) {
@@ -818,11 +819,9 @@ public class DubboServiceInvokingProcess {
             } catch (Throwable t) {
                 // 省略代码....
             }
-    
-            executor = (ExecutorService) ExtensionLoader.getExtensionLoader(DataStore.class)
-                    .getDefaultExtension().get(Constants.CONSUMER_SIDE, Integer.toString(url.getPort()));
-            ExtensionLoader.getExtensionLoader(DataStore.class)
-                    .getDefaultExtension().remove(Constants.CONSUMER_SIDE, Integer.toString(url.getPort()));
+
+            executor = (ExecutorService) ExtensionLoader.getExtensionLoader(DataStore.class).getDefaultExtension().get(Constants.CONSUMER_SIDE, Integer.toString(url.getPort()));
+            ExtensionLoader.getExtensionLoader(DataStore.class).getDefaultExtension().remove(Constants.CONSUMER_SIDE, Integer.toString(url.getPort()));
         }
 
         protected void connect() throws RemotingException {
@@ -832,7 +831,7 @@ public class DubboServiceInvokingProcess {
                 if (isConnected()) {
                     return;
                 }
-                // 初始化连接状态检查器，定期检查channel是否连接，连接断开会进行重连操作
+                // 初始化连接状态检查器，定期检查 channel 是否连接，连接断开会进行重连操作
                 initConnectStatusCheckCommand();
                 doConnect();
                 if (!isConnected()) {
@@ -842,8 +841,8 @@ public class DubboServiceInvokingProcess {
                         logger.info("Successed connect to server ...." );
                     }
                 }
-                // 连接建立好或者重新建立好之后，将reconnect_count（表示重连次数）以及reconnect_error_log_flag（是否已经记录了重连警告信息）
-                // 重置为初始值0和false
+                // 连接建立好或者重新建立好之后，将 reconnect_count（表示重连次数）以及 reconnect_error_log_flag（是否已经记录了重连警告信息）
+                // 重置为初始值 0 和 false
                 reconnect_count.set(0);
                 reconnect_error_log_flag.set(false);
             } catch (RemotingException e) {
@@ -864,7 +863,8 @@ public class DubboServiceInvokingProcess {
             // 表示进行重连接操作，reconnect如果为true，就将其设置为 2000ms，或者用户自己设置的时间间隔数
             int reconnect = getReconnectParam(getUrl());
 
-            // reconnectExecutorFuture == null || reconnectExecutorFuture.isCancelled() 这个判断条件保证了当再一次
+            // reconnectExecutorFuture == null || reconnectExecutorFuture.isCancelled() 这个判断条件保证了当再一次调用 connect 方法时，
+            // 如果定时任务已经开始了并且没有被取消，那么就不再重复创建定时任务
             if (reconnect > 0 && (reconnectExecutorFuture == null || reconnectExecutorFuture.isCancelled())) {
                 Runnable connectStatusCheckCommand = new Runnable() {
                     public void run() {
@@ -875,11 +875,10 @@ public class DubboServiceInvokingProcess {
                                 lastConnectedTime = System.currentTimeMillis();
                             }
                         } catch (Throwable t) {
-                            String errorMsg = "client reconnect to " + getUrl().getAddress() + " find error . url: "
-                                    + getUrl();
+                            String errorMsg = "client reconnect to " + getUrl().getAddress() + " find error . url: " + getUrl();
                             // wait registry sync provider list
-                            // shutdown_timeout表示服务器一直连不上的超时时间，如果距离上次连上的时间间隔（lastConnectedTime）超过
-                            // 了shutdown_timeout，且还没有在日志中记录重连警告，那么就在日志里面进行记录
+                            // shutdown_timeout 表示服务器一直连不上的超时时间，如果距离上次连上的时间间隔（lastConnectedTime）超过
+                            // 了 shutdown_timeout，且还没有在日志中记录重连警告，那么就在日志里面进行记录
                             if (System.currentTimeMillis() - lastConnectedTime > shutdown_timeout) {
                                 if (!reconnect_error_log_flag.get()) {
                                     reconnect_error_log_flag.set(true);
@@ -895,8 +894,7 @@ public class DubboServiceInvokingProcess {
                     }
                 };
                 // 创建好定时任务之后，就交给 ScheduledThreadPoolExecutor 来执行
-                reconnectExecutorFuture = reconnectExecutorService
-                                                .scheduleWithFixedDelay(connectStatusCheckCommand, reconnect, reconnect, TimeUnit.MILLISECONDS);
+                reconnectExecutorFuture = reconnectExecutorService.scheduleWithFixedDelay(connectStatusCheckCommand, reconnect, reconnect, TimeUnit.MILLISECONDS);
             }
         }
 
@@ -944,13 +942,13 @@ public class DubboServiceInvokingProcess {
                     .option(ChannelOption.ALLOCATOR, PooledByteBufAllocator.DEFAULT)
                     //.option(ChannelOption.CONNECT_TIMEOUT_MILLIS, getTimeout())
                     .channel(NioSocketChannel.class);
-    
+
             if (getTimeout() < 3000) {
                 bootstrap.option(ChannelOption.CONNECT_TIMEOUT_MILLIS, 3000);
             } else {
                 bootstrap.option(ChannelOption.CONNECT_TIMEOUT_MILLIS, getTimeout());
             }
-    
+
             bootstrap.handler(new ChannelInitializer() {
                 protected void initChannel(Channel ch) throws Exception {
                     NettyCodecAdapter adapter = new NettyCodecAdapter(getCodec(), getUrl(), NettyClient.this);
@@ -976,7 +974,7 @@ public class DubboServiceInvokingProcess {
                 if (ret && future.isSuccess()) {
                     Channel newChannel = future.channel();
                     try {
-                        // Close old channel
+                        // close old channel
                         Channel oldChannel = NettyClient.this.channel; // copy reference
                         if (oldChannel != null) {
                             try {
@@ -1004,13 +1002,9 @@ public class DubboServiceInvokingProcess {
                         }
                     }
                 } else if (future.cause() != null) {
-                    throw new RemotingException(this, "client(url: " + getUrl() + ") failed to connect to server "
-                            + getRemoteAddress() + ", error message is:" + future.cause().getMessage(), future.cause());
+                    throw new RemotingException("client(url: " + getUrl() + ") failed to connect to server ");
                 } else {
-                    throw new RemotingException(this, "client(url: " + getUrl() + ") failed to connect to server "
-                            + getRemoteAddress() + " client-side timeout "
-                            + getConnectTimeout() + "ms (elapsed: " + (System.currentTimeMillis() - start) + "ms) from netty client "
-                            + NetUtils.getLocalHost() + " using dubbo version " + Version.getVersion());
+                    throw new RemotingException("client(url: " + getUrl() + ") failed to connect to server ");
                 }
             } finally {
                 if (!isConnected()) {

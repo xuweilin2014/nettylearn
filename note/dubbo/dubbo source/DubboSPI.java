@@ -113,6 +113,7 @@ public class DubboSPI {
          * b. 有一个以目标接口为参数类型的构造函数。
          * 这也就是上述createExtension()方法最后封装wrapper对象时传入的构造函数实例始终可以为instance实例的原因
          */
+        // ExtensionLoader#createExtension
         private T createExtension(String name) {
             // getExtensionClasses用来获取配置文件中所有的拓展类，可以得到 "配置项名称" -> "配置类" 的对应关系
             Class<?> clazz = getExtensionClasses().get(name);
@@ -357,6 +358,7 @@ public class DubboSPI {
         //objectFactory 变量的类型为 AdaptiveExtensionFactory，AdaptiveExtensionFactory 内部维护了一个 ExtensionFactory 列表，
         //用于存储其他类型的 ExtensionFactory。Dubbo 目前提供了两种 ExtensionFactory，分别是 SpiExtensionFactory 和 SpringExtensionFactory。
         //前者用于创建自适应的拓展，后者是用于从 Spring 的 IOC 容器中获取所需的拓展。
+        // ExtensionLoader#injectExtension
         private T injectExtension(T instance) {
             try {
                 if (objectFactory != null) {
@@ -389,8 +391,6 @@ public class DubboSPI {
             }
             return instance;
         }
-
-
     }
 
     @SPI
@@ -434,20 +434,22 @@ public class DubboSPI {
     }
 
     public class SpiExtensionFactory implements ExtensionFactory {
-
+        @Override
         public <T> T getExtension(Class<T> type, String name) {
+            // Class type对应的必须是接口，并且需要注解了@SPI注解
             if (type.isInterface() && type.isAnnotationPresent(SPI.class)) {
                 ExtensionLoader<T> loader = ExtensionLoader.getExtensionLoader(type);
+                // 判断该扩展点接口是否有扩展点实现类
                 if (loader.getSupportedExtensions().size() > 0) {
+                    // 获取type对应接口的自适应类(适配类)实例。如果有@Adaptive注解的类,则返回该类的实例,否则返回一个动态生成类的实例(如Protocol$Adpative的实例)
                     return loader.getAdaptiveExtension();
                 }
             }
             return null;
         }
-    
     }
 
-    public class SpringExtensionFactory implements ExtensionFactory {
+    public static class SpringExtensionFactory implements ExtensionFactory {
 
         private static final Set<ApplicationContext> contexts = new ConcurrentHashSet<ApplicationContext>();
     

@@ -28,7 +28,7 @@ public class DubboDirectory{
     }
 
     /**
-     * RpcInvocation是对Invoker和方法调用各项参数的一个封装，比如方法调用的名字methodName、参数类型parameterTypes、具体参数arguments
+     * RpcInvocation 是对 Invoker 和方法调用各项参数的一个封装，比如方法调用的名字 methodName、参数类型 parameterTypes、具体参数 arguments
      */
     public class RpcInvocation implements Invocation, Serializable {
 
@@ -121,7 +121,7 @@ public class DubboDirectory{
     }
 
     //StaticDirectory 即静态服务目录，顾名思义，它内部存放的 Invoker 是不会变动的。所以，理论上它和不可变 List 的功能很相似。
-    public class StaticDirectory<T> extends AbstractDirectory<T> {
+    public class StaticDirectory<T>{
 
         private final List<Invoker<T>> invokers;
     
@@ -181,16 +181,20 @@ public class DubboDirectory{
      * RegistryDirectory 可根据配置变更信息刷新 Invoker 列表。RegistryDirectory 中有几个比较重要的逻辑:
      * 第一是 Invoker 的列举逻辑，第二是接收服务配置变更的逻辑，第三是 Invoker 列表的刷新逻辑。
      */
-    public class RegistryDirectory<T> extends AbstractDirectory<T> implements NotifyListener{
+    public class RegistryDirectory<T> implements NotifyListener{
         
         private volatile Map<String, Invoker<T>> urlInvokerMap;
 
+        /**
+         * 以上代码进行多次尝试，希望从 localMethodInvokerMap 中获取到 invoker 列表，一般情况下，普通的调用
+         * 可以通过方法名获取到对应的 invoker 列表。localMethodInvokerMap 源自 RegistryDirectory 类的成员
+         * 变量 methodInvokerMap。doList 方法可以看做是对 methodInvokerMap 变量的读取操作。
+         */
+        // RegistryDirectory#doList
         public List<Invoker<T>> doList(Invocation invocation) {
             if (forbidden) {
                 // 服务提供者禁用了服务或者没有对应的服务提供者，此时抛出 No provider 异常
-                throw new RpcException(RpcException.FORBIDDEN_EXCEPTION,
-                    "No provider available from registry " + getUrl().getAddress() + " for service " + getConsumerUrl().getServiceKey() + " on consumer " +  NetUtils.getLocalHost()
-                        + " use dubbo version " + Version.getVersion() + ", may be providers disabled or not registered ?");
+                throw new RpcException("No provider available from registry ");
             }
 
             List<Invoker<T>> invokers = null;
@@ -216,6 +220,14 @@ public class DubboDirectory{
                     //Constants.ANY_VALUE的值为 *
                     invokers = localMethodInvokerMap.get(Constants.ANY_VALUE);
                 }
+
+                // 遍历 methodlnvokerMap，找到第一个 Invoker 列表返回。如果还没有，则返回一个空列表
+                if (invokers == null) {
+                    Iterator<List<Invoker<T>>> iterator = localMethodInvokerMap.values().iterator();
+                    if (iterator.hasNext()) {
+                        invokers = iterator.next();
+                    }
+                }
             }
             return invokers == null ? new ArrayList<Invoker<T>>(0) : invokers;
         }
@@ -225,6 +237,7 @@ public class DubboDirectory{
         // 
         // 如上，notify 方法首先是根据 url 的 category 参数对 url 进行分门别类存储，然后通过 toRouters 和 toConfigurators 将 url 列表转成 Router 和 Configurator 列表。
         // 最后调用 refreshInvoker 方法刷新 Invoker 列表。
+        // RegistryDirectory#notify
         public synchronized void notify(List<URL> urls) {
             // 定义三个集合，分别用于存放服务提供者 url，路由 url，配置器 url
             List<URL> invokerUrls = new ArrayList<URL>();
@@ -233,15 +246,13 @@ public class DubboDirectory{
 
             for (URL url : urls) {
                 String protocol = url.getProtocol();
-                //用来获取url中的category参数，默认是providers。在zookeeper中，注册中心的目录有4种：providers、routers、configurators、consumers
+                // 用来获取url中的category参数，默认是providers。在zookeeper中，注册中心的目录有4种：providers、routers、configurators、consumers
                 String category = url.getParameter(Constants.CATEGORY_KEY, Constants.DEFAULT_CATEGORY);
                 // 根据 category 参数将 url 分别放到不同的列表中
-                if (Constants.ROUTERS_CATEGORY.equals(category)
-                        || Constants.ROUTE_PROTOCOL.equals(protocol)) {
+                if (Constants.ROUTERS_CATEGORY.equals(category) || Constants.ROUTE_PROTOCOL.equals(protocol)) {
                     // 添加路由器 url
                     routerUrls.add(url);
-                } else if (Constants.CONFIGURATORS_CATEGORY.equals(category)
-                        || Constants.OVERRIDE_PROTOCOL.equals(protocol)) {
+                } else if (Constants.CONFIGURATORS_CATEGORY.equals(category) || Constants.OVERRIDE_PROTOCOL.equals(protocol)) {
                     // 添加配置器 url
                     configuratorUrls.add(url);
                 } else if (Constants.PROVIDERS_CATEGORY.equals(category)) {
@@ -279,8 +290,9 @@ public class DubboDirectory{
          * 3.将 url 转成 Invoker，得到 <url, Invoker> 的映射关系。
          * 4.进一步进行转换，得到 <methodName, Invoker 列表> 映射关系。然后进行多组 Invoker 合并操作，并且将合并操作的结果赋值给 methodInvokerMap，
          * 这个 methodInvokerMap 在 doList 方法中会用到，doList 方法中会对该方法进行读操作，在这里是写操作。
-         * 5.销毁无用的 Invoker，避免服务消费者调用已下线的服务的服务。
+         * 5.销毁无用的 Invoker，避免服务消费者调用已下线的服务。
          */
+        // RegistryDirectory#refreshInvoker
         private void refreshInvoker(List<URL> invokerUrls) {
             // Constants.EMPTY_PROTOCOL的字符串值为empty
             // 首先会根据入参 invokerUrls 的数量和协议头是否为 empty 来判断是否禁用所有的服务，如果禁用，则将 forbidden 设为 true，并销毁所有的 Invoker
@@ -334,6 +346,7 @@ public class DubboDirectory{
         //url中的各种配置参数，在RegistryDirectory的构造函数中初始化
         private final Map<String, String> queryMap; // Initialization at construction time, assertion not null
 
+        // RegistryDirectory#toInvokers
         private Map<String, Invoker<T>> toInvokers(List<URL> urls) {
             Map<String, Invoker<T>> newUrlInvokerMap = new HashMap<String, Invoker<T>>();
             if (urls == null || urls.size() == 0) {
@@ -371,8 +384,9 @@ public class DubboDirectory{
                             + ", supported protocol: " + ExtensionLoader.getExtensionLoader(Protocol.class).getSupportedExtensions()));
                     continue;
                 }
+                // 对 consumerUrl 和 providerUrl 中的部分参数进行合并，比如 timeout
                 URL url = mergeUrl(providerUrl);
-    
+
                 String key = url.toFullString(); // The parameter urls are sorted
                 if (keys.contains(key)) { // Repeated url
                     continue;
@@ -411,8 +425,136 @@ public class DubboDirectory{
             keys.clear();
             return newUrlInvokerMap;
         }
+
+        // destroyUnusedInvokers 方法的主要逻辑是通过 newUrlInvokerMap 找出待删除 Invoker 对应的 url，并将 url 存入到 deleted 列表中。
+        // 然后再遍历 deleted 列表，并从 oldUrlInvokerMap 中移除相应的 Invoker
+        private void destroyUnusedInvokers(Map<String, Invoker<T>> oldUrlInvokerMap, Map<String, Invoker<T>> newUrlInvokerMap) {
+            // 如果新的 invoker 集合为空，就表明当前没有服务提供者可用，所以销毁掉所有的 invoker
+            if (newUrlInvokerMap == null || newUrlInvokerMap.size() == 0) {
+                destroyAllInvokers();
+                return;
+            }
+
+            // check deleted invoker
+            List<String> deleted = null;
+            // 如果旧的 invoker 不在新的 invoker 集合（也就是 newUrlInvokerMap）中，就将其加入到 deleted 集合中，表明要对其进行删除
+            if (oldUrlInvokerMap != null) {
+                Collection<Invoker<T>> newInvokers = newUrlInvokerMap.values();
+                for (Map.Entry<String, Invoker<T>> entry : oldUrlInvokerMap.entrySet()) {
+                    if (!newInvokers.contains(entry.getValue())) {
+                        if (deleted == null) {
+                            deleted = new ArrayList<String>();
+                        }
+                        deleted.add(entry.getKey());
+                    }
+                }
+            }
+    
+            // deleted 集合表示要销毁掉的 invoker 集合 
+            if (deleted != null) {
+                for (String url : deleted) {
+                    if (url != null) {
+                        Invoker<T> invoker = oldUrlInvokerMap.remove(url);
+                        if (invoker != null) {
+                            try {
+                                invoker.destroy();
+                                if (logger.isDebugEnabled()) {
+                                    logger.debug("destory invoker[" + invoker.getUrl() + "] success. ");
+                                }
+                            } catch (Exception e) {
+                                logger.warn("destory invoker[" + invoker.getUrl() + "] faild. " + e.getMessage(), e);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        private URL mergeUrl(URL providerUrl) {
+            // 对 zookeeper 中的 providerUrl 中的参数与 consumerUrl 中的 queryMap 参数进行一个合并，比如 consumer 和 provider 的超时时间
+            providerUrl = ClusterUtils.mergeUrl(providerUrl, queryMap); // Merge the consumer side parameters
+    
+            List<Configurator> localConfigurators = this.configurators; // local reference
+            if (localConfigurators != null && localConfigurators.size() > 0) {
+                for (Configurator configurator : localConfigurators) {
+                    providerUrl = configurator.configure(providerUrl);
+                }
+            }
+    
+            providerUrl = providerUrl.addParameter(Constants.CHECK_KEY, String.valueOf(false)); // Do not check whether the connection is successful or not, always create Invoker!
+    
+            // The combination of directoryUrl and override is at the end of notify, which can't be handled here
+            this.overrideDirectoryUrl = this.overrideDirectoryUrl.addParametersIfAbsent(providerUrl.getParameters()); // Merge the provider side parameters
+    
+            if ((providerUrl.getPath() == null || providerUrl.getPath().length() == 0)
+                    && "dubbo".equals(providerUrl.getProtocol())) { // Compatible version 1.0
+                //fix by tony.chenl DUBBO-44
+                String path = directoryUrl.getParameter(Constants.INTERFACE_KEY);
+                if (path != null) {
+                    int i = path.indexOf('/');
+                    if (i >= 0) {
+                        path = path.substring(i + 1);
+                    }
+                    i = path.lastIndexOf(':');
+                    if (i >= 0) {
+                        path = path.substring(0, i);
+                    }
+                    providerUrl = providerUrl.setPath(path);
+                }
+            }
+            return providerUrl;
+        }
     }
 
+    public static class ClusterUtils {
+
+        public static URL mergeUrl(URL remoteUrl, Map<String, String> localMap) {
+            Map<String, String> map = new HashMap<String, String>();
+            // remoteMap 为 providerUrl 中的参数
+            // localMap 为 consumerUrl 中的参数
+            Map<String, String> remoteMap = remoteUrl.getParameters();
+    
+    
+            if (remoteMap != null && remoteMap.size() > 0) {
+                // 先将 providerUrl 中的参数保存到 map 中
+                map.putAll(remoteMap);
+    
+                // Remove configurations from provider, some items should be affected by provider.
+                map.remove(Constants.THREAD_NAME_KEY);
+                map.remove(Constants.DEFAULT_KEY_PREFIX + Constants.THREAD_NAME_KEY);
+    
+                map.remove(Constants.THREADPOOL_KEY);
+                map.remove(Constants.DEFAULT_KEY_PREFIX + Constants.THREADPOOL_KEY);
+    
+                map.remove(Constants.CORE_THREADS_KEY);
+                map.remove(Constants.DEFAULT_KEY_PREFIX + Constants.CORE_THREADS_KEY);
+    
+                map.remove(Constants.THREADS_KEY);
+                map.remove(Constants.DEFAULT_KEY_PREFIX + Constants.THREADS_KEY);
+    
+                map.remove(Constants.QUEUES_KEY);
+                map.remove(Constants.DEFAULT_KEY_PREFIX + Constants.QUEUES_KEY);
+    
+                map.remove(Constants.ALIVE_KEY);
+                map.remove(Constants.DEFAULT_KEY_PREFIX + Constants.ALIVE_KEY);
+    
+                map.remove(Constants.TRANSPORTER_KEY);
+                map.remove(Constants.DEFAULT_KEY_PREFIX + Constants.TRANSPORTER_KEY);
+            }
+    
+            if (localMap != null && localMap.size() > 0) {
+                // 再将 consumerUrl 中的参数保存到 map 中，在这里，localMap 会覆盖掉 remoteMap 中相同名称的参数
+                // 也就是说 consumer 端的参数会覆盖掉 provider 端的参数，比如 timeout
+                map.putAll(localMap);
+            }
+            if (remoteMap != null && remoteMap.size() > 0) {
+                // 省略代码
+            }
+    
+            return remoteUrl.clearParameters().addParameters(map);
+        }
+
+    }
 
 
 

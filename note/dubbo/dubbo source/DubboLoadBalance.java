@@ -68,9 +68,9 @@ public class DubboLoadBalance{
     public class RandomLoadBalance extends AbstractLoadBalance {
 
         public static final String NAME = "random";
-    
+
         private final Random random = new Random();
-    
+
         protected <T> Invoker<T> doSelect(List<Invoker<T>> invokers, URL url, Invocation invocation) {
             int length = invokers.size(); // Number of invokers
             int totalWeight = 0; // The sum of weights
@@ -281,10 +281,11 @@ public class DubboLoadBalance{
      * 
      * 实现逻辑：Dubbo 实现的负载均衡是客户端负载均衡。初始化的时候根据用户配置的 hash.nodes 创建指定数目的虚拟节点，默认为 160 个。
      * 
-     * Dubbo 对 Invoker 进行 hash 运算时使用的是 Invoker 的 ip + port + 0-39的数字；对发送的 rpc 请求则是使用方法中的参数值进行 hash 运算，默认是使用第 1 个参数（从 1 开始计数的话）。
+     * Dubbo 对 Invoker 进行 hash 运算时使用的是 Invoker 的 ip + port + 0-39的数字；对发送的 rpc 请求则是使用方法中的参数值进行 hash 运算，
+     * 默认是使用第 1 个参数（从 1 开始计数的话）。
      * 
-     * 需要特别说明的是，客户端发送的请求的 hash 值只和参数值有关，具有相同参数值的请求，在虚拟节点不发生变化的情况下，会传递给相同的 Invoker 进行处理。在 Dubbo 实现的一致性 hash 算法中，每一个节点 invoker
-     * 的 hash 值就代表一个虚拟节点
+     * 需要特别说明的是，客户端发送的请求的 hash 值只和参数值有关，具有相同参数值的请求，在虚拟节点不发生变化的情况下，会传递给相同的 Invoker 进行处理。
+     * 在 Dubbo 实现的一致性 hash 算法中，每一个节点 invoker 的 hash 值就代表一个虚拟节点
      */
     public class ConsistentHashLoadBalance extends AbstractLoadBalance {
 
@@ -297,10 +298,11 @@ public class DubboLoadBalance{
         @SuppressWarnings("unchecked")
         @Override
         protected <T> Invoker<T> doSelect(List<Invoker<T>> invokers, URL url, Invocation invocation) {
-            // key的值一般为：com.dubbo.simple.common.DemoService.sayHello
+            // key 值一般为：服务接口名 + 方法名
+            // key 的值一般为：com.dubbo.simple.common.DemoService.sayHello
             String key = invokers.get(0).getUrl().getServiceKey() + "." + invocation.getMethodName();
 
-            // 获取 invokers 列表的原始 hash 值
+            // 获取 invokers 列表的新的 hash 值
             int identityHashCode = System.identityHashCode(invokers);
             ConsistentHashSelector<T> selector = (ConsistentHashSelector<T>) selectors.get(key);
 
@@ -318,7 +320,7 @@ public class DubboLoadBalance{
         private static final class ConsistentHashSelector<T> {
     
             /**
-             * 存储Hash值与节点映射关系的TreeMap
+             * 存储 Hash 值与虚拟节点映射关系的 TreeMap
              */
             private final TreeMap<Long, Invoker<T>> virtualInvokers;
     
@@ -338,7 +340,7 @@ public class DubboLoadBalance{
             private final int[] argumentIndex;
     
             /**
-             * 为每个Invoker都创建replicaNumber个节点，Hash值与Invoker的映射关系即象征着一个节点，这个关系存储在TreeMap中
+             * 为每个Invoker都创建replicaNumber个虚拟节点，Hash值与Invoker的映射关系即象征着一个节点，这个关系存储在TreeMap中
              */
             ConsistentHashSelector(List<Invoker<T>> invokers, String methodName, int identityHashCode) {
                 this.virtualInvokers = new TreeMap<Long, Invoker<T>>();
@@ -420,9 +422,8 @@ public class DubboLoadBalance{
                 // 返回 Invoker
                 return entry.getValue();
             }
-    
+
         }
-    
     }
 
     /**

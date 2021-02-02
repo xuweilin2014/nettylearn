@@ -25,12 +25,12 @@ public class DubboCluster{
     public class FailoverCluster implements Cluster {
 
         public final static String NAME = "failover";
-    
+
         public <T> Invoker<T> join(Directory<T> directory) throws RpcException {
             // 创建并返回FailoverClusterInvoker对象
             return new FailoverClusterInvoker<T>(directory);
         }
-    
+
     }
 
     public class AvailableCluster implements Cluster {
@@ -110,7 +110,7 @@ public class DubboCluster{
             String methodName = invocation == null ? "" : invocation.getMethodName();
 
             // 获取 sticky 配置，sticky 表示粘滞连接。所谓粘滞连接是指让服务消费者尽可能的调用同一个服务提供者，除非该提供者挂了再进行切换。
-            // CLUSTER_STICKY_KEY为sticky，DEFAULT_CLUSTER_STICKY为false
+            // CLUSTER_STICKY_KEY 为 sticky，DEFAULT_CLUSTER_STICKY 为 false
             boolean sticky = invokers.get(0).getUrl().getMethodParameter(methodName, Constants.CLUSTER_STICKY_KEY, Constants.DEFAULT_CLUSTER_STICKY);
             {
                 // 检测 invokers 列表是否包含 stickyInvoker，如果不包含，说明 stickyInvoker 代表的服务提供者挂了，此时需要将其置空
@@ -329,7 +329,7 @@ public class DubboCluster{
 
         private final ConcurrentMap<Invocation, AbstractClusterInvoker<?>> failed = new ConcurrentHashMap<Invocation, AbstractClusterInvoker<?>>();
 
-        // 使用饿汉模式创建 retryFuture，保证在一个 Invoker 对象中只会创建一个 retryFuture
+        // 使用饿汉模式创建 retryFuture，保证在一个 Invoker 对象中只会创建一个 retryFuture，也就是意味着一个 FailbackClusterInvoker 中只有一个线程来重新发送请求
         private volatile ScheduledFuture<?> retryFuture;
     
         public FailbackClusterInvoker(Directory<T> directory) {
@@ -342,7 +342,6 @@ public class DubboCluster{
                     if (retryFuture == null) {
                         // 创建定时任务，每隔5秒执行一次
                         retryFuture = scheduledExecutorService.scheduleWithFixedDelay(new Runnable() {
-    
                             public void run() {
                                 try {
                                     // 对失败的调用进行重试
@@ -454,11 +453,11 @@ public class DubboCluster{
     public class ForkingClusterInvoker<T> extends AbstractClusterInvoker<T> {
 
         private final ExecutorService executor = Executors.newCachedThreadPool(new NamedThreadFactory("forking-cluster-timer", true));
-    
+
         public ForkingClusterInvoker(Directory<T> directory) {
             super(directory);
         }
-    
+
         @SuppressWarnings({"unchecked", "rawtypes"})
         public Result doInvoke(final Invocation invocation, List<Invoker<T>> invokers, LoadBalance loadbalance) throws RpcException {
             checkInvokers(invokers, invocation);
@@ -498,10 +497,11 @@ public class DubboCluster{
                             ref.offer(result);
                         } catch (Throwable e) {
                             int value = count.incrementAndGet();
-                            // 仅在 value 大于等于 selected.size() 时，才将异常对象放入阻塞队列中。这是因为在并行调用多个服务提供者的情况下，只要有一个服务提供者能够成功返回结果，而其他全部失败。
-                            // 此时 ForkingClusterInvoker 仍应该返回成功的结果，而非抛出异常。因此只有在 selected.size 次调用之后，才能把调用失败抛出的异常添加到阻塞队列中。而后面只会取出阻塞队列的
-                            // 第一个元素，如果前 selected.size - 1 次调用都失败了，那么取出的阻塞队列的第一个元素就是这个异常，随后会抛出。如果前面 selected.size -1 次调用有一次成功了，取出的就是
-                            // 调用成功的结果，第 selected.size 次调用抛出的异常就会被忽略
+                            // 仅在 value 大于等于 selected.size() 时，才将异常对象放入阻塞队列中。这是因为在并行调用多个服务提供者的情况下，只要有一个服务提供者
+                            // 能够成功返回结果，而其他全部失败。此时 ForkingClusterInvoker 仍应该返回成功的结果，而非抛出异常。因此只有在 selected.size 次调用之后，
+                            // 才能把调用失败抛出的异常添加到阻塞队列中。而后面只会取出阻塞队列的第一个元素，如果前 selected.size - 1 次调用都失败了，那么取出的阻塞
+                            // 队列的第一个元素就是这个异常，随后会抛出。如果前面 selected.size -1 次调用有一次成功了，取出的就是调用成功的结果，第 selected.size 次
+                            // 调用抛出的异常就会被忽略
                             if (value >= selected.size()) {
                                 ref.offer(e);
                             }

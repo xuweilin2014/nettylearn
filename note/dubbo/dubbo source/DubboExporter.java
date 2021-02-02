@@ -650,8 +650,7 @@ public class DubboExporter {
             final URL overrideSubscribeUrl = getSubscribedOverrideUrl(registedProviderUrl);
 
             // 创建监听器
-            final OverrideListener overrideSubscribeListener = new OverrideListener(overrideSubscribeUrl,
-                    originInvoker);
+            final OverrideListener overrideSubscribeListener = new OverrideListener(overrideSubscribeUrl, originInvoker);
             overrideListeners.put(overrideSubscribeUrl, overrideSubscribeListener);
 
             // 向注册中心进行订阅 override 数据

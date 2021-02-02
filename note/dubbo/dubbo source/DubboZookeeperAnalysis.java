@@ -14,13 +14,14 @@ public class DubboSubscribeNotify {
     // 服务引用过程中的订阅与通知
     public class RegistryProtocol implements Protocol {
 
+        // RegistryProtocol#refer
         public <T> Invoker<T> refer(Class<T> type, URL url) throws RpcException {
             // 取 registry 参数值，并将其设置为协议头，比如url中配置了registry=zookeeper，那么就将zookeeper设置为url的协议，
             // 然后把registry=zookeeper从url中移除掉
             url = url.setProtocol(url.getParameter(Constants.REGISTRY_KEY, Constants.DEFAULT_REGISTRY))
                     .removeParameter(Constants.REGISTRY_KEY);
 
-            // registryFactory为RegistryFactory$Adaptive，所以这里会根据url中的protocol，也就是url中协议的类型来调用对应RegistryFactory对象
+            // registryFactory 为 RegistryFactory$Adaptive，所以这里会根据url中的protocol，也就是url中协议的类型来调用对应RegistryFactory对象
             // 的getRegistry方法。这里则是调用ZookeeperRegistryFactory对象的getRegistry方法，返回一个ZookeeperRegistry对象
             Registry registry = registryFactory.getRegistry(url);
             if (RegistryService.class.equals(type)) {
@@ -48,14 +49,11 @@ public class DubboSubscribeNotify {
             directory.setProtocol(protocol);
             // all attributes of REFER_KEY
             Map<String, String> parameters = new HashMap<String, String>(directory.getUrl().getParameters());
-            URL subscribeUrl = new URL(Constants.CONSUMER_PROTOCOL, parameters.remove(Constants.REGISTER_IP_KEY), 0,
-                    type.getName(), parameters);
+            URL subscribeUrl = new URL(Constants.CONSUMER_PROTOCOL, parameters.remove(Constants.REGISTER_IP_KEY), 0, type.getName(), parameters);
 
             // 服务消费方向注册中心注册自己（也就是在consumers目录下创建一个新节点），供其他层使用，比如服务治理
-            if (!Constants.ANY_VALUE.equals(url.getServiceInterface())
-                    && url.getParameter(Constants.REGISTER_KEY, true)) {
-                registry.register(subscribeUrl.addParameters(Constants.CATEGORY_KEY, Constants.CONSUMERS_CATEGORY,
-                        Constants.CHECK_KEY, String.valueOf(false)));
+            if (!Constants.ANY_VALUE.equals(url.getServiceInterface()) && url.getParameter(Constants.REGISTER_KEY, true)) {
+                registry.register(subscribeUrl.addParameters(Constants.CATEGORY_KEY, Constants.CONSUMERS_CATEGORY, Constants.CHECK_KEY, String.valueOf(false)));
             }
 
             // 进行到这里时，subscribeUrl为：
@@ -113,8 +111,7 @@ public class DubboSubscribeNotify {
                     consumerUrl.getParameter(Constants.CATEGORY_KEY, Constants.DEFAULT_CATEGORY))) {
                 return false;
             }
-            if (!providerUrl.getParameter(Constants.ENABLED_KEY, true)
-                    && !Constants.ANY_VALUE.equals(consumerUrl.getParameter(Constants.ENABLED_KEY))) {
+            if (!providerUrl.getParameter(Constants.ENABLED_KEY, true) && !Constants.ANY_VALUE.equals(consumerUrl.getParameter(Constants.ENABLED_KEY))) {
                 return false;
             }
     
@@ -157,6 +154,7 @@ public class DubboSubscribeNotify {
             listeners.add(listener);
         }
 
+        // AbstractRegistry#notify
         protected void notify(URL url, NotifyListener listener, List<URL> urls) {
             // 检查各个参数的合法性，比如是否为null
 
@@ -165,6 +163,7 @@ public class DubboSubscribeNotify {
             // 并且还会检测这些url和消费者的url是否相匹配（传进来的参数中，url为消费者的URL，表示要调用服务的相关配置信息，比如服务的接口名是否相同，
             // 版本，组等等）
             for (URL u : urls) {
+                // providerUrl 和 consumerUrl 的 interface、category、group、version、classifier 属性是否相同
                 if (UrlUtils.isMatch(url, u)) {
                     String category = u.getParameter(Constants.CATEGORY_KEY, Constants.DEFAULT_CATEGORY);
                     List<URL> categoryList = result.get(category);
@@ -190,7 +189,7 @@ public class DubboSubscribeNotify {
                 List<URL> categoryList = entry.getValue();
                 categoryNotified.put(category, categoryList);
                 saveProperties(url);
-                // 最终调用RegistryDirectory中的notify方法
+                // 最终调用 RegistryDirectory 中的 notify 方法
                 listener.notify(categoryList);
             }
         }
@@ -250,6 +249,7 @@ public class DubboSubscribeNotify {
         private final ZookeeperClient zkClient;
 
         // 向url中category指明的目录注册监听器listener
+        // ZookeeperRegistry#doSubscribe
         protected void doSubscribe(final URL url, final NotifyListener listener) {
             try {
                 if (Constants.ANY_VALUE.equals(url.getServiceInterface())) {
@@ -263,30 +263,30 @@ public class DubboSubscribeNotify {
                             zkListeners.putIfAbsent(url, new ConcurrentHashMap<NotifyListener, ChildListener>());
                             listeners = zkListeners.get(url);
                         }
-                        // 根据我们的listener获取一个ChildListener实例
+                        // 根据我们的 listener 获取一个 ChildListener 实例
                         ChildListener zkListener = listeners.get(listener);
-                        // 没有的话就创建一个ChildListener实例。
+                        // 没有的话就创建一个 ChildListener 实例。
                         if (zkListener == null) {
                             listeners.putIfAbsent(listener, new ChildListener() {
                                 public void childChanged(String parentPath, List<String> currentChilds) {
-                                    // 如果 path 下面的子节点的状态发生变化（增加或者删除节点），那么就会最终调用ZookeeperRegistry下面的notify方法
-                                    // 这个ChildListener接口用于把zkclient的事件（IZkChildListener）转换到registry事件（NotifyListener）。
-                                    // 这里的做法可以更好的把zkclient的api和dubbo真身的注册中心逻辑分离开，毕竟dubbo除了zkclient以外还可以选择curator。
+                                    // 如果 path 下面的子节点的状态发生变化（增加或者删除节点），那么就会最终调用 ZookeeperRegistry 下面的 notify 方法
+                                    // 这个 ChildListener 接口用于把 zkclient 的事件（IZkChildListener）转换到 registry 事件（NotifyListener）。
+                                    // 这里的做法可以更好的把 zkclient 的 api 和 dubbo 真身的注册中心逻辑分离开，毕竟 dubbo 除了 zkclient 以外还可以选择 curator。
                                     ZookeeperRegistry.this.notify(url, listener, toUrlsWithEmpty(url, parentPath, currentChilds));
                                 }
                             });
                             zkListener = listeners.get(listener);
                         }
-                        // 根据path在Zookeeper中创建节点
+                        // 根据 path 在 Zookeeper 中创建节点
                         zkClient.create(path, false);
-                        // 这里zkClient是dubbo的ZkclientZookeeperClient，在addChildListener中会转化为ZkClient（Zookeeper的开源客户端）中的Listener
+                        // 这里 zkClient 是 dubbo 的 ZkclientZookeeperClient，在 addChildListener 中会转化为 ZkClient（Zookeeper 的开源客户端）中的 Listener
                         List<String> children = zkClient.addChildListener(path, zkListener);
                         if (children != null) {
                             urls.addAll(toUrlsWithEmpty(url, path, children));
                         }
                     }
-                    // 订阅完成之后，进行通知，调用ZookeeperRegistry的父类FailbackRegistry的notify方法
-                    // 这里的urls为订阅的各个path节点下面子节点的值的集合，如果path下面没有子节点，则为empty://开头的url
+                    // 订阅完成之后，进行通知，调用 ZookeeperRegistry 的父类 FailbackRegistry 的 notify 方法
+                    // 这里的 urls 为订阅的各个 path 节点下面子节点的值的集合，如果 path 下面没有子节点，则为 empty:// 开头的 url
                     notify(url, listener, urls);
                 }
             } catch (Throwable e) {
@@ -324,11 +324,14 @@ public class DubboSubscribeNotify {
     
     }
 
-    // AbstractZookeeperClient有两个子类：CuratorZookeeperClient和ZkclientZookeeperClient
+    // AbstractZookeeperClient 有两个子类：CuratorZookeeperClient 和 ZkclientZookeeperClient
     public abstract class AbstractZookeeperClient<TargetChildListener> implements ZookeeperClient {
 
         public List<String> addChildListener(String path, final ChildListener listener) {
-            // listeners是ChildListener到TargetChildListener的映射，目的应该是把ZkClient/Curator的逻辑与dubbo的逻辑进行一个分离
+            // listeners 是 ChildListener 到 TargetChildListener 的映射，目的应该是把 ZkClient/Curator 的逻辑与 dubbo 的逻辑进行一个分离
+            // ChildListener 就是 dubbo 自定义的一个监听器，用来对 ZkClient 和 Curator 中的监听器提供一个适配
+            // TargetChildListener 是一个泛型参数，类似于 T。当使用 ZkClient 客户端时，它是 IZkChildListener，
+            // 当使用 Curator 客户端时，它是 CuratorWatcher
             ConcurrentMap<ChildListener, TargetChildListener> listeners = childListeners.get(path);
             if (listeners == null) {
                 childListeners.putIfAbsent(path, new ConcurrentHashMap<ChildListener, TargetChildListener>());
@@ -336,11 +339,11 @@ public class DubboSubscribeNotify {
             }
             TargetChildListener targetListener = listeners.get(listener);
             if (targetListener == null) {
-                // createTargetListener是一个模板方法，具体由子类进行实现，即创建ZkClient或者Curator这两种客户端所对应的监听器对象
+                // createTargetListener 是一个模板方法，具体由子类进行实现，即创建 ZkClient 或者 Curator 这两种客户端所对应的监听器对象
                 listeners.putIfAbsent(listener, createTargetChildListener(path, listener));
                 targetListener = listeners.get(listener);
             }
-            // addTargetChildListener也是模板方法，将前面创建好的监听器注册到path路径上
+            // addTargetChildListener 也是模板方法，将前面创建好的监听器注册到 path 路径上
             return addTargetChildListener(path, targetListener);
         }
 
@@ -352,8 +355,13 @@ public class DubboSubscribeNotify {
 
     /*********************************** ✨Zookeeper的ZkClient客户端✨  ******************************************** */
 
-    public class ZkclientZookeeperClient extends AbstractZookeeperClient<IZkChildListener> {
+    /**
+     * ZookeeperClient -> AbstractZookeeperClient -> ZkclientZookeeperClient
+     * ZkclientZookeeperClient 这种含有一个 ZkClientWrapper 对象，ZkClientWrapper 中含有一个 ZkClient 对象，也就是 org.I0Itec.zkclient.ZkClient
+     * 它可以真正对 Zookeeper 进行一系列操作。
+     */
 
+    public class ZkclientZookeeperClient extends AbstractZookeeperClient<IZkChildListener> {
         /**
          * 在原生的zookeeper中，使用watcher需要每次先注册，而且使用一次就需要注册一次。而再zkClient中，没有注册watcher的必要，而是引入了listener的概念，
          * 即只要client在某一个节点中注册了listener，只要服务端发生变化，就会通知当前注册listener的客户端。
@@ -364,11 +372,10 @@ public class DubboSubscribeNotify {
          * 3.IZkStateListener：zookeeper连接状态发生变化时，触发该接口，这个在zkClient连接zookeeper时，用到比较多
          */
         public IZkChildListener createTargetChildListener(String path, final ChildListener listener) {
-            // 创建一个IZkChildListener，用于监听path下面节点的变化，如果发生了变化，则会回调我们定义的ChildListener，
-            // 并且回调时，zkClient会传入当前path下面的节点列表，最终会调用ZookeeperRegistry的notify方法
+            // 创建一个 IZkChildListener，用于监听 path 下面节点的变化，如果发生了变化，则会回调我们定义的 ChildListener，
+            // 并且回调时，zkClient 会传入当前 path 下面的节点列表，最终会调用 ZookeeperRegistry 的 notify 方法
             return new IZkChildListener() {
-                public void handleChildChange(String parentPath, List<String> currentChilds)
-                        throws Exception {
+                public void handleChildChange(String parentPath, List<String> currentChilds) throws Exception {
                     listener.childChanged(parentPath, currentChilds);
                 }
             };
@@ -377,7 +384,6 @@ public class DubboSubscribeNotify {
         public List<String> addTargetChildListener(String path, final IZkChildListener listener) {
             return client.subscribeChildChanges(path, listener);
         }
-
     }
 
     public class ZkClientWrapper{
@@ -508,12 +514,12 @@ public class DubboSubscribeNotify {
         // 取消订阅失败的 URL 集合
         private final ConcurrentMap<URL, Set<NotifyListener>> failedUnsubscribed = new ConcurrentHashMap<URL, Set<NotifyListener>>();
 
-        //通知失败的 URL 集合
+        // 通知失败的 URL 集合
         private final ConcurrentMap<URL, Map<NotifyListener, List<URL>>> failedNotified = new ConcurrentHashMap<URL, Map<NotifyListener, List<URL>>>();
 
         private AtomicBoolean destroyed = new AtomicBoolean(false);
 
-        // 在 FailbackRegistry 中定义了一个 ScheduledExecutorService ，每经过固定的时间间隔，大约 5s，就调用 FailbackRegistry#retry 方法
+        // 在 FailbackRegistry 中定义了一个 ScheduledExecutorService，每经过固定的时间间隔，大约 5s，就调用 FailbackRegistry#retry 方法
         // 在定时器中调用retry方法的时候，会把这五个集合分别遍历和重试，重试成功则从集合中移除。FailbackRegistry实现了 subscribe、register等通用方法，
         // 里面调用了未实现的模板方法，会由子类实现。通用方法会调用这些模板方法，如果捕获到异常，则会把URL添加到对应的重试集合中，以供定时器去重试
         public FailbackRegistry(URL url) {
